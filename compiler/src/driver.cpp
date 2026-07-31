@@ -24,10 +24,20 @@ namespace kami {
 
 int run_process(const std::vector<std::string>& args) {
 #ifdef _WIN32
+    // _spawnvp joins arguments with spaces and no quoting, so quote any
+    // argument that contains whitespace (e.g. "C:\Program Files\LLVM\...").
+    std::vector<std::string> quoted;
+    quoted.reserve(args.size());
+    for (const auto& a : args) {
+        if (a.find_first_of(" \t") != std::string::npos && a.front() != '"')
+            quoted.push_back("\"" + a + "\"");
+        else
+            quoted.push_back(a);
+    }
     std::vector<const char*> argv;
-    for (auto& a : args) argv.push_back(a.c_str());
+    for (auto& a : quoted) argv.push_back(a.c_str());
     argv.push_back(nullptr);
-    intptr_t rc = _spawnvp(_P_WAIT, argv[0], argv.data());
+    intptr_t rc = _spawnvp(_P_WAIT, args[0].c_str(), argv.data());
     return (int)rc;
 #else
     std::vector<char*> argv;

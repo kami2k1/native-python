@@ -6,6 +6,11 @@
 #include <cstring>
 #include <cstdio>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 namespace kami {
 
 std::recursive_mutex g_lock;
@@ -155,7 +160,13 @@ using namespace kami;
 
 extern "C" {
 
-void kami_rt_init(void) {}
+void kami_rt_init(void) {
+#ifdef _WIN32
+    // Keep '\n' as-is so program output is identical across platforms.
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
+}
 
 void kami_rt_shutdown(void) {
     // Join any still-running threads so we exit cleanly.

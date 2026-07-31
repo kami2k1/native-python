@@ -25,6 +25,8 @@ $ ldd app          # no libpython — only libc/libm/libstdc++
 
 Requirements / Yêu cầu: CMake ≥ 3.20, a C++20 compiler, and `clang++` (LLVM ≥ 15) on `PATH` (used as the LLVM backend + linker driver).
 
+**Windows (Visual Studio Community):** xem hướng dẫn chi tiết / see the full guide — [docs/vi/BUILD_WINDOWS.md](docs/vi/BUILD_WINDOWS.md) · [docs/en/BUILD_WINDOWS.md](docs/en/BUILD_WINDOWS.md)
+
 ```bash
 cmake -B build
 cmake --build build -j
@@ -83,7 +85,25 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | hello startup | **1.9 ms** | 1.8 ms | 12.6 ms | — |
 | hello max RSS | **3.6 MB** | 3.6 MB | 7.5 MB | < 20 MB ✅ |
 | fib(27) | **42 ms** | — | 44 ms | — |
+| prime sieve 100k | **19 ms / 5.3 MB** | — | 55 ms / 8.5 MB | — |
+| quicksort 20k | **32 ms / 4.1 MB** | — | 38 ms / 8.5 MB | — |
+| sudoku solver | **18 ms / 3.6 MB** | — | 29 ms / 7.7 MB | — |
 | GC stress (600k allocs) | 96 ms, 4.7 MB peak | — | — | bounded ✅ |
+
+## Real-world validation / Kiểm chứng dự án thực tế
+
+8 real programs compiled to native and tested in CI — 7 of them are plain-Python-compatible and their outputs are **byte-identical to CPython** (`tests/integration/proj_*.py`):
+
+| Project | Exercises |
+|---|---|
+| `proj_calculator` | expression interpreter: tokenizer + recursive-descent parser + evaluator |
+| `proj_sudoku` | backtracking search, deep recursion, 2D lists |
+| `proj_text_analytics` | manual string parsing, frequency dicts, deterministic top-k |
+| `proj_linear_regression` | gradient descent (ML), float math |
+| `proj_primes` | Sieve of Eratosthenes to 100k (100k-element list, tight loops) |
+| `proj_maze_bfs` | BFS shortest path: queue, visited dict |
+| `proj_quicksort` | in-place quicksort of 20k ints + LCG + checksum |
+| `proj_bank_threads` | 6 concurrent OS threads updating a shared list |
 
 ## Status
 
@@ -92,5 +112,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Lexer / Parser / Sema / Codegen / Linker driver | ✅ implemented + tested |
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
-| Tests | ✅ 2 unit suites + 15 integration programs (incl. threading, GC stress, neural-net XOR) |
-| Platforms | ✅ Linux x64 (tested) · ⚠️ Windows x64 (code paths present, not yet CI-tested) |
+| Tests | ✅ 2 unit suites + 23 integration programs (threading, GC stress, neural-net XOR, 8 real-world projects) |
+| CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
+| Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |

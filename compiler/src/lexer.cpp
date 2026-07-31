@@ -1,5 +1,7 @@
 #include "lexer.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <unordered_map>
 
 namespace kami {

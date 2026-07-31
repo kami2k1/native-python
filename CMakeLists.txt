@@ -9,6 +9,14 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Compiler-specific flags (MSVC vs GCC/Clang)
+if(MSVC)
+    add_compile_options(/utf-8 /EHsc)
+    set(KAMI_RT_OPTS /O2)
+else()
+    set(KAMI_RT_OPTS -O2 -fno-exceptions)
+endif()
+
 # ---- runtime library (linked into every compiled program) ----
 add_library(kamirt STATIC
     runtime/src/gc.cpp
@@ -19,7 +27,7 @@ add_library(kamirt STATIC
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
-target_compile_options(kamirt PRIVATE -O2 -fno-exceptions)
+target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
 
 # ---- compiler ----
 add_library(kamipy_core STATIC

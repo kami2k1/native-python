@@ -1,6 +1,7 @@
 // Dynamic operators, indexing, iteration and calls.
 #include "rt_internal.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstring>
 

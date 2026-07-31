@@ -4,6 +4,56 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.1.1] — 2026-08-01 — Windows build support + real-world validation / Hỗ trợ build Windows + kiểm chứng dự án thực tế
+
+### Added / Thêm mới
+- **Tài liệu build Windows (Visual Studio Community)** song ngữ: [`docs/vi/BUILD_WINDOWS.md`](docs/vi/BUILD_WINDOWS.md) · [`docs/en/BUILD_WINDOWS.md`](docs/en/BUILD_WINDOWS.md) — cài VS Community (workload *Desktop development with C++*), LLVM/Clang for Windows, build bằng dòng lệnh hoặc IDE, sử dụng, biến môi trường, troubleshooting.
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): build + full test trên **ubuntu-24.04** và **windows-latest** (MSVC + LLVM) cho mỗi push/PR.
+- **8 dự án thực tế** compile thành native + chạy trong CI (`tests/integration/proj_*.py`):
+  | Dự án | Nội dung |
+  |---|---|
+  | `proj_calculator` | interpreter biểu thức: tokenizer + recursive-descent parser + evaluator |
+  | `proj_sudoku` | giải sudoku backtracking (đệ quy sâu, list 2 chiều) — ra đúng nghiệm chuẩn |
+  | `proj_text_analytics` | tách từ thủ công, dict tần suất, top-k deterministic |
+  | `proj_linear_regression` | machine learning: gradient descent fit y=2x+1 (hội tụ, MSE < 1e-4) |
+  | `proj_primes` | sàng Eratosthenes tới 100.000 (list 100k phần tử) — 9592 số nguyên tố |
+  | `proj_maze_bfs` | BFS đường đi ngắn nhất trong mê cung (queue + visited dict) |
+  | `proj_quicksort` | quicksort in-place 20.000 số + LCG + checksum |
+  | `proj_bank_threads` | 6 OS threads cập nhật list chia sẻ đồng thời |
+
+### Fixed / Sửa (Windows-portability)
+- `CMakeLists.txt`: tách flags MSVC (`/O2 /utf-8 /EHsc`) khỏi GCC/Clang (`-O2 -fno-exceptions`) — trước đây build MSVC sẽ fail.
+- `driver.cpp`: quote arguments chứa khoảng trắng khi `_spawnvp` (đường dẫn `C:\Program Files\LLVM\...`).
+- `gc.cpp`: `_setmode(stdout, _O_BINARY)` trên Windows để output `\n` đồng nhất giữa các platform.
+- `.gitattributes`: ép LF cho `*.py`, `*.expected`, `*.sh` — tránh CRLF phá integration test khi clone trên Windows.
+- Thêm `<cctype>/<cstdlib>` còn thiếu trong `lexer.cpp`, `ops.cpp` (portability MSVC).
+
+### Build instructions / Hướng dẫn build
+- **Linux**: như v0.1.0 (`cmake -B build && cmake --build build -j && ctest --test-dir build`).
+- **Windows (VS Community)**: xem `docs/vi/BUILD_WINDOWS.md` — tóm tắt: cài VS Community + workload C++, `winget install LLVM.LLVM`, mở *x64 Native Tools Command Prompt*, `cmake -B build && cmake --build build --config Release`, `ctest --test-dir build -C Release`.
+
+### Test report / Báo cáo test (Linux x64, clang/LLVM 18.1.3)
+| Kiểm chứng / Check | Kết quả / Result |
+|---|---|
+| Unit (lexer, parser) | ✅ PASS |
+| Integration **23/23** (15 cũ + 8 dự án thực tế mới) | ✅ PASS |
+| **Cross-check CPython**: 7 dự án Python-compatible, output so sánh từng byte với `python3` chạy cùng source | ✅ GIỐNG HỆT 7/7 |
+| ASan + LSan trên `proj_bank_threads`, `proj_sudoku` | ✅ CLEAN |
+| TSan trên `proj_bank_threads` (6 threads + GC) | ✅ CLEAN |
+| Determinism: `proj_bank_threads` chạy 20 lần | ✅ 20/20 output giống hệt |
+| Clean rebuild từ đầu | ✅ 0 error, 0 warning |
+| Windows CI (MSVC + LLVM, windows-latest) | 🔄 chạy tự động trên GitHub Actions sau khi push |
+
+### Benchmarks — dự án thực tế (Linux x64)
+| Program | KamiPython | CPython 3.11 |
+|---|---|---|
+| prime sieve 100k | **19 ms / 5.3 MB** | 55 ms / 8.5 MB |
+| quicksort 20k | **32 ms / 4.1 MB** | 38 ms / 8.5 MB |
+| sudoku solver | **18 ms / 3.6 MB** | 29 ms / 7.7 MB |
+| calculator interpreter | **2.1 ms / 3.8 MB** | 12.1 ms / 7.9 MB |
+
+---
+
 ## [v0.1.0] — 2026-08-01 — Full compiler implementation / Compiler hoàn chỉnh
 
 Compiler hoạt động end-to-end: `.py → native executable`, không cần Python. / Working end-to-end compiler: `.py → native executable`, no Python required.
