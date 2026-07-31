@@ -16,6 +16,8 @@ namespace kami {
 std::recursive_mutex g_lock;
 std::atomic<bool> g_multithreaded{false};
 std::vector<KamiValue> g_globals;
+int64_t g_argc = 0;
+char** g_argv = nullptr;
 std::vector<std::pair<KamiValue*, int64_t>> g_pins;
 std::vector<FrameStack*> g_frame_stacks;
 
@@ -79,6 +81,24 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
         }
         break;
     }
+    case KT_CLASS: {
+        KamiClassObj* c = (KamiClassObj*)h;
+        if (c->parent && !c->parent->h.mark) {
+            c->parent->h.mark = 1;
+            stack.push_back(&c->parent->h);
+        }
+        for (auto& kv : *c->members) mark_value(&kv.second, stack);
+        break;
+    }
+    case KT_OBJECT: {
+        KamiInstance* o = (KamiInstance*)h;
+        if (o->cls && !o->cls->h.mark) {
+            o->cls->h.mark = 1;
+            stack.push_back(&o->cls->h);
+        }
+        for (auto& kv : *o->fields) mark_value(&kv.second, stack);
+        break;
+    }
     default: break; // STR / FUNC / THREAD have no Value children
     }
 }
@@ -112,6 +132,8 @@ void gc_collect() {
             switch (h->type) {
             case KT_LIST: free(((KamiList*)h)->items); break;
             case KT_MAP: free(((KamiMap*)h)->entries); break;
+            case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
+            case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
             case KT_THREAD: {
                 ThreadData* td = ((KamiThreadObj*)h)->td;
                 if (td) {
@@ -148,10 +170,14 @@ void gc_track_extra(uint64_t bytes) { g_bytes_since_gc += bytes; }
 void gc_track_free(uint64_t) {}
 
 [[noreturn]] void panic(const std::string& msg) {
-    fflush(stdout);
-    fprintf(stderr, "KamiPython runtime error: %s\n", msg.c_str());
-    fflush(stderr);
-    _Exit(1);
+    // Thrown as a Python-level exception; catchable by try/except. If nothing
+    // catches it, kami_run_module / the thread wrapper reports it and exits.
+    throw KamiError{msg};
+}
+
+std::string& tls_error() {
+    thread_local std::string err;
+    return err;
 }
 
 } // namespace kami
@@ -160,7 +186,9 @@ using namespace kami;
 
 extern "C" {
 
-void kami_rt_init(void) {
+void kami_rt_init(int64_t argc, char** argv) {
+    g_argc = argc;
+    g_argv = argv;
 #ifdef _WIN32
     // Keep '\n' as-is so program output is identical across platforms.
     _setmode(_fileno(stdout), _O_BINARY);
@@ -202,10 +230,12 @@ void kami_global_set(int64_t idx, const KamiValue* v) {
     g_globals[(size_t)idx] = *v;
 }
 
-void kami_global_make_func(int64_t idx, void* fnptr, int64_t arity, const char* name) {
+void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t arity,
+                           const char* name) {
     Lock lk(g_lock);
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
+    f->min_arity = min_arity;
     f->arity = arity;
     f->name = name;
     g_globals[(size_t)idx].tag = KT_FUNC;

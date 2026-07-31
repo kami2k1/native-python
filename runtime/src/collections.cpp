@@ -52,6 +52,13 @@ uint64_t value_hash(const KamiValue* v) {
         return x;
     }
     case KT_STR: return ((KamiStr*)v->p)->hash;
+    case KT_LIST: { // tuples are represented as lists; hash deep like a tuple
+        KamiList* l = (KamiList*)v->p;
+        uint64_t h = 0x345678ull ^ (uint64_t)l->len;
+        for (int64_t i = 0; i < l->len; i++)
+            h = h * 1000003ull ^ value_hash(&l->items[i]);
+        return h;
+    }
     default: panic(std::string("unhashable type: '") + type_name(v->tag) + "'");
     }
 }

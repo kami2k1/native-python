@@ -36,5 +36,30 @@ enum KamiBuiltinId : int64_t {
     // threading
     KB_THREAD_SPAWN,
     KB_THREAD_JOIN,
+    // extended builtins (v0.2)
+    KB_SUM,
+    KB_SORTED,
+    KB_REVERSED,
+    KB_ENUMERATE,
+    KB_ZIP,
+    KB_BOOL,
+    KB_ROUND,
+    KB_INPUT,
+    KB_POW,
+    KB_PRINT_EX, // args: [sep, end, values...]
+    KB_ALL,
+    KB_ANY,
+    KB_BIN,
+    KB_HEX,
+    KB_OCT,
+    KB_LIST,
+    KB_DICT,
+    KB_TUPLE,
+    KB_ISINSTANCE,
+    KB_FORMAT,
+    KB_NOOP,      // doctest.testmod etc.
+    KB_SYS_EXIT,
+    KB_SYS_ARGV,
+    KB_DIVMOD,
     KB__COUNT
 };

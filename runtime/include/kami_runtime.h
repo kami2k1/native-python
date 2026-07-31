@@ -33,26 +33,31 @@ enum KamiTag : int64_t {
     KT_MAP = 6,
     KT_FUNC = 7,
     KT_THREAD = 8,
+    KT_CLASS = 9,
+    KT_OBJECT = 10,
 };
 
 enum KamiBinOp : int64_t {
     KOP_ADD = 0, KOP_SUB, KOP_MUL, KOP_DIV, KOP_FLOORDIV, KOP_MOD,
     KOP_EQ, KOP_NE, KOP_LT, KOP_GT, KOP_LE, KOP_GE, KOP_IN,
+    KOP_POW, KOP_IS, KOP_ISNOT,
+    KOP_BITAND, KOP_BITOR, KOP_BITXOR, KOP_SHL, KOP_SHR,
 };
-enum KamiUnOp : int64_t { KUOP_NEG = 0, KUOP_NOT = 1 };
+enum KamiUnOp : int64_t { KUOP_NEG = 0, KUOP_NOT = 1, KUOP_INV = 2 };
 
 // Calling convention for compiled user functions.
-typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv);
+typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv, int64_t nargs);
 
 // --- lifecycle ---
-void kami_rt_init(void);
+void kami_rt_init(int64_t argc, char** argv);
 void kami_rt_shutdown(void);
 
 // --- GC roots ---
 void kami_globals_init(int64_t n);
 void kami_global_get(KamiValue* out, int64_t idx);
 void kami_global_set(int64_t idx, const KamiValue* v);
-void kami_global_make_func(int64_t idx, void* fnptr, int64_t arity, const char* name);
+void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity,
+                           int64_t arity, const char* name);
 void kami_frame_push(KamiValue* slots, int64_t n); // zeroes slots, registers as roots
 void kami_frame_pop(void);
 
@@ -81,6 +86,28 @@ void kami_builtin(int64_t id, KamiValue* out, KamiValue** argv, int64_t nargs);
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);
 int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx);
 void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx);
+void kami_unpack(KamiValue* out, const KamiValue* seq, int64_t idx, int64_t expect_len);
+// Python slice semantics; pass tag=NONE values for omitted start/stop/step.
+void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
+                const KamiValue* stop, const KamiValue* step);
+
+// --- classes / attributes ---
+void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx);
+void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
+                           int64_t min_arity, int64_t arity);
+void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
+void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val);
+
+// --- exceptions ---
+// Runs an outlined try-body (signature: int64_t body(KamiValue* frame)).
+// Returns the body's code (0 normal, 1 return, 2 break, 3 continue) or -1 if
+// a runtime error was caught; the message is then available via kami_last_error.
+int64_t kami_try(void* body_fn, KamiValue* frame);
+void kami_last_error(KamiValue* out);
+void kami_raise(const KamiValue* msg);
+void kami_rethrow(void);
+// Top-level entry: runs the module body, catching runtime errors.
+void kami_run_module(void* module_fn);
 
 // --- diagnostics ---
 void kami_panic(const char* msg);

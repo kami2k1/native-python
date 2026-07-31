@@ -2,6 +2,7 @@
 #include "../include/kami_builtins.h"
 #include "rt_internal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,133 @@ static void check_arity(int64_t nargs, int64_t lo, int64_t hi, const char* fn) {
 }
 
 static std::mt19937_64 g_rng{0xC0FFEEull};
+
+// Python-like format(value, spec): [[fill]align][sign][width][,][.prec][type]
+static std::string format_value(KamiValue* v, const std::string& spec) {
+    char fill = ' ';
+    char align = 0;
+    char sign = 0;
+    char type = 0;
+    long width = 0;
+    long prec = -1;
+    size_t i = 0;
+    if (spec.size() >= 2 && (spec[1] == '<' || spec[1] == '>' || spec[1] == '^')) {
+        fill = spec[0];
+        align = spec[1];
+        i = 2;
+    } else if (!spec.empty() && (spec[0] == '<' || spec[0] == '>' || spec[0] == '^')) {
+        align = spec[0];
+        i = 1;
+    }
+    if (i < spec.size() && (spec[i] == '+' || spec[i] == '-' || spec[i] == ' ')) {
+        sign = spec[i];
+        i++;
+    }
+    if (i < spec.size() && spec[i] == '0' && !align) {
+        fill = '0';
+        align = '>';
+        i++;
+    }
+    while (i < spec.size() && isdigit((unsigned char)spec[i])) {
+        width = width * 10 + (spec[i] - '0');
+        i++;
+    }
+    if (i < spec.size() && spec[i] == ',') i++; // thousands sep: ignored
+    if (i < spec.size() && spec[i] == '.') {
+        i++;
+        prec = 0;
+        while (i < spec.size() && isdigit((unsigned char)spec[i])) {
+            prec = prec * 10 + (spec[i] - '0');
+            i++;
+        }
+    }
+    if (i < spec.size()) {
+        type = spec[i];
+        i++;
+    }
+    if (i != spec.size()) panic("unsupported format spec: '" + spec + "'");
+
+    std::string body;
+    char buf[64];
+    auto num = [&](double d) {
+        switch (type) {
+        case 'f': case 'F':
+            snprintf(buf, sizeof buf, "%.*f", prec < 0 ? 6 : (int)prec, d);
+            body = buf;
+            break;
+        case 'e': case 'E':
+            snprintf(buf, sizeof buf, type == 'e' ? "%.*e" : "%.*E",
+                     prec < 0 ? 6 : (int)prec, d);
+            body = buf;
+            break;
+        case 'g': case 'G':
+            snprintf(buf, sizeof buf, type == 'g' ? "%.*g" : "%.*G",
+                     prec < 0 ? 6 : (int)prec, d);
+            body = buf;
+            break;
+        case '%':
+            snprintf(buf, sizeof buf, "%.*f%%", prec < 0 ? 6 : (int)prec, d * 100.0);
+            body = buf;
+            break;
+        default:
+            panic("unsupported format type for float: '" + spec + "'");
+        }
+    };
+    if (v->tag == KT_INT || v->tag == KT_BOOL) {
+        switch (type) {
+        case 0: case 'd':
+            snprintf(buf, sizeof buf, "%lld", (long long)v->i);
+            body = buf;
+            break;
+        case 'x':
+            snprintf(buf, sizeof buf, "%llx", (unsigned long long)v->i);
+            body = buf;
+            break;
+        case 'X':
+            snprintf(buf, sizeof buf, "%llX", (unsigned long long)v->i);
+            body = buf;
+            break;
+        case 'o':
+            snprintf(buf, sizeof buf, "%llo", (unsigned long long)v->i);
+            body = buf;
+            break;
+        case 'b': {
+            uint64_t u = (uint64_t)(v->i < 0 ? -v->i : v->i);
+            std::string d2;
+            if (!u) d2 = "0";
+            while (u) { d2 += (char)('0' + (u & 1)); u >>= 1; }
+            if (v->i < 0) body = "-";
+            for (size_t k = d2.size(); k-- > 0;) body += d2[k];
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case '%':
+            num((double)v->i);
+            break;
+        default:
+            panic("unsupported format type for int: '" + spec + "'");
+        }
+        if (sign == '+' && v->i >= 0) body = "+" + body;
+    } else if (v->tag == KT_FLOAT) {
+        if (type == 0) body = format_float(v->f);
+        else num(v->f);
+        if (sign == '+' && v->f >= 0) body = "+" + body;
+    } else {
+        if (type != 0 && type != 's') panic("unsupported format spec for value: '" + spec + "'");
+        body = value_str(v);
+        if (prec >= 0 && (long)body.size() > prec) body.resize((size_t)prec);
+        if (!align) align = '<';
+    }
+    if (!align) align = '>';
+    if ((long)body.size() < width) {
+        size_t pad = (size_t)width - body.size();
+        if (align == '>') body = std::string(pad, fill) + body;
+        else if (align == '<') body += std::string(pad, fill);
+        else {
+            body = std::string(pad / 2, fill) + body + std::string(pad - pad / 2, fill);
+        }
+    }
+    return body;
+}
 
 static void set_float(KamiValue* out, double d) { out->tag = KT_FLOAT; out->f = d; }
 static void set_int(KamiValue* out, int64_t i) { out->tag = KT_INT; out->i = i; }
@@ -57,7 +185,14 @@ static void thread_body(PinBlock pb) {
     int64_t nargs = pb.n - 1;
     KamiValue* argv[16];
     for (int64_t i = 0; i < nargs; i++) argv[i] = &slots[(size_t)(2 + i)];
-    kami_call_value(&slots[0], &slots[1], argv, nargs);
+    try {
+        kami_call_value(&slots[0], &slots[1], argv, nargs);
+    } catch (KamiError& e) {
+        fflush(stdout);
+        fprintf(stderr, "KamiPython runtime error (in thread): %s\n", e.msg.c_str());
+        fflush(stderr);
+        _Exit(1);
+    }
     kami_frame_pop();
 }
 
@@ -178,7 +313,21 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_MIN:
     case KB_MAX: {
         const char* fn = id == KB_MIN ? "min" : "max";
-        check_arity(nargs, 2, 16, fn);
+        check_arity(nargs, 1, 16, fn);
+        // min(list) / max(list) form
+        if (nargs == 1) {
+            if (argv[0]->tag != KT_LIST) panic(std::string(fn) + "() expected a list");
+            KamiList* l = (KamiList*)argv[0]->p;
+            if (l->len == 0) panic(std::string(fn) + "() of empty list");
+            KamiValue best = l->items[0];
+            for (int64_t i = 1; i < l->len; i++) {
+                KamiValue r;
+                kami_binop(id == KB_MIN ? KOP_LT : KOP_GT, &r, &l->items[i], &best);
+                if (r.i) best = l->items[i];
+            }
+            *out = best;
+            return;
+        }
         KamiValue best = *argv[0];
         for (int64_t i = 1; i < nargs; i++) {
             KamiValue r;
@@ -279,6 +428,318 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     // ---- threading ----
     case KB_THREAD_SPAWN: builtin_spawn(out, argv, nargs); return;
     case KB_THREAD_JOIN: builtin_join(lk, out, argv, nargs); return;
+    // ---- extended builtins ----
+    case KB_SUM: {
+        check_arity(nargs, 1, 2, "sum");
+        if (argv[0]->tag != KT_LIST) panic("sum() expected a list");
+        KamiList* l = (KamiList*)argv[0]->p;
+        KamiValue acc;
+        if (nargs == 2) acc = *argv[1];
+        else { acc.tag = KT_INT; acc.i = 0; }
+        for (int64_t i = 0; i < l->len; i++) {
+            KamiValue r;
+            kami_binop(KOP_ADD, &r, &acc, &l->items[i]);
+            acc = r;
+        }
+        *out = acc;
+        return;
+    }
+    case KB_SORTED: {
+        check_arity(nargs, 1, 1, "sorted");
+        if (argv[0]->tag != KT_LIST) panic("sorted() expected a list");
+        KamiList* src = (KamiList*)argv[0]->p;
+        KamiList* r = list_new(src->len);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < src->len; i++) r->items[r->len++] = src->items[i];
+        std::sort(r->items, r->items + r->len, [](const KamiValue& a, const KamiValue& b) {
+            KamiValue c;
+            kami_binop(KOP_LT, &c, &a, &b);
+            return c.i != 0;
+        });
+        return;
+    }
+    case KB_REVERSED: {
+        check_arity(nargs, 1, 1, "reversed");
+        if (argv[0]->tag != KT_LIST) panic("reversed() expected a list");
+        KamiList* src = (KamiList*)argv[0]->p;
+        KamiList* r = list_new(src->len);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = src->len - 1; i >= 0; i--) r->items[r->len++] = src->items[i];
+        return;
+    }
+    case KB_ENUMERATE: {
+        check_arity(nargs, 1, 1, "enumerate");
+        KamiValue* v = argv[0];
+        KamiList* r = list_new(4);
+        out->tag = KT_LIST;
+        out->p = r;
+        auto push_pair = [&](int64_t i, const KamiValue* item) {
+            KamiList* pair = list_new(2);
+            pair->items[0].tag = KT_INT;
+            pair->items[0].i = i;
+            pair->items[1] = *item;
+            pair->len = 2;
+            KamiValue pv;
+            pv.tag = KT_LIST;
+            pv.p = pair;
+            list_push(r, &pv);
+        };
+        if (v->tag == KT_LIST) {
+            KamiList* l = (KamiList*)v->p;
+            for (int64_t i = 0; i < l->len; i++) push_pair(i, &l->items[i]);
+        } else if (v->tag == KT_STR) {
+            KamiStr* s = (KamiStr*)v->p;
+            for (int64_t i = 0; i < s->len; i++) {
+                KamiValue ch;
+                ch.tag = KT_STR;
+                ch.p = str_new(s->data + i, 1);
+                push_pair(i, &ch);
+            }
+        } else {
+            panic("enumerate() expected a list or str");
+        }
+        return;
+    }
+    case KB_ZIP: {
+        check_arity(nargs, 2, 2, "zip");
+        if (argv[0]->tag != KT_LIST || argv[1]->tag != KT_LIST)
+            panic("zip() expects two lists");
+        KamiList* a = (KamiList*)argv[0]->p;
+        KamiList* b = (KamiList*)argv[1]->p;
+        int64_t n = a->len < b->len ? a->len : b->len;
+        KamiList* r = list_new(n > 4 ? n : 4);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < n; i++) {
+            KamiList* pair = list_new(2);
+            pair->items[0] = a->items[i];
+            pair->items[1] = b->items[i];
+            pair->len = 2;
+            KamiValue pv;
+            pv.tag = KT_LIST;
+            pv.p = pair;
+            list_push(r, &pv);
+        }
+        return;
+    }
+    case KB_BOOL: {
+        check_arity(nargs, 1, 1, "bool");
+        out->tag = KT_BOOL;
+        out->i = kami_truthy(argv[0]);
+        return;
+    }
+    case KB_ROUND: {
+        check_arity(nargs, 1, 2, "round");
+        double x = arg_num(argv[0], "round");
+        if (nargs == 1) {
+            set_int(out, (int64_t)llround(x));
+        } else {
+            int64_t nd = arg_int(argv[1], "round");
+            double p = std::pow(10.0, (double)nd);
+            set_float(out, std::llround(x * p) / p);
+        }
+        return;
+    }
+    case KB_INPUT: {
+        check_arity(nargs, 0, 1, "input");
+        if (nargs == 1) {
+            std::string prompt = value_str(argv[0]);
+            fwrite(prompt.data(), 1, prompt.size(), stdout);
+            fflush(stdout);
+        }
+        std::string line;
+        lk.unlock(); // don't hold the GIL while blocked on stdin
+        int c;
+        bool got = false;
+        while ((c = fgetc(stdin)) != EOF && c != '\n') {
+            line += (char)c;
+            got = true;
+        }
+        if (c == '\n') got = true;
+        lk.lock();
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        (void)got;
+        out->tag = KT_STR;
+        out->p = str_new(line.data(), (int64_t)line.size());
+        return;
+    }
+    case KB_POW: {
+        check_arity(nargs, 2, 2, "pow");
+        kami_binop(KOP_POW, out, argv[0], argv[1]);
+        return;
+    }
+    case KB_ALL:
+    case KB_ANY: {
+        const char* fn = id == KB_ALL ? "all" : "any";
+        check_arity(nargs, 1, 1, fn);
+        if (argv[0]->tag != KT_LIST) panic(std::string(fn) + "() expected a list");
+        KamiList* l = (KamiList*)argv[0]->p;
+        bool result = id == KB_ALL;
+        for (int64_t i = 0; i < l->len; i++) {
+            bool t = kami_truthy(&l->items[i]) != 0;
+            if (id == KB_ALL && !t) { result = false; break; }
+            if (id == KB_ANY && t) { result = true; break; }
+        }
+        out->tag = KT_BOOL;
+        out->i = result;
+        return;
+    }
+    case KB_BIN:
+    case KB_HEX:
+    case KB_OCT: {
+        const char* fn = id == KB_BIN ? "bin" : id == KB_HEX ? "hex" : "oct";
+        check_arity(nargs, 1, 1, fn);
+        int64_t v = arg_int(argv[0], fn);
+        bool neg = v < 0;
+        uint64_t u = neg ? (uint64_t)(-v) : (uint64_t)v;
+        std::string digits;
+        int base = id == KB_BIN ? 2 : id == KB_HEX ? 16 : 8;
+        const char* dc = "0123456789abcdef";
+        if (u == 0) digits = "0";
+        while (u) {
+            digits += dc[u % (uint64_t)base];
+            u /= (uint64_t)base;
+        }
+        std::string r = neg ? "-" : "";
+        r += id == KB_BIN ? "0b" : id == KB_HEX ? "0x" : "0o";
+        for (size_t i = digits.size(); i-- > 0;) r += digits[i];
+        out->tag = KT_STR;
+        out->p = str_new(r.data(), (int64_t)r.size());
+        return;
+    }
+    case KB_LIST:
+    case KB_TUPLE: {
+        check_arity(nargs, 0, 1, id == KB_LIST ? "list" : "tuple");
+        KamiList* r = list_new(4);
+        out->tag = KT_LIST;
+        out->p = r;
+        if (nargs == 0) return;
+        if (argv[0]->tag == KT_LIST) {
+            KamiList* src = (KamiList*)argv[0]->p;
+            for (int64_t i = 0; i < src->len; i++) list_push(r, &src->items[i]);
+        } else if (argv[0]->tag == KT_STR) {
+            KamiStr* s2 = (KamiStr*)argv[0]->p;
+            for (int64_t i = 0; i < s2->len; i++) {
+                KamiValue ch;
+                ch.tag = KT_STR;
+                ch.p = str_new(s2->data + i, 1);
+                list_push(r, &ch);
+            }
+        } else {
+            panic("list() expected a list or str");
+        }
+        return;
+    }
+    case KB_DICT: {
+        check_arity(nargs, 0, 0, "dict");
+        KamiMap* m = map_new();
+        out->tag = KT_MAP;
+        out->p = m;
+        return;
+    }
+    case KB_ISINSTANCE: {
+        check_arity(nargs, 2, 2, "isinstance");
+        auto matches = [&](const KamiValue* spec) -> bool {
+            if (spec->tag == KT_STR) {
+                KamiStr* s2 = (KamiStr*)spec->p;
+                std::string t(s2->data, (size_t)s2->len);
+                int64_t tag = argv[0]->tag;
+                if (t == "int") return tag == KT_INT || tag == KT_BOOL;
+                if (t == "float") return tag == KT_FLOAT;
+                if (t == "str") return tag == KT_STR;
+                if (t == "bool") return tag == KT_BOOL;
+                if (t == "list" || t == "tuple") return tag == KT_LIST;
+                if (t == "dict") return tag == KT_MAP;
+                return false;
+            }
+            if (spec->tag == KT_CLASS) {
+                if (argv[0]->tag != KT_OBJECT) return false;
+                KamiClassObj* want = (KamiClassObj*)spec->p;
+                KamiClassObj* c = ((KamiInstance*)argv[0]->p)->cls;
+                while (c) {
+                    if (c == want) return true;
+                    c = c->parent;
+                }
+                return false;
+            }
+            panic("isinstance() arg 2 must be a type or class");
+        };
+        bool r = false;
+        if (argv[1]->tag == KT_LIST) {
+            KamiList* l = (KamiList*)argv[1]->p;
+            for (int64_t i = 0; i < l->len && !r; i++) r = matches(&l->items[i]);
+        } else {
+            r = matches(argv[1]);
+        }
+        out->tag = KT_BOOL;
+        out->i = r;
+        return;
+    }
+    case KB_FORMAT: {
+        check_arity(nargs, 1, 2, "format");
+        std::string spec;
+        if (nargs == 2) {
+            if (argv[1]->tag != KT_STR) panic("format() spec must be a str");
+            KamiStr* s2 = (KamiStr*)argv[1]->p;
+            spec.assign(s2->data, (size_t)s2->len);
+        }
+        std::string r = format_value(argv[0], spec);
+        out->tag = KT_STR;
+        out->p = str_new(r.data(), (int64_t)r.size());
+        return;
+    }
+    case KB_NOOP: {
+        set_none(out);
+        return;
+    }
+    case KB_SYS_EXIT: {
+        check_arity(nargs, 0, 1, "sys.exit");
+        int64_t code = nargs ? arg_int(argv[0], "sys.exit") : 0;
+        fflush(stdout);
+        _Exit((int)code);
+    }
+    case KB_SYS_ARGV: {
+        KamiList* r = list_new(g_argc > 4 ? g_argc : 4);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < g_argc; i++) {
+            KamiValue v;
+            v.tag = KT_STR;
+            v.p = str_new(g_argv[i], (int64_t)strlen(g_argv[i]));
+            list_push(r, &v);
+        }
+        return;
+    }
+    case KB_DIVMOD: {
+        check_arity(nargs, 2, 2, "divmod");
+        KamiValue q, r2;
+        kami_binop(KOP_FLOORDIV, &q, argv[0], argv[1]);
+        kami_binop(KOP_MOD, &r2, argv[0], argv[1]);
+        KamiList* l = list_new(2);
+        l->items[0] = q;
+        l->items[1] = r2;
+        l->len = 2;
+        out->tag = KT_LIST;
+        out->p = l;
+        return;
+    }
+    case KB_PRINT_EX: {
+        // args: [sep, end, values...]
+        if (nargs < 2) panic("print(): bad kwargs form");
+        std::string sep = value_str(argv[0]);
+        std::string end = value_str(argv[1]);
+        std::string line;
+        for (int64_t i = 2; i < nargs; i++) {
+            if (i > 2) line += sep;
+            line += value_str(argv[i]);
+        }
+        line += end;
+        fwrite(line.data(), 1, line.size(), stdout);
+        set_none(out);
+        return;
+    }
     default: panic("unknown builtin id " + std::to_string(id));
     }
 }

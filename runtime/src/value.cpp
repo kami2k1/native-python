@@ -17,6 +17,8 @@ const char* type_name(int64_t tag) {
     case KT_MAP: return "dict";
     case KT_FUNC: return "function";
     case KT_THREAD: return "thread";
+    case KT_CLASS: return "type";
+    case KT_OBJECT: return "object";
     default: return "?";
     }
 }
@@ -78,6 +80,9 @@ std::string value_str(const KamiValue* v) {
         return std::string("<function ") + f->name + ">";
     }
     case KT_THREAD: return "<thread>";
+    case KT_CLASS: return std::string("<class '") + ((KamiClassObj*)v->p)->name + "'>";
+    case KT_OBJECT:
+        return std::string("<") + ((KamiInstance*)v->p)->cls->name + " object>";
     default: return "<?>";
     }
 }

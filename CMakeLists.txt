@@ -14,7 +14,7 @@ if(MSVC)
     add_compile_options(/utf-8 /EHsc)
     set(KAMI_RT_OPTS /O2)
 else()
-    set(KAMI_RT_OPTS -O2 -fno-exceptions)
+    set(KAMI_RT_OPTS -O2)
 endif()
 
 # ---- runtime library (linked into every compiled program) ----
@@ -23,6 +23,7 @@ add_library(kamirt STATIC
     runtime/src/value.cpp
     runtime/src/collections.cpp
     runtime/src/ops.cpp
+    runtime/src/objects.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)

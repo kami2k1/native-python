@@ -4,6 +4,84 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.2.0] — 2026-08-01 — Real-world compatibility: exceptions, classes, f-strings + 100s dự án GitHub thật
+
+Xuất phát từ bug report thực tế (`try:` → parse error), toàn bộ frontend + runtime được nâng cấp
+theo quy trình **đo trên corpus thật → fix theo tần suất lỗi → đo lại**, dùng 2.182 file Python
+thật từ GitHub (TheAlgorithms/Python, geekcomputers/Python).
+
+### Kết quả corpus / Corpus results
+| Vòng | Build được / Built | Chạy được / Ran |
+|---|---|---|
+| Baseline v0.1.1 | 269/2182 (12%) | 261 |
+| **v0.2.0** | **914/2182 (42%)** | **704** |
+
+(Phần lớn số còn lại cần: third-party modules như numpy/cv2/re/os, `with`, decorators, lambda,
+generators, nested functions, set literals, relative imports — xem Roadmap.)
+
+### Added — ngôn ngữ / Language
+- **Exceptions**: `try/except [E [as e]]/else/finally`, `raise Error("msg")`, bare `raise`,
+  `assert cond, msg`. Runtime error nào cũng bắt được (ZeroDivision, IndexError, KeyError, ...).
+  Cơ chế: try-body được outline thành hàm riêng, bảo vệ bằng C++ unwinding (`kami_try`),
+  GC frame-stack được tự sửa khi unwind; `return/break/continue` xuyên qua try hoạt động đúng
+  qua mã code (0/1/2/3). ASan clean.
+- **Classes**: `class C(Base):`, `__init__`, methods, instance fields (`self.x`), class
+  attributes, single inheritance, unbound call `Base.__init__(self, ...)`,
+  `isinstance(x, C)` / `isinstance(x, (int, str))`.
+- **f-strings**: `f"{expr}"`, format spec `{x:.2f}` `{n:04d}` `{s:>6}` `{p:.0%}`, debug `{x = }`,
+  raw strings `r"..."`, triple-quoted strings + docstrings, implicit string concat.
+- **Slices**: `a[1:3]`, `a[:n]`, `a[::-1]` cho list + str.
+- **Comprehensions**: `[f(x) for x in xs if cond]`, generator-expression trong call
+  (`sum(x for x in xs)`), unpack targets (`for k, v in d.items()`).
+- **Tuple assignment**: `a, b = 1, 2`, swap `a, b = b, a`, unpack từ hàm, `x = y = 0`,
+  `return a, b`; tuple literals ≈ list (hashable khi dùng làm dict key: `d[i, j]`).
+- **Bitwise**: `& | ^ ~ << >>` + augmented (`|=`, `<<=`, ...); `**`/`**=`; `//=`, `%=`.
+- Chained comparisons (`0 <= i < n`), ternary (`a if c else b`), `is`/`is not`,
+  `not in`, `while True`, inline body (`if x: return y`), dấu `;`, `\` nối dòng,
+  hex/octal/binary/underscore số (`0xFF`, `1_000_000`), số mũ, `.5`, `1.`.
+- **Kwargs + defaults**: `def f(a, b=1)`, gọi `f(a, b=2)` cho hàm/constructor/unbound method
+  trong file; runtime hỗ trợ gọi động với defaults (calling convention mang `nargs`).
+- `global`, type annotations (params, return `->`, biến, `self.x: T = v`) — parse và bỏ qua.
+- Imports: `import a, b`, `import x as y`, `from math import sqrt, pi`,
+  `import` trong `try/except ImportError` với module không có sẵn → bỏ qua (đúng pattern
+  bug report), `__name__ == "__main__"`, no-op modules (`typing`, `__future__`, `abc`,
+  `dataclasses`), stub `doctest.testmod()`, `sys.argv`/`sys.exit`, `string.ascii_lowercase`...
+
+### Added — builtins & methods
+`sum sorted reversed enumerate zip bool round input pow all any bin hex oct list dict tuple
+isinstance format divmod exit quit`; str: `split join strip lstrip rstrip replace startswith
+endswith find count isdigit isalpha isupper islower isspace capitalize title zfill`;
+list: `insert remove index extend sort reverse count copy pop(i)`; dict: `items`;
+`min(xs)`/`max(xs)` dạng iterable; `print(sep=, end=)`.
+
+### Fixed
+- **Bug codegen nghiêm trọng**: slot kết quả cấp phát sau khi giải phóng temp args → out
+  alias arg slot; constructor ghi instance đè lên argument. (Phát hiện nhờ test class.)
+- Unknown escape trong string giờ giữ nguyên như Python (`"\d"`), thay vì lỗi.
+- Trailing comma trong tham số `def f(a, b,)`, positional-only marker `/`.
+
+### Verification / Kiểm chứng
+- Integration **28/28 PASS** (23 cũ + 5 mới: `feat_exceptions`, `feat_classes`,
+  `feat_modern_syntax`, `feat_builtins`, `feat_guarded_imports` — 4/5 cross-check CPython
+  từng byte; riêng exceptions dùng expected riêng vì format message khác chủ ý).
+- ASan CLEAN trên exception-unwinding + classes; unit + integration cũ không hỏng.
+- Tool khảo sát corpus: `tools/corpus_survey.sh` (tái lập được kết quả).
+
+### Known deviations / Khác biệt chủ ý so với CPython
+- Tuple hiển thị như list (`(1, 2)` → `[1, 2]`); tuple là list (mutable).
+- `str(e)` của exception kèm prefix loại lỗi (`"ValueError: msg"`).
+- `except SomeError` bắt mọi lỗi (chưa phân loại theo type); nhiều mệnh đề except:
+  mệnh đề đầu bắt tất.
+- `round()` half-away-from-zero (không banker's); enumerate/zip/range eager (trả list).
+- Comprehension variable leak ra scope (như Python 2); `a[i] += v` đánh giá `a`, `i` 2 lần.
+
+### Roadmap (chưa hỗ trợ, lỗi rõ ràng)
+`with`, decorators, lambda, generators/`yield`, nested functions/closures, set literals,
+`del`, walrus `:=`, relative imports, `*args/**kwargs`, f-string spec lồng nhau,
+match, PEP 695 generics, third-party modules (numpy, cv2, requests...).
+
+---
+
 ## [v0.1.1] — 2026-08-01 — Windows build support + real-world validation / Hỗ trợ build Windows + kiểm chứng dự án thực tế
 
 ### Added / Thêm mới
