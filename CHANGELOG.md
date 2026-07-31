@@ -32,6 +32,8 @@ source cái đó".
   đặt file `.py` cạnh input để bundle.
 
 ### Fixed — runtime
+- **UTF-8 BOM**: file `.py` lưu bằng Notepad (UTF-8 with BOM) không còn báo
+  "unexpected character" ở dòng 1 — lexer tự bỏ qua BOM `EF BB BF`.
 - **`Response.json()`**: bổ sung method còn thiếu — trước đây mọi response từ
   `requests.get/post` gọi `.json()` đều raise `AttributeError` (bị `except Exception`
   nuốt mất nên script API-polling "chạy mà không làm gì").
