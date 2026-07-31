@@ -441,6 +441,8 @@ void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
 void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs) {
     KamiFn f = nullptr;
     KamiFn init = nullptr;
+    KamiValue* f_caps = nullptr;
+    KamiValue* init_caps = nullptr;
     int64_t builtin_id = -1;
     {
         Lock lk(g_lock);
@@ -457,6 +459,7 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
                     panic(std::string(c->name) + "() takes " + std::to_string(fo->arity - 1) +
                           " argument(s) but " + std::to_string(nargs) + " were given");
                 init = (KamiFn)fo->fn;
+                init_caps = fo->captures;
             } else if (nargs != 0) {
                 panic(std::string(c->name) + "() takes no arguments");
             }
@@ -471,6 +474,7 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
                     panic(std::string(fo->name) + "() takes " + std::to_string(fo->arity) +
                           " argument(s) but " + std::to_string(nargs) + " were given");
                 f = (KamiFn)fo->fn;
+                f_caps = fo->captures;
             }
         }
     }
@@ -484,15 +488,16 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
         argv2[0] = out; // self
         for (int64_t i = 0; i < nargs; i++) argv2[i + 1] = argv[i];
         KamiValue dummy;
-        init(&dummy, argv2, nargs + 1);
+        init(&dummy, argv2, nargs + 1, init_caps);
         return;
     }
-    if (f) f(out, argv, nargs);
+    if (f) f(out, argv, nargs, f_caps);
 }
 
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
                  int64_t nargs) {
     KamiFn user_fn = nullptr;
+    KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
     KamiValue* argv2[17];
     {
@@ -910,14 +915,64 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             }
         } else if (o.tag == KT_OBJECT) {
             KamiInstance* in = (KamiInstance*)o.p;
-            // requests.Response.json(): parse the body text as JSON.
-            if (in->cls && std::string(in->cls->name) == "Response" && m == "json" &&
-                nargs == 0) {
-                auto tit = in->fields->find("text");
-                if (tit == in->fields->end() || tit->second.tag != KT_STR)
-                    panic("Response.json(): response has no text body");
-                KamiStr* s = (KamiStr*)tit->second.p;
-                json_loads(out, std::string(s->data, (size_t)s->len));
+            const char* cn = in->cls->name;
+            if (strcmp(cn, "Match") == 0) {
+                KamiValue gv;
+                auto it = in->fields->find("__groups__");
+                if (it == in->fields->end()) panic("bad Match object");
+                gv = it->second;
+                KamiList* groups = (KamiList*)gv.p;
+                auto grp = [&](int64_t idx) -> KamiList* {
+                    if (idx < 0 || idx >= groups->len)
+                        panic("no such group " + std::to_string(idx));
+                    return (KamiList*)groups->items[idx].p;
+                };
+                if (m == "group") {
+                    int64_t idx = nargs == 0 ? 0 : (argv[0]->tag == KT_INT ? argv[0]->i : 0);
+                    KamiList* tri = grp(idx);
+                    if (tri->items[0].i < 0) { out->tag = KT_NONE; out->i = 0; }
+                    else *out = tri->items[2];
+                    return;
+                }
+                if (m == "groups" && nargs == 0) {
+                    KamiList* r = list_new(groups->len);
+                    out->tag = KT_LIST; out->p = r;
+                    for (int64_t i = 1; i < groups->len; i++) {
+                        KamiList* tri = (KamiList*)groups->items[i].p;
+                        if (tri->items[0].i < 0) {
+                            KamiValue none{KT_NONE, {0}};
+                            r->items[r->len++] = none;
+                        } else {
+                            r->items[r->len++] = tri->items[2];
+                        }
+                    }
+                    return;
+                }
+                if ((m == "start" || m == "end") && nargs <= 1) {
+                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
+                    KamiList* tri = grp(idx);
+                    out->tag = KT_INT;
+                    out->i = tri->items[m == "start" ? 0 : 1].i;
+                    return;
+                }
+                if (m == "span" && nargs <= 1) {
+                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
+                    KamiList* tri = grp(idx);
+                    KamiList* r = list_new(2);
+                    r->items[0] = tri->items[0];
+                    r->items[1] = tri->items[1];
+                    r->len = 2;
+                    out->tag = KT_LIST; out->p = r;
+                    return;
+                }
+                panic(std::string("Match object has no method '") + m + "'");
+            }
+            if (strcmp(cn, "Response") == 0 && m == "json" && nargs == 0) {
+                auto it = in->fields->find("text");
+                if (it == in->fields->end() || it->second.tag != KT_STR)
+                    panic("Response has no text to decode");
+                KamiStr* t = (KamiStr*)it->second.p;
+                json_loads(out, std::string(t->data, (size_t)t->len));
                 return;
             }
             KamiValue* mv = nullptr;
@@ -939,6 +994,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 panic(m + "() takes " + std::to_string(fo->arity - (bound ? 1 : 0)) +
                       " argument(s) but " + std::to_string(nargs) + " were given");
             user_fn = (KamiFn)fo->fn;
+            user_caps = fo->captures;
             int64_t k = 0;
             if (bound) argv2[k++] = obj;
             for (int64_t i = 0; i < nargs; i++) argv2[k++] = argv[i];
@@ -954,6 +1010,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 panic(m + "() takes " + std::to_string(fo->arity) + " argument(s) but " +
                       std::to_string(nargs) + " were given");
             user_fn = (KamiFn)fo->fn;
+            user_caps = fo->captures;
             for (int64_t i = 0; i < nargs; i++) argv2[i] = argv[i];
             user_nargs = nargs;
         }
@@ -962,7 +1019,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                   std::to_string(nargs) + " args)");
     }
     // Invoke user method WITHOUT holding the lock.
-    user_fn(out, argv2, user_nargs);
+    user_fn(out, argv2, user_nargs, user_caps);
 }
 
 } // extern "C"

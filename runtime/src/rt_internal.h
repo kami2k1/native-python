@@ -54,6 +54,8 @@ struct KamiFuncObj {
     int64_t arity;     // max
     int64_t builtin_id; // >= 0 => call via kami_builtin
     const char* name;
+    KamiValue* captures; // heap array, null when not a closure
+    int64_t ncaptures;
 };
 
 struct ThreadData {

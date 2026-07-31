@@ -78,6 +78,10 @@ enum KamiBuiltinId : int64_t {
     KB_SOCKET_SOCKET,
     // requests
     KB_REQUESTS_GET, KB_REQUESTS_POST,
+    // functional
+    KB_MAP, KB_FILTER,
+    // re
+    KB_RE_MATCH, KB_RE_SEARCH, KB_RE_FULLMATCH, KB_RE_FINDALL, KB_RE_SUB, KB_RE_SPLIT,
     // diagnostics
     KB_KWARGS_UNSUPPORTED,
     KB__COUNT

@@ -17,10 +17,12 @@ enum class ExprKind {
     Slice,      // a=base; args[0..2] = start/stop/step (may be null)
     ListComp,   // a=element expr, b=iter, c=cond(opt), params=target names
     SetLit,     // args = elements
+    Lambda,     // params = arg names, a = body expr
+    Closure,    // res_idx = function index; capture sources in comp_t* vectors
 };
 
 // Name/Call resolution (filled by sema)
-enum class Res { Unresolved, Local, Global, BuiltinFunc, UserFunc };
+enum class Res { Unresolved, Local, Global, BuiltinFunc, UserFunc, Capture };
 
 struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
@@ -89,13 +91,17 @@ struct Stmt {
     int nlocals = 0;                  // FuncDef
     int64_t global_idx = -1;          // FuncDef/ClassDef global slot
     int func_index = -1;              // FuncDef index into module function table
-    int raise_mode = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
+    int raise_mode = 0;
+    std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
+    bool is_closure = false;          // FuncDef compiled with a %captures param
+    int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
 };
 
 struct Module {
     std::vector<StmtPtr> body;         // module-level statements
     std::vector<Stmt*> functions;      // all FuncDefs incl. methods (borrowed)
     std::vector<Stmt*> classes;        // all ClassDefs (borrowed)
+    std::vector<StmtPtr> synth;        // synthetic functions (lambdas), owned
     int64_t nglobals = 0;
     // Local .py modules whose source was bundled into this module by the
     // driver ("import utils" → utils.py compiled in). Their top-level code is
