@@ -675,7 +675,9 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
     case KB_REQUESTS_GET:
     case KB_REQUESTS_POST: {
         std::string url = arg_str(0, "requests");
-        std::vector<std::string> cmd = {"curl", "-s", "-S", "-w",
+        // -s (no progress) without -S: connection errors surface as a Python
+        // RequestException, not as stray curl noise on stderr.
+        std::vector<std::string> cmd = {"curl", "-s", "-w",
                                         "\n__KAMI_HTTP_STATUS__:%{http_code}"};
         double timeout = 0;
         if (id == KB_REQUESTS_GET) {

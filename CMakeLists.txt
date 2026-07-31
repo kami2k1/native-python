@@ -11,7 +11,11 @@ find_package(Threads REQUIRED)
 
 # Compiler-specific flags (MSVC vs GCC/Clang)
 if(MSVC)
-    add_compile_options(/utf-8 /EHsc)
+    # /EHs (NOT /EHsc): the runtime raises Python exceptions as C++ exceptions
+    # across extern "C" boundaries (kami_raise → kami_try). With /EHc MSVC
+    # assumes extern "C" never throws and may delete the catch handler,
+    # breaking try/except at runtime (and emitting warning C4297).
+    add_compile_options(/utf-8 /EHs)
     set(KAMI_RT_OPTS /O2)
 else()
     set(KAMI_RT_OPTS -O2)

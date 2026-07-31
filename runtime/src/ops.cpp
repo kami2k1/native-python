@@ -910,6 +910,16 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             }
         } else if (o.tag == KT_OBJECT) {
             KamiInstance* in = (KamiInstance*)o.p;
+            // requests.Response.json(): parse the body text as JSON.
+            if (in->cls && std::string(in->cls->name) == "Response" && m == "json" &&
+                nargs == 0) {
+                auto tit = in->fields->find("text");
+                if (tit == in->fields->end() || tit->second.tag != KT_STR)
+                    panic("Response.json(): response has no text body");
+                KamiStr* s = (KamiStr*)tit->second.p;
+                json_loads(out, std::string(s->data, (size_t)s->len));
+                return;
+            }
             KamiValue* mv = nullptr;
             bool bound = false;
             auto it = in->fields->find(m);

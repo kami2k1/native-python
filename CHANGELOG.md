@@ -4,6 +4,51 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.3.1] — 2026-08-01 — Sửa build Windows (MSVC) + đóng gói module .py cục bộ khi import
+
+Phiên bản v0.3.0 **không build được trên Windows** (`sema.cpp: error C2177: constant too big`),
+nên `kamipy.exe` không được cập nhật — người dùng vẫn chạy binary cũ và tưởng "vẫn thế".
+Bản này sửa dứt điểm build Windows và thêm cơ chế **đóng gói (bundle) module Python cục bộ**:
+`import utils` → compiler tự tìm `utils.py` cạnh file input, lấy source và biên dịch chung
+vào executable — đúng triết lý "import cái gì thì đóng gói source cái đó".
+
+### Fixed — Windows / MSVC
+- **`error C2177: constant too big`** (`sema.cpp`, `math.inf`): thay literal `1e999` bằng
+  `std::numeric_limits<double>::infinity()`. Đây là lỗi chặn toàn bộ build `kamipy_core`
+  trên MSVC → `kamipy.exe` không bao giờ được tạo lại.
+- **`/EHsc` → `/EHs`** trong CMake: runtime ném exception C++ xuyên qua ranh giới
+  `extern "C"` (`kami_raise` → `kami_try`). Với `/EHc`, MSVC coi hàm `extern "C"` là
+  nothrow và **có thể xoá luôn catch handler** → `try/except` crash lúc chạy trên Windows.
+  Sửa luôn 2 warning C4297 (`kami_raise`, `kami_rethrow`).
+
+### Added — đóng gói module cục bộ (local module bundling)
+- `import mymodule` / `from mymodule import f`: nếu `mymodule.py` nằm cạnh file input,
+  source của nó được parse và ghép vào chương trình (theo thứ tự phụ thuộc, đệ quy,
+  có chặn import vòng). `mymodule.f(...)`, `mymodule.CONST` resolve như tên thường.
+- Khối `if __name__ == "__main__":` trong module được bundle **không chạy**
+  (đúng semantics CPython); trong file chính vẫn chạy.
+- Hỗ trợ `import pkg.mod` → `pkg/mod.py`. Thông báo lỗi "unknown module" giờ gợi ý
+  đặt file `.py` cạnh input để bundle.
+
+### Fixed — runtime
+- **`Response.json()`**: bổ sung method còn thiếu — trước đây mọi response từ
+  `requests.get/post` gọi `.json()` đều raise `AttributeError` (bị `except Exception`
+  nuốt mất nên script API-polling "chạy mà không làm gì").
+- **kwargs trên method call động** (vd `pyautogui.locateCenterOnScreen(img, confidence=0.8)`
+  sau `try: import pyautogui`): không còn chặn cả build bằng compile error; giờ sinh
+  runtime exception bắt được bằng `try/except` (qua `KB_KWARGS_UNSUPPORTED`).
+- `requests` không còn xả stderr của curl (`curl: (7) Failed to connect...`) khi mất mạng —
+  lỗi kết nối chỉ surface qua `RequestException` như CPython.
+
+### Verification
+- Integration **34/34 PASS** (2 suite mới: `feat_bundle_app` + `feat_bundle_util`;
+  mở rộng `feat_guarded_imports` với kwargs-method-call trong try/except).
+- Script bug report (auto-click pull request: os + time + logging + requests +
+  guarded pyautogui, kwargs, `response.json()`, `result.get()`) **build và chạy đúng**:
+  poll API mỗi 1s, log đủ banner, bắt RequestException khi mất mạng.
+
+---
+
 ## [v0.3.0] — 2026-08-01 — stdlib thực tế: file I/O, os, json, logging, socket, requests + with/set/del
 
 Tiếp tục từ bug report (`try: import ...`, `logging.basicConfig`), bổ sung các module và cú pháp
