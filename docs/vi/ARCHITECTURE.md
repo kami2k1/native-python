@@ -424,3 +424,15 @@ Chưa hỗ trợ (roadmap): class đầy đủ, closure, generator, `try/except`
 | 15    | Binary protection    | strip + optimize, tài liệu giới hạn                           |
 
 **Milestone cuối:** `kamipy build main.py` → `main.exe` chạy in `30`, không cần Python.
+
+---
+
+## 15. Ghi chú triển khai v0.1 (as-built)
+
+Bản triển khai v0.1 (xem `CHANGELOG.md` mục v0.1.0) có các khác biệt có chủ đích so với thiết kế trên:
+
+1. **AST → LLVM IR trực tiếp, chưa có KIR riêng.** Constant folding chạy ở tầng semantic; dead code sau `return/break/continue` bị loại ngay tại codegen. KIR vẫn là hướng mở rộng khi cần optimizer sâu hơn (unboxing xuyên hàm, inline).
+2. **GC là mark & sweep (không phải reference counting).** Lý do: kết hợp với threading an toàn và đơn giản hơn — codegen tuân thủ bất biến *"object pointer không bao giờ sống trong register qua một call; mọi giá trị nằm trong frame slot đã đăng ký làm root; mọi mutation đi qua runtime call giữ global lock"*. Nhờ đó GC + đa luồng đúng đắn theo thiết kế (đã chứng minh bằng ThreadSanitizer/AddressSanitizer).
+3. **Threading theo mô hình GIL** như CPython: mọi runtime call giữ một global lock; `sleep/join` nhả lock khi block. Tối ưu quan trọng: khi chương trình chưa spawn thread nào, lock được **bỏ qua hoàn toàn** (flag bật vĩnh viễn tại lần spawn đầu — chuyển trạng thái an toàn vì lúc đó chỉ có đúng một thread và nó đang giữ lock thật). Kết quả: single-thread nhanh gấp ~2 lần, đa luồng vẫn đúng.
+4. **Codegen phát textual LLVM IR (`.ll`) rồi gọi `clang++`** làm backend + linker driver (qua `fork/execvp`, không qua shell). Đơn giản, không phụ thuộc phiên bản thư viện LLVM C++, vẫn là pipeline LLVM thực thụ. In-process `TargetMachine` là tối ưu tương lai.
+5. **AST dùng `unique_ptr` (RAII)** thay arena — thay đổi hiệu năng compiler, không đổi ngữ nghĩa.

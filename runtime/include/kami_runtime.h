@@ -1,0 +1,90 @@
+#pragma once
+// KamiPython native runtime — public C ABI used by generated code.
+//
+// Design notes:
+//  * Every dynamic value is a 16-byte tagged union (KamiValue).
+//  * All heap objects are managed by a stop-allocation mark&sweep GC.
+//  * Generated code NEVER stores object pointers in registers across calls:
+//    values only live in registered frame slots, globals, or pins, and every
+//    mutation goes through a runtime call that holds the global runtime lock
+//    (GIL-style). This makes the GC and threading correct by construction.
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct KamiValue {
+    int64_t tag;
+    union {
+        int64_t i;   // INT / BOOL
+        double  f;   // FLOAT
+        void*   p;   // heap object (STR/LIST/MAP/FUNC/THREAD)
+    };
+} KamiValue;
+
+enum KamiTag : int64_t {
+    KT_NONE = 0,
+    KT_BOOL = 1,
+    KT_INT = 2,
+    KT_FLOAT = 3,
+    KT_STR = 4,
+    KT_LIST = 5,
+    KT_MAP = 6,
+    KT_FUNC = 7,
+    KT_THREAD = 8,
+};
+
+enum KamiBinOp : int64_t {
+    KOP_ADD = 0, KOP_SUB, KOP_MUL, KOP_DIV, KOP_FLOORDIV, KOP_MOD,
+    KOP_EQ, KOP_NE, KOP_LT, KOP_GT, KOP_LE, KOP_GE, KOP_IN,
+};
+enum KamiUnOp : int64_t { KUOP_NEG = 0, KUOP_NOT = 1 };
+
+// Calling convention for compiled user functions.
+typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv);
+
+// --- lifecycle ---
+void kami_rt_init(void);
+void kami_rt_shutdown(void);
+
+// --- GC roots ---
+void kami_globals_init(int64_t n);
+void kami_global_get(KamiValue* out, int64_t idx);
+void kami_global_set(int64_t idx, const KamiValue* v);
+void kami_global_make_func(int64_t idx, void* fnptr, int64_t arity, const char* name);
+void kami_frame_push(KamiValue* slots, int64_t n); // zeroes slots, registers as roots
+void kami_frame_pop(void);
+
+// --- value constructors / moves ---
+void kami_copy(KamiValue* dst, const KamiValue* src);
+void kami_make_none(KamiValue* out);
+void kami_make_bool(KamiValue* out, int64_t b);
+void kami_make_int(KamiValue* out, int64_t v);
+void kami_make_float(KamiValue* out, double v);
+void kami_make_str(KamiValue* out, const char* data, int64_t len);
+void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
+void kami_make_map(KamiValue* out);
+
+// --- operations ---
+int32_t kami_truthy(const KamiValue* v);
+void kami_binop(int64_t op, KamiValue* out, const KamiValue* a, const KamiValue* b);
+void kami_unop(int64_t op, KamiValue* out, const KamiValue* a);
+void kami_index_get(KamiValue* out, const KamiValue* obj, const KamiValue* idx);
+void kami_index_set(KamiValue* obj, const KamiValue* idx, const KamiValue* val);
+void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
+void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
+                 int64_t nargs);
+void kami_builtin(int64_t id, KamiValue* out, KamiValue** argv, int64_t nargs);
+
+// --- loop helpers ---
+int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);
+int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx);
+void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx);
+
+// --- diagnostics ---
+void kami_panic(const char* msg);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif

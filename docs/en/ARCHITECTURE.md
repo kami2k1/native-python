@@ -424,3 +424,15 @@ Not yet (roadmap): full classes, closures, generators, `try/except`, slicing, f-
 | 15    | Binary protection    | strip + optimize, documented limitations                      |
 
 **Final milestone:** `kamipy build main.py` → `main.exe` runs and prints `30`, with no Python installed.
+
+---
+
+## 15. v0.1 implementation notes (as-built)
+
+The v0.1 implementation (see `CHANGELOG.md`, v0.1.0) intentionally deviates from the design above in a few places:
+
+1. **AST → LLVM IR directly; no separate KIR yet.** Constant folding runs in the semantic pass; code after `return/break/continue` is dropped at codegen time. KIR remains the extension point for deeper optimizations (cross-function unboxing, inlining).
+2. **The GC is mark & sweep (not reference counting).** Rationale: it composes more safely and simply with threading — codegen maintains the invariant that *object pointers never live in registers across a call; every value lives in a frame slot registered as a GC root; every mutation goes through a runtime call that holds the global lock*. This makes GC + threads correct by construction (validated with ThreadSanitizer/AddressSanitizer).
+3. **Threading uses a GIL model** like CPython: every runtime call holds one global lock; `sleep/join` release it while blocked. Key optimization: while a program has not spawned any thread, the lock is **skipped entirely** (the flag flips permanently at the first spawn — a race-free transition because exactly one thread exists at that moment and it holds the real lock). Result: ~2× faster single-threaded code, still-correct multithreading.
+4. **Codegen emits textual LLVM IR (`.ll`) and invokes `clang++`** as the backend + linker driver (via `fork/execvp`, never through a shell). Simple, robust across LLVM versions, and still a genuine LLVM pipeline. In-process `TargetMachine` is a future optimization.
+5. **The AST uses `unique_ptr` (RAII)** instead of an arena — a compiler-performance detail with no semantic impact.
