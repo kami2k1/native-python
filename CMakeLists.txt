@@ -25,6 +25,7 @@ add_library(kamirt STATIC
     runtime/src/ops.cpp
     runtime/src/objects.cpp
     runtime/src/netio.cpp
+    runtime/src/kami_regex.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)

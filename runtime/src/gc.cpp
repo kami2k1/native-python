@@ -100,7 +100,12 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
         for (auto& kv : *o->fields) mark_value(&kv.second, stack);
         break;
     }
-    default: break; // STR / FUNC / THREAD have no Value children
+    case KT_FUNC: {
+        KamiFuncObj* fo = (KamiFuncObj*)h;
+        for (int64_t i = 0; i < fo->ncaptures; i++) mark_value(&fo->captures[i], stack);
+        break;
+    }
+    default: break; // STR / THREAD have no Value children
     }
 }
 
@@ -139,6 +144,7 @@ void gc_collect() {
                 if (!f->closed && f->fp) fclose((FILE*)f->fp);
                 break;
             }
+            case KT_FUNC: free(((KamiFuncObj*)h)->captures); break;
             case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
             case KT_THREAD: {
@@ -246,6 +252,8 @@ void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t 
     f->arity = arity;
     f->builtin_id = -1;
     f->name = name;
+    f->captures = nullptr;
+    f->ncaptures = 0;
     g_globals[(size_t)idx].tag = KT_FUNC;
     g_globals[(size_t)idx].p = f;
 }

@@ -221,10 +221,10 @@ void kami_rethrow(void) {
 }
 
 void kami_run_module(void* module_fn) {
-    using ModFn = void (*)(KamiValue*, KamiValue**, int64_t);
+    using ModFn = void (*)(KamiValue*, KamiValue**, int64_t, KamiValue*);
     KamiValue ret{KT_NONE, {0}};
     try {
-        ((ModFn)module_fn)(&ret, nullptr, 0);
+        ((ModFn)module_fn)(&ret, nullptr, 0, nullptr);
     } catch (KamiError& e) {
         fflush(stdout);
         fprintf(stderr, "KamiPython runtime error: %s\n", e.msg.c_str());

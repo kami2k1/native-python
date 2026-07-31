@@ -1,5 +1,6 @@
 // os / os.path, logging, json, socket, requests — the "real world" runtime.
 #include "../include/kami_builtins.h"
+#include "kami_regex.h"
 #include "rt_internal.h"
 
 #include <cctype>
@@ -538,6 +539,37 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         out->tag = KT_NONE;
         out->i = 0;
     };
+    auto unpin = [&](KamiValue* p) {
+        for (size_t i = g_pins.size(); i-- > 0;)
+            if (g_pins[i].first == p) { g_pins.erase(g_pins.begin() + (long)i); break; }
+    };
+    // Build a Match object (internal class) holding the text and group spans.
+    auto make_match = [&](KamiValue* o, const std::string& text, const std::vector<int>& gs,
+                          const std::vector<int>& ge) {
+        KamiClassObj* cls = internal_class("Match");
+        KamiInstance* inst = (KamiInstance*)gc_alloc(sizeof(KamiInstance), KT_OBJECT);
+        inst->cls = cls;
+        inst->fields = new std::unordered_map<std::string, KamiValue>();
+        o->tag = KT_OBJECT;
+        o->p = inst; // rooted
+        // store groups as a list of [start, end, text] triples
+        KamiList* groups = list_new((int64_t)gs.size());
+        for (size_t g = 0; g < gs.size(); g++) {
+            KamiList* tri = list_new(3);
+            tri->items[0].tag = KT_INT; tri->items[0].i = gs[g];
+            tri->items[1].tag = KT_INT; tri->items[1].i = ge[g];
+            tri->items[2].tag = KT_STR;
+            tri->items[2].p = gs[g] < 0 ? str_new("", 0)
+                                        : str_new(text.data() + gs[g], ge[g] - gs[g]);
+            tri->len = 3;
+            KamiValue tv{KT_LIST, {0}};
+            tv.p = tri;
+            groups->items[groups->len++] = tv;
+        }
+        KamiValue gv{KT_LIST, {0}};
+        gv.p = groups;
+        (*inst->fields)["__groups__"] = gv;
+    };
     std::error_code ec;
     switch (id) {
     // ---- os ----
@@ -741,6 +773,186 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         v.tag = KT_STR;
         v.p = str_new(body.data(), (int64_t)body.size());
         (*inst->fields)["text"] = v;
+        return true;
+    }
+    // ---- functional: map / filter (eager; return lists) ----
+    case KB_MAP:
+    case KB_FILTER: {
+        const char* fn = id == KB_MAP ? "map" : "filter";
+        if (nargs != 2) panic(std::string(fn) + "() takes exactly 2 arguments");
+        KamiValue fnv = *argv[0];
+        KamiValue seqv;
+        kami_iter_prep(&seqv, argv[1]);
+        g_pins.push_back({&seqv, 1});
+        KamiList* src = (KamiList*)seqv.p;
+        KamiList* r = list_new(src->len);
+        out->tag = KT_LIST;
+        out->p = r; // rooted
+        for (int64_t i = 0; i < src->len; i++) {
+            KamiValue res;
+            KamiValue* a1[1] = {&src->items[i]};
+            if (id == KB_MAP && fnv.tag == KT_NONE) {
+                res = src->items[i];
+            } else {
+                lk.unlock();
+                kami_call_value(&res, &fnv, a1, 1);
+                lk.lock();
+                src = (KamiList*)seqv.p; // re-read (GC may have run)
+                r = (KamiList*)out->p;
+            }
+            if (id == KB_MAP) {
+                list_push(r, &res);
+            } else {
+                if (kami_truthy(&res)) list_push(r, &src->items[i]);
+            }
+        }
+        unpin(&seqv);
+        return true;
+    }
+    // ---- re ----
+    case KB_RE_MATCH:
+    case KB_RE_SEARCH:
+    case KB_RE_FULLMATCH: {
+        std::string pat = arg_str(0, "re");
+        std::string text = arg_str(1, "re");
+        re::Regex rx(pat);
+        if (!rx.ok()) panic("re.error: " + rx.err());
+        std::vector<int> gs, ge;
+        bool matched = false;
+        int base = 0;
+        if (id == KB_RE_SEARCH) {
+            int at = rx.search(text, 0, gs, ge);
+            matched = at >= 0;
+        } else {
+            matched = rx.matchAt(text, 0, gs, ge, id == KB_RE_FULLMATCH);
+        }
+        (void)base;
+        if (!matched) { set_none(); return true; }
+        make_match(out, text, gs, ge);
+        return true;
+    }
+    case KB_RE_FINDALL: {
+        std::string pat = arg_str(0, "re.findall");
+        std::string text = arg_str(1, "re.findall");
+        re::Regex rx(pat);
+        if (!rx.ok()) panic("re.error: " + rx.err());
+        KamiList* r = list_new(4);
+        out->tag = KT_LIST;
+        out->p = r;
+        std::vector<int> gs, ge;
+        int from = 0;
+        int n = (int)text.size();
+        while (from <= n) {
+            int at = rx.search(text, from, gs, ge);
+            if (at < 0) break;
+            // findall returns group(1) if one group, tuple of groups if many,
+            // else whole match — matching Python semantics.
+            KamiValue v;
+            int ng = rx.group_count();
+            auto sub = [&](int g) {
+                if (gs[g] < 0) return str_new("", 0);
+                return str_new(text.data() + gs[g], ge[g] - gs[g]);
+            };
+            if (ng == 0) {
+                v.tag = KT_STR;
+                v.p = sub(0);
+            } else if (ng == 1) {
+                v.tag = KT_STR;
+                v.p = sub(1);
+            } else {
+                KamiList* tup = list_new(ng);
+                for (int g = 1; g <= ng; g++) {
+                    KamiValue sv{KT_STR, {0}};
+                    sv.p = sub(g);
+                    tup->items[tup->len++] = sv;
+                }
+                v.tag = KT_LIST;
+                v.p = tup;
+            }
+            r = (KamiList*)out->p;
+            list_push(r, &v);
+            int me = ge[0];
+            from = (me == at) ? me + 1 : me; // advance past empty matches
+        }
+        return true;
+    }
+    case KB_RE_SUB: {
+        std::string pat = arg_str(0, "re.sub");
+        std::string repl = arg_str(1, "re.sub");
+        std::string text = arg_str(2, "re.sub");
+        int count = 0;
+        if (nargs >= 4 && argv[3]->tag == KT_INT) count = (int)argv[3]->i;
+        re::Regex rx(pat);
+        if (!rx.ok()) panic("re.error: " + rx.err());
+        std::string result;
+        std::vector<int> gs, ge;
+        int from = 0, done = 0;
+        int n = (int)text.size();
+        while (from <= n) {
+            int at = rx.search(text, from, gs, ge);
+            if (at < 0) break;
+            result.append(text, (size_t)from, (size_t)(at - from));
+            // expand backreferences \1..\9 and \g<n>
+            for (size_t i = 0; i < repl.size(); i++) {
+                if (repl[i] == '\\' && i + 1 < repl.size()) {
+                    char c = repl[i + 1];
+                    if (isdigit((unsigned char)c)) {
+                        int g = c - '0';
+                        if (g <= rx.group_count() && gs[g] >= 0)
+                            result.append(text, (size_t)gs[g], (size_t)(ge[g] - gs[g]));
+                        i++;
+                        continue;
+                    }
+                    if (c == 'n') { result += '\n'; i++; continue; }
+                    if (c == 't') { result += '\t'; i++; continue; }
+                    if (c == '\\') { result += '\\'; i++; continue; }
+                }
+                result += repl[i];
+            }
+            int me = ge[0];
+            if (me == at) { // empty match: emit one char, advance
+                if (at < n) result += text[at];
+                from = at + 1;
+            } else {
+                from = me;
+            }
+            done++;
+            if (count > 0 && done >= count) break;
+        }
+        if (from < n) result.append(text, (size_t)from, (size_t)(n - from));
+        out->tag = KT_STR;
+        out->p = str_new(result.data(), (int64_t)result.size());
+        return true;
+    }
+    case KB_RE_SPLIT: {
+        std::string pat = arg_str(0, "re.split");
+        std::string text = arg_str(1, "re.split");
+        re::Regex rx(pat);
+        if (!rx.ok()) panic("re.error: " + rx.err());
+        KamiList* r = list_new(4);
+        out->tag = KT_LIST;
+        out->p = r;
+        std::vector<int> gs, ge;
+        int from = 0, last = 0, n = (int)text.size();
+        while (from <= n) {
+            int at = rx.search(text, from, gs, ge);
+            if (at < 0) break;
+            if (ge[0] == at) { // empty match
+                from = at + 1;
+                if (from > n) break;
+                continue;
+            }
+            KamiValue v{KT_STR, {0}};
+            v.p = str_new(text.data() + last, at - last);
+            r = (KamiList*)out->p;
+            list_push(r, &v);
+            last = ge[0];
+            from = ge[0];
+        }
+        KamiValue tail{KT_STR, {0}};
+        tail.p = str_new(text.data() + last, n - last);
+        r = (KamiList*)out->p;
+        list_push(r, &tail);
         return true;
     }
     case KB_KWARGS_UNSUPPORTED:

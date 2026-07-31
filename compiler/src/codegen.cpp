@@ -208,6 +208,14 @@ struct FnGen {
                      std::to_string(e->res_idx) + ", ptr " + str_const(e->sval) + ")");
                 return t;
             }
+            if (e->res == Res::Capture) {
+                int t = alloc_temp();
+                std::string cp = r();
+                emit(cp + " = getelementptr inbounds %kv, ptr %captures, i64 " +
+                     std::to_string(e->res_idx));
+                emit("call void @kami_copy(ptr " + slot_ptr(t) + ", ptr " + cp + ")");
+                return t;
+            }
             return read_var(e->res, e->res_idx);
         case ExprKind::Binary: {
             int save = temp_top;
@@ -358,6 +366,8 @@ struct FnGen {
         }
         case ExprKind::ListComp:
             return gen_listcomp(e);
+        case ExprKind::Closure:
+            return gen_closure(e->res_idx);
         case ExprKind::Call: {
             const Expr* callee = e->a.get();
             // Result slot is allocated BEFORE the arguments so it can never
@@ -370,8 +380,8 @@ struct FnGen {
             if (callee->res == Res::UserFunc) {
                 fill_argbuf(slots);
                 const Stmt* f = mod.functions[(size_t)callee->res_idx];
-                emit("call void @u_" + f->alias + "(ptr " + slot_ptr(t) + ", ptr %argbuf, i64 " +
-                     std::to_string(slots.size()) + ")");
+                emit("call void @u_" + f->alias + "(ptr " + slot_ptr(t) +
+                     ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr null)");
                 temp_top = save;
                 return t;
             }
@@ -406,6 +416,40 @@ struct FnGen {
         }
         }
         throw CompileError(e->line, "internal error: bad expression kind in codegen");
+    }
+
+    // Materialize a capture source (in enclosing-frame terms) into a slot,
+    // returning that slot index.
+    int capture_source_slot(int kind, int64_t idx) {
+        if (kind == 1) return (int)idx; // enclosing local slot
+        int t = alloc_temp();
+        if (kind == 2) { // global
+            emit("call void @kami_global_get(ptr " + slot_ptr(t) + ", i64 " +
+                 std::to_string(idx) + ")");
+        } else { // 3: enclosing capture
+            std::string cp = r();
+            emit(cp + " = getelementptr inbounds %kv, ptr %captures, i64 " +
+                 std::to_string(idx));
+            emit("call void @kami_copy(ptr " + slot_ptr(t) + ", ptr " + cp + ")");
+        }
+        return t;
+    }
+
+    int gen_closure(int64_t func_index) {
+        const Stmt* fn = mod.functions[(size_t)func_index];
+        int result = alloc_temp();
+        int save = temp_top;
+        std::vector<int> caps;
+        for (size_t i = 0; i < fn->multi_tkind.size(); i++)
+            caps.push_back(capture_source_slot(fn->multi_tkind[i], fn->multi_tidx[i]));
+        fill_argbuf(caps);
+        size_t fmin = fn->params.size() - fn->defaults.size();
+        emit("call void @kami_make_closure(ptr " + slot_ptr(result) + ", ptr @u_" + fn->alias +
+             ", i64 " + std::to_string(fmin) + ", i64 " + std::to_string(fn->params.size()) +
+             ", ptr " + str_const(fn->name) + ", ptr %argbuf, i64 " +
+             std::to_string(caps.size()) + ")");
+        temp_top = save;
+        return result;
     }
 
     int gen_listcomp(const Expr* e) {
@@ -659,8 +703,31 @@ struct FnGen {
             break;
         }
         case StmtKind::FuncDef:
-            break; // compiled separately
+            if (s->global_idx < 0) { // nested function -> closure bound to a local
+                int c = gen_closure(s->func_index);
+                assign_var(s->target_res, s->target_idx, c);
+            } else if (!s->decorators.empty()) {
+                // top-level decorated function: name = d1(d2(...(name)))
+                int cur = alloc_temp();
+                emit("call void @kami_global_get(ptr " + slot_ptr(cur) + ", i64 " +
+                     std::to_string(s->global_idx) + ")");
+                for (size_t i = s->decorators.size(); i-- > 0;)
+                    cur = apply_decorator(s->decorators[i].get(), cur);
+                std::string sp = slot_ptr(cur);
+                emit("call void @kami_global_set(i64 " + std::to_string(s->global_idx) +
+                     ", ptr " + sp + ")");
+            }
+            break;
         case StmtKind::ClassDef: {
+            if (!s->decorators.empty()) {
+                int cur = alloc_temp();
+                emit("call void @kami_global_get(ptr " + slot_ptr(cur) + ", i64 " +
+                     std::to_string(s->global_idx) + ")");
+                for (size_t i = s->decorators.size(); i-- > 0;)
+                    cur = apply_decorator(s->decorators[i].get(), cur);
+                emit("call void @kami_global_set(i64 " + std::to_string(s->global_idx) +
+                     ", ptr " + slot_ptr(cur) + ")");
+            }
             // class attribute assignments run here, in module order
             for (auto& msp : s->body) {
                 if (msp->kind != StmtKind::Assign) continue;
@@ -734,6 +801,17 @@ struct FnGen {
             break;
         }
         temp_top = save;
+    }
+
+    int apply_decorator(const Expr* deco, int arg_slot) {
+        int fn = gen_expr(deco);
+        std::string fp = slot_ptr(fn);
+        std::vector<int> a{arg_slot};
+        fill_argbuf(a);
+        int t = alloc_temp();
+        emit("call void @kami_call_value(ptr " + slot_ptr(t) + ", ptr " + fp +
+             ", ptr %argbuf, i64 1)");
+        return t;
     }
 
     void gen_multi_assign(const Stmt* s) {
@@ -1076,7 +1154,7 @@ struct FnGen {
         if (total < 1) total = 1;
         std::string out;
         out += "define void @" + fn_name +
-               "(ptr %ret, ptr %argv, i64 %nargs) {\n";
+               "(ptr %ret, ptr %argv, i64 %nargs, ptr %captures) {\n";
         out += "entry:\n";
         out += "  %frame = alloca %kv, i64 " + std::to_string(total) + ", align 8\n";
         out += "  %argbuf = alloca ptr, i64 " + std::to_string(max_call_args) + ", align 8\n";
@@ -1120,6 +1198,7 @@ declare void @kami_make_str(ptr, ptr, i64)
 declare void @kami_make_list(ptr, ptr, i64)
 declare void @kami_make_map(ptr)
 declare void @kami_make_builtin_func(ptr, i64, ptr)
+declare void @kami_make_closure(ptr, ptr, i64, i64, ptr, ptr, i64)
 declare void @kami_make_set(ptr)
 declare void @kami_set_add(ptr, ptr)
 declare i32 @kami_truthy(ptr)

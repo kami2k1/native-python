@@ -49,7 +49,8 @@ enum KamiBinOp : int64_t {
 enum KamiUnOp : int64_t { KUOP_NEG = 0, KUOP_NOT = 1, KUOP_INV = 2 };
 
 // Calling convention for compiled user functions.
-typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv, int64_t nargs);
+typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv, int64_t nargs,
+                       KamiValue* captures);
 
 // --- lifecycle ---
 void kami_rt_init(int64_t argc, char** argv);
@@ -74,6 +75,10 @@ void kami_make_str(KamiValue* out, const char* data, int64_t len);
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
 void kami_make_map(KamiValue* out);
 void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name);
+// Build a closure: copies ncap captured values (given as an array of slot
+// pointers) into the function object. out must be a rooted slot.
+void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
+                       const char* name, KamiValue** capture_slots, int64_t ncap);
 void kami_make_set(KamiValue* out);
 void kami_set_add(KamiValue* set, const KamiValue* v);
 

@@ -174,8 +174,31 @@ void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name
     f->arity = 16;
     f->builtin_id = builtin_id;
     f->name = name;
+    f->captures = nullptr;
+    f->ncaptures = 0;
     out->tag = KT_FUNC;
     out->p = f;
+}
+
+void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
+                       const char* name, KamiValue** capture_slots, int64_t ncap) {
+    Lock lk(g_lock);
+    KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
+    f->fn = fnptr;
+    f->min_arity = min_arity;
+    f->arity = arity;
+    f->builtin_id = -1;
+    f->name = name;
+    f->ncaptures = ncap;
+    f->captures = nullptr;
+    out->tag = KT_FUNC;
+    out->p = f; // root before the capture array alloc (which can GC)
+    if (ncap > 0) {
+        f->captures = (KamiValue*)malloc(sizeof(KamiValue) * (size_t)ncap);
+        if (!f->captures) panic("out of memory");
+        for (int64_t i = 0; i < ncap; i++) f->captures[i] = *capture_slots[i];
+        gc_track_extra((uint64_t)ncap * sizeof(KamiValue));
+    }
 }
 
 void kami_make_set(KamiValue* out) {
