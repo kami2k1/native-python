@@ -61,13 +61,17 @@ kamipy clean                # xóa .kamipy-cache
 | Functions | `def` với **kwargs + default params**, recursion, functions as values, `global` |
 | Sugar | list comprehension + genexp, tuple assignment/swap/unpack, `x = y = 0`, slices, `;`, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
-| Modules | `math`, `time`, `random`, `threading` (spawn/join), `sys` (argv/exit), `string`, `doctest` (stub); no-op: `typing`, `__future__`; `try: import cv2 / except ImportError:` hoạt động |
-| Threading | Real OS threads with GIL-style lock (elided when single-threaded) |
-| Memory | Mark & sweep GC (exception-unwind safe); ASan/LSan/TSan clean |
+| I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post via curl, http+https), **`json`** (loads/dumps) |
+| Collections | + **`set`** (`{1,2}`, `&\|^-`, add/remove), **`del`**, first-class builtins (`sorted(xs, key=len)`) |
+| Modules | `math time random threading sys os os.path json logging socket requests string doctest`; no-op `typing`/`__future__`; `try: import cv2 / except ImportError:` works |
+| Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
+| Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |
 
-**Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **914 build (42%), 704 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
+**Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **975 build (45%), 731 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
-Not yet / Chưa hỗ trợ (lỗi thông báo rõ): `with`, decorators, lambda, generators, closures/nested defs, set literals, `*args/**kwargs`, walrus, relative imports, third-party modules (numpy...).
+**Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary. TCP socket server+client qua thread. Xem `docs`/CHANGELOG.
+
+Not yet / Chưa hỗ trợ (lỗi thông báo rõ): decorators, lambda, generators, closures/nested defs, `*args/**kwargs`, walrus, relative imports, `re`/`numpy` và third-party modules khác.
 
 ## How it works / Cách hoạt động
 
@@ -117,6 +121,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Lexer / Parser / Sema / Codegen / Linker driver | ✅ implemented + tested |
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
-| Tests | ✅ 2 unit suites + 28 integration programs (threading, GC stress, neural-net XOR, 8 real-world projects, exceptions/classes/f-strings) |
+| Tests | ✅ 2 unit suites + 31 integration programs (threading, GC stress, neural-net XOR, 8 real-world projects, exceptions/classes/f-strings, files/sets, stdlib, sockets) |
 | CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
 | Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |
