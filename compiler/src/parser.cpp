@@ -11,6 +11,7 @@ struct Parser {
     size_t pos = 0;
     int func_depth = 0;
     int loop_depth = 0;
+    int class_depth = 0;
 
     explicit Parser(std::vector<Token> t) : toks(std::move(t)) {}
 
@@ -39,9 +40,53 @@ struct Parser {
         e->line = peek().line;
         return e;
     }
+    ExprPtr mkbin(int op, int line, ExprPtr a, ExprPtr b) {
+        auto e = std::make_unique<Expr>();
+        e->kind = ExprKind::Binary;
+        e->line = line;
+        e->op = op;
+        e->a = std::move(a);
+        e->b = std::move(b);
+        return e;
+    }
+
+    static ExprPtr clone_expr(const Expr* e) {
+        auto c = std::make_unique<Expr>();
+        c->kind = e->kind;
+        c->line = e->line;
+        c->ival = e->ival;
+        c->fval = e->fval;
+        c->sval = e->sval;
+        c->op = e->op;
+        c->params = e->params;
+        if (e->a) c->a = clone_expr(e->a.get());
+        if (e->b) c->b = clone_expr(e->b.get());
+        if (e->c) c->c = clone_expr(e->c.get());
+        for (auto& a : e->args) c->args.push_back(a ? clone_expr(a.get()) : nullptr);
+        for (auto& k : e->kwargs) c->kwargs.emplace_back(k.first, clone_expr(k.second.get()));
+        for (auto& p : e->pairs)
+            c->pairs.emplace_back(clone_expr(p.first.get()), clone_expr(p.second.get()));
+        return c;
+    }
 
     // ---------------- expressions ----------------
-    ExprPtr parse_expr() { return parse_or(); }
+    ExprPtr parse_expr() { return parse_ternary(); }
+
+    ExprPtr parse_ternary() {
+        ExprPtr v = parse_or();
+        if (!check(Tok::KW_IF)) return v;
+        int line = advance().line;
+        ExprPtr cond = parse_or();
+        expect(Tok::KW_ELSE, "'else' in conditional expression");
+        ExprPtr els = parse_ternary();
+        auto e = std::make_unique<Expr>();
+        e->kind = ExprKind::IfExp;
+        e->line = line;
+        e->a = std::move(v);
+        e->b = std::move(cond);
+        e->c = std::move(els);
+        return e;
+    }
 
     ExprPtr parse_or() {
         ExprPtr left = parse_and();
@@ -86,38 +131,105 @@ struct Parser {
         return parse_comparison();
     }
 
-    ExprPtr parse_comparison() {
-        ExprPtr left = parse_arith();
-        int op = -1;
-        bool negate = false;
+    // returns op or -1; negate for "not in" / "is not"
+    int comp_op(bool& negate) {
+        negate = false;
         switch (peek().kind) {
-        case Tok::EQ: op = KOP_EQ; break;
-        case Tok::NE: op = KOP_NE; break;
-        case Tok::LT: op = KOP_LT; break;
-        case Tok::GT: op = KOP_GT; break;
-        case Tok::LE: op = KOP_LE; break;
-        case Tok::GE: op = KOP_GE; break;
-        case Tok::KW_IN: op = KOP_IN; break;
-        case Tok::KW_NOT: // "not in"
-            if (peek(1).kind == Tok::KW_IN) { op = KOP_IN; negate = true; pos++; }
-            break;
-        default: break;
+        case Tok::EQ: return KOP_EQ;
+        case Tok::NE: return KOP_NE;
+        case Tok::LT: return KOP_LT;
+        case Tok::GT: return KOP_GT;
+        case Tok::LE: return KOP_LE;
+        case Tok::GE: return KOP_GE;
+        case Tok::KW_IN: return KOP_IN;
+        case Tok::KW_IS:
+            if (peek(1).kind == Tok::KW_NOT) { pos++; return KOP_ISNOT; }
+            return KOP_IS;
+        case Tok::KW_NOT:
+            if (peek(1).kind == Tok::KW_IN) { negate = true; pos++; return KOP_IN; }
+            return -1;
+        default: return -1;
         }
+    }
+
+    ExprPtr parse_comparison() {
+        ExprPtr left = parse_bitor();
+        bool neg1;
+        int op = comp_op(neg1);
         if (op < 0) return left;
         int line = advance().line;
-        auto e = std::make_unique<Expr>();
-        e->kind = ExprKind::Binary;
-        e->line = line;
-        e->op = op;
-        e->a = std::move(left);
-        e->b = parse_arith();
-        if (!negate) return e;
-        auto n = std::make_unique<Expr>();
-        n->kind = ExprKind::Unary;
-        n->line = line;
-        n->op = KUOP_NOT;
-        n->a = std::move(e);
-        return n;
+        ExprPtr right = parse_bitor();
+
+        auto wrap_neg = [&](ExprPtr x, bool neg, int ln) -> ExprPtr {
+            if (!neg) return x;
+            auto n = std::make_unique<Expr>();
+            n->kind = ExprKind::Unary;
+            n->line = ln;
+            n->op = KUOP_NOT;
+            n->a = std::move(x);
+            return n;
+        };
+
+        ExprPtr result = wrap_neg(mkbin(op, line, std::move(left), clone_expr(right.get())), neg1, line);
+        // chained comparisons: a < b < c  →  (a < b) and (b < c)
+        for (;;) {
+            bool negN;
+            int opN = comp_op(negN);
+            if (opN < 0) break;
+            int lnN = advance().line;
+            ExprPtr next = parse_bitor();
+            ExprPtr pair = wrap_neg(
+                mkbin(opN, lnN, std::move(right), clone_expr(next.get())), negN, lnN);
+            right = std::move(next);
+            auto conj = std::make_unique<Expr>();
+            conj->kind = ExprKind::BoolOp;
+            conj->line = lnN;
+            conj->op = 0; // and
+            conj->a = std::move(result);
+            conj->b = std::move(pair);
+            result = std::move(conj);
+        }
+        return result;
+    }
+
+    ExprPtr parse_bitor() {
+        ExprPtr left = parse_bitxor();
+        while (check(Tok::PIPE)) {
+            int line = advance().line;
+            left = mkbin(KOP_BITOR, line, std::move(left), parse_bitxor());
+        }
+        return left;
+    }
+
+    ExprPtr parse_bitxor() {
+        ExprPtr left = parse_bitand();
+        while (check(Tok::CARET)) {
+            int line = advance().line;
+            left = mkbin(KOP_BITXOR, line, std::move(left), parse_bitand());
+        }
+        return left;
+    }
+
+    ExprPtr parse_bitand() {
+        ExprPtr left = parse_shift();
+        while (check(Tok::AMP)) {
+            int line = advance().line;
+            left = mkbin(KOP_BITAND, line, std::move(left), parse_shift());
+        }
+        return left;
+    }
+
+    ExprPtr parse_shift() {
+        ExprPtr left = parse_arith();
+        for (;;) {
+            int op;
+            if (check(Tok::LSHIFT)) op = KOP_SHL;
+            else if (check(Tok::RSHIFT)) op = KOP_SHR;
+            else break;
+            int line = advance().line;
+            left = mkbin(op, line, std::move(left), parse_arith());
+        }
+        return left;
     }
 
     ExprPtr parse_arith() {
@@ -128,13 +240,7 @@ struct Parser {
             else if (check(Tok::MINUS)) op = KOP_SUB;
             else break;
             int line = advance().line;
-            auto e = std::make_unique<Expr>();
-            e->kind = ExprKind::Binary;
-            e->line = line;
-            e->op = op;
-            e->a = std::move(left);
-            e->b = parse_term();
-            left = std::move(e);
+            left = mkbin(op, line, std::move(left), parse_term());
         }
         return left;
     }
@@ -149,13 +255,7 @@ struct Parser {
             else if (check(Tok::PERCENT)) op = KOP_MOD;
             else break;
             int line = advance().line;
-            auto e = std::make_unique<Expr>();
-            e->kind = ExprKind::Binary;
-            e->line = line;
-            e->op = op;
-            e->a = std::move(left);
-            e->b = parse_factor();
-            left = std::move(e);
+            left = mkbin(op, line, std::move(left), parse_factor());
         }
         return left;
     }
@@ -171,7 +271,69 @@ struct Parser {
             return e;
         }
         if (check(Tok::PLUS)) { advance(); return parse_factor(); }
-        return parse_postfix();
+        if (check(Tok::TILDE)) {
+            int line = advance().line;
+            auto e = std::make_unique<Expr>();
+            e->kind = ExprKind::Unary;
+            e->line = line;
+            e->op = KUOP_INV;
+            e->a = parse_factor();
+            return e;
+        }
+        return parse_power();
+    }
+
+    ExprPtr parse_power() {
+        ExprPtr base = parse_postfix();
+        if (check(Tok::POW)) {
+            int line = advance().line;
+            return mkbin(KOP_POW, line, std::move(base), parse_factor()); // right-assoc
+        }
+        return base;
+    }
+
+    // call argument list after '('
+    void parse_call_args(Expr* call) {
+        if (!check(Tok::RPAREN)) {
+            do {
+                if (check(Tok::RPAREN)) break; // trailing comma
+                if (check(Tok::STAR) || check(Tok::POW))
+                    err("*args/**kwargs are not supported");
+                if (check(Tok::NAME) && peek(1).kind == Tok::ASSIGN) {
+                    std::string kw = advance().text;
+                    advance(); // '='
+                    call->kwargs.emplace_back(kw, parse_expr());
+                    continue;
+                }
+                ExprPtr a = parse_expr();
+                if (check(Tok::KW_FOR)) { // generator expression argument
+                    a = parse_comprehension_tail(std::move(a));
+                }
+                call->args.push_back(std::move(a));
+            } while (match(Tok::COMMA));
+        }
+        expect(Tok::RPAREN, "')'");
+        if (call->args.size() + call->kwargs.size() > 16)
+            throw CompileError(call->line, "too many arguments (max 16)");
+    }
+
+    ExprPtr parse_comprehension_tail(ExprPtr element) {
+        int line = advance().line; // 'for'
+        auto e = std::make_unique<Expr>();
+        e->kind = ExprKind::ListComp;
+        e->line = line;
+        e->a = std::move(element);
+        e->params.push_back(expect(Tok::NAME, "comprehension target").text);
+        while (match(Tok::COMMA))
+            e->params.push_back(expect(Tok::NAME, "comprehension target").text);
+        expect(Tok::KW_IN, "'in'");
+        e->b = parse_or();
+        if (check(Tok::KW_IF)) {
+            advance();
+            e->c = parse_or();
+        }
+        if (check(Tok::KW_FOR)) err("nested comprehensions are not supported");
+        return e;
     }
 
     ExprPtr parse_postfix() {
@@ -179,37 +341,65 @@ struct Parser {
         for (;;) {
             if (check(Tok::LPAREN)) {
                 int line = advance().line;
-                std::vector<ExprPtr> args;
-                if (!check(Tok::RPAREN)) {
-                    do { args.push_back(parse_expr()); } while (match(Tok::COMMA));
-                }
-                expect(Tok::RPAREN, "')'");
-                if (args.size() > 16) throw CompileError(line, "too many arguments (max 16)");
                 if (e->kind == ExprKind::Attr) {
                     auto c = std::make_unique<Expr>();
                     c->kind = ExprKind::MethodCall;
                     c->line = line;
-                    c->sval = e->sval;   // method / module-attr name
+                    c->sval = e->sval;
                     c->a = std::move(e->a);
-                    c->args = std::move(args);
+                    parse_call_args(c.get());
                     e = std::move(c);
                 } else {
                     auto c = std::make_unique<Expr>();
                     c->kind = ExprKind::Call;
                     c->line = line;
                     c->a = std::move(e);
-                    c->args = std::move(args);
+                    parse_call_args(c.get());
                     e = std::move(c);
                 }
             } else if (check(Tok::LBRACKET)) {
                 int line = advance().line;
-                auto c = std::make_unique<Expr>();
-                c->kind = ExprKind::Index;
-                c->line = line;
-                c->a = std::move(e);
-                c->b = parse_expr();
+                // index or slice
+                ExprPtr start, stop, step;
+                bool is_slice = false;
+                if (!check(Tok::COLON)) start = parse_expr();
+                if (start && check(Tok::COMMA)) { // a[x, y] — tuple index
+                    auto lst = std::make_unique<Expr>();
+                    lst->kind = ExprKind::ListLit;
+                    lst->line = line;
+                    lst->args.push_back(std::move(start));
+                    while (match(Tok::COMMA)) {
+                        if (check(Tok::RBRACKET)) break;
+                        lst->args.push_back(parse_expr());
+                    }
+                    start = std::move(lst);
+                }
+                if (check(Tok::COLON)) {
+                    is_slice = true;
+                    advance();
+                    if (!check(Tok::COLON) && !check(Tok::RBRACKET)) stop = parse_expr();
+                    if (match(Tok::COLON)) {
+                        if (!check(Tok::RBRACKET)) step = parse_expr();
+                    }
+                }
                 expect(Tok::RBRACKET, "']'");
-                e = std::move(c);
+                if (is_slice) {
+                    auto c = std::make_unique<Expr>();
+                    c->kind = ExprKind::Slice;
+                    c->line = line;
+                    c->a = std::move(e);
+                    c->args.push_back(std::move(start));
+                    c->args.push_back(std::move(stop));
+                    c->args.push_back(std::move(step));
+                    e = std::move(c);
+                } else {
+                    auto c = std::make_unique<Expr>();
+                    c->kind = ExprKind::Index;
+                    c->line = line;
+                    c->a = std::move(e);
+                    c->b = std::move(start);
+                    e = std::move(c);
+                }
             } else if (check(Tok::DOT)) {
                 int line = advance().line;
                 const Token& n = expect(Tok::NAME, "attribute name");
@@ -245,6 +435,10 @@ struct Parser {
             auto e = mk(ExprKind::StrLit);
             e->sval = t.text;
             advance();
+            while (check(Tok::STRING)) { // implicit concatenation: "a" "b"
+                e->sval += peek().text;
+                advance();
+            }
             return e;
         }
         case Tok::KW_TRUE:
@@ -265,36 +459,77 @@ struct Parser {
             advance();
             return e;
         }
+        case Tok::KW_LAMBDA: err("lambda expressions are not supported");
+        case Tok::KW_YIELD: err("generators (yield) are not supported");
         case Tok::LPAREN: {
-            advance();
-            ExprPtr e = parse_expr();
+            int line = advance().line;
+            if (check(Tok::RPAREN)) { // empty tuple → empty list
+                advance();
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::ListLit;
+                e->line = line;
+                return e;
+            }
+            ExprPtr inner = parse_expr();
+            if (check(Tok::KW_FOR)) {
+                ExprPtr comp = parse_comprehension_tail(std::move(inner));
+                expect(Tok::RPAREN, "')'");
+                return comp;
+            }
+            if (check(Tok::COMMA)) { // tuple → list
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::ListLit;
+                e->line = line;
+                e->args.push_back(std::move(inner));
+                while (match(Tok::COMMA)) {
+                    if (check(Tok::RPAREN)) break;
+                    e->args.push_back(parse_expr());
+                }
+                expect(Tok::RPAREN, "')'");
+                return e;
+            }
             expect(Tok::RPAREN, "')'");
-            return e;
+            return inner;
         }
         case Tok::LBRACKET: {
             auto e = mk(ExprKind::ListLit);
             advance();
-            if (!check(Tok::RBRACKET)) {
-                do {
-                    if (check(Tok::RBRACKET)) break; // trailing comma
-                    e->args.push_back(parse_expr());
-                } while (match(Tok::COMMA));
+            if (check(Tok::RBRACKET)) {
+                advance();
+                return e;
+            }
+            ExprPtr first = parse_expr();
+            if (check(Tok::KW_FOR)) {
+                ExprPtr comp = parse_comprehension_tail(std::move(first));
+                expect(Tok::RBRACKET, "']'");
+                return comp;
+            }
+            e->args.push_back(std::move(first));
+            while (match(Tok::COMMA)) {
+                if (check(Tok::RBRACKET)) break;
+                e->args.push_back(parse_expr());
             }
             expect(Tok::RBRACKET, "']'");
-            if (e->args.size() > 16) err("list literal too long (max 16 items; use append)");
             return e;
         }
         case Tok::LBRACE: {
             auto e = mk(ExprKind::MapLit);
             advance();
-            if (!check(Tok::RBRACE)) {
-                do {
-                    if (check(Tok::RBRACE)) break;
-                    ExprPtr k = parse_expr();
-                    expect(Tok::COLON, "':'");
-                    ExprPtr v = parse_expr();
-                    e->pairs.emplace_back(std::move(k), std::move(v));
-                } while (match(Tok::COMMA));
+            if (check(Tok::RBRACE)) {
+                advance();
+                return e;
+            }
+            ExprPtr k = parse_expr();
+            if (!check(Tok::COLON)) err("set literals are not supported (use a list or dict)");
+            advance();
+            ExprPtr v = parse_expr();
+            if (check(Tok::KW_FOR)) err("dict comprehensions are not supported");
+            e->pairs.emplace_back(std::move(k), std::move(v));
+            while (match(Tok::COMMA)) {
+                if (check(Tok::RBRACE)) break;
+                ExprPtr k2 = parse_expr();
+                expect(Tok::COLON, "':'");
+                e->pairs.emplace_back(std::move(k2), parse_expr());
             }
             expect(Tok::RBRACE, "'}'");
             return e;
@@ -314,56 +549,174 @@ struct Parser {
     }
 
     std::vector<StmtPtr> parse_block() {
+        if (!check(Tok::NEWLINE)) { // inline body:  if x: do_it()
+            std::vector<StmtPtr> body;
+            for (;;) {
+                body.push_back(parse_small_stmt());
+                if (match(Tok::SEMI)) {
+                    if (check(Tok::NEWLINE)) break;
+                    continue;
+                }
+                break;
+            }
+            expect(Tok::NEWLINE, "newline");
+            return body;
+        }
         expect(Tok::NEWLINE, "newline");
         expect(Tok::INDENT, "an indented block");
         std::vector<StmtPtr> body;
-        while (!check(Tok::DEDENT) && !check(Tok::END)) body.push_back(parse_stmt());
+        while (!check(Tok::DEDENT) && !check(Tok::END)) parse_stmt_into(body);
         expect(Tok::DEDENT, "dedent");
         return body;
     }
 
-    StmtPtr parse_stmt() {
+    void parse_stmt_into(std::vector<StmtPtr>& body) {
+        switch (peek().kind) {
+        case Tok::KW_IF: body.push_back(parse_if()); return;
+        case Tok::KW_WHILE: body.push_back(parse_while()); return;
+        case Tok::KW_FOR: body.push_back(parse_for()); return;
+        case Tok::KW_DEF: body.push_back(parse_def()); return;
+        case Tok::KW_CLASS: body.push_back(parse_class()); return;
+        case Tok::KW_TRY: body.push_back(parse_try()); return;
+        case Tok::KW_WITH: err("'with' statements are not supported");
+        case Tok::AT: err("decorators (@...) are not supported");
+        case Tok::KW_DEL: err("'del' is not supported");
+        case Tok::KW_NONLOCAL: err("'nonlocal' is not supported");
+        default: break;
+        }
+        // one or more simple statements separated by ';'
+        for (;;) {
+            body.push_back(parse_small_stmt());
+            if (match(Tok::SEMI)) {
+                if (check(Tok::NEWLINE)) { advance(); return; }
+                continue;
+            }
+            expect(Tok::NEWLINE, "newline");
+            return;
+        }
+    }
+
+    StmtPtr parse_small_stmt() {
         const Token& t = peek();
         switch (t.kind) {
-        case Tok::KW_IF: return parse_if();
-        case Tok::KW_WHILE: return parse_while();
-        case Tok::KW_FOR: return parse_for();
-        case Tok::KW_DEF: return parse_def();
         case Tok::KW_RETURN: {
             if (func_depth == 0) err("'return' outside function");
             int line = advance().line;
             auto s = mks(StmtKind::Return, line);
-            if (!check(Tok::NEWLINE)) s->e1 = parse_expr();
-            expect(Tok::NEWLINE, "newline");
+            if (!check(Tok::NEWLINE) && !check(Tok::SEMI)) {
+                ExprPtr v = parse_expr();
+                if (check(Tok::COMMA)) { // return a, b → return [a, b]
+                    auto lst = std::make_unique<Expr>();
+                    lst->kind = ExprKind::ListLit;
+                    lst->line = line;
+                    lst->args.push_back(std::move(v));
+                    while (match(Tok::COMMA)) {
+                        if (check(Tok::NEWLINE)) break;
+                        lst->args.push_back(parse_expr());
+                    }
+                    v = std::move(lst);
+                }
+                s->e1 = std::move(v);
+            }
             return s;
         }
         case Tok::KW_BREAK: {
             if (loop_depth == 0) err("'break' outside loop");
             int line = advance().line;
-            expect(Tok::NEWLINE, "newline");
             return mks(StmtKind::Break, line);
         }
         case Tok::KW_CONTINUE: {
             if (loop_depth == 0) err("'continue' outside loop");
             int line = advance().line;
-            expect(Tok::NEWLINE, "newline");
             return mks(StmtKind::Continue, line);
         }
         case Tok::KW_PASS: {
             int line = advance().line;
-            expect(Tok::NEWLINE, "newline");
             return mks(StmtKind::Pass, line);
         }
-        case Tok::KW_IMPORT: {
+        case Tok::KW_IMPORT: return parse_import();
+        case Tok::KW_FROM: return parse_from_import();
+        case Tok::KW_RAISE: {
             int line = advance().line;
-            const Token& n = expect(Tok::NAME, "module name");
-            expect(Tok::NEWLINE, "newline");
-            auto s = mks(StmtKind::Import, line);
-            s->name = n.text;
+            auto s = mks(StmtKind::Raise, line);
+            if (!check(Tok::NEWLINE) && !check(Tok::SEMI)) {
+                s->e1 = parse_expr();
+                if (match(Tok::KW_FROM)) parse_expr(); // raise X from Y: cause ignored
+            } else {
+                s->raise_mode = 1; // bare re-raise
+            }
+            return s;
+        }
+        case Tok::KW_ASSERT: {
+            int line = advance().line;
+            ExprPtr cond = parse_expr();
+            ExprPtr msg;
+            if (match(Tok::COMMA)) msg = parse_expr();
+            // desugar: if not cond: raise AssertionError(msg)
+            auto iff = mks(StmtKind::If, line);
+            auto notc = std::make_unique<Expr>();
+            notc->kind = ExprKind::Unary;
+            notc->line = line;
+            notc->op = KUOP_NOT;
+            notc->a = std::move(cond);
+            iff->e1 = std::move(notc);
+            auto rs = mks(StmtKind::Raise, line);
+            rs->raise_mode = 2;
+            rs->name = "AssertionError";
+            rs->e1 = std::move(msg); // may be null
+            iff->body.push_back(std::move(rs));
+            return iff;
+        }
+        case Tok::KW_GLOBAL: {
+            int line = advance().line;
+            auto s = mks(StmtKind::Global, line);
+            s->params.push_back(expect(Tok::NAME, "name").text);
+            while (match(Tok::COMMA)) s->params.push_back(expect(Tok::NAME, "name").text);
             return s;
         }
         default: return parse_simple();
         }
+    }
+
+    StmtPtr parse_import() {
+        int line = advance().line;
+        // import a.b [as x] [, c [as y]]*  — only the first module kept per stmt;
+        // extra modules become chained Import stmts is not possible here (single
+        // return), so we parse them into one stmt list via a wrapper below.
+        auto s = mks(StmtKind::Import, line);
+        s->name = parse_dotted_name();
+        if (match(Tok::KW_AS)) s->alias = expect(Tok::NAME, "alias").text;
+        while (match(Tok::COMMA)) {
+            // represent extra "import b" as nested Import in body
+            auto extra = mks(StmtKind::Import, line);
+            extra->name = parse_dotted_name();
+            if (match(Tok::KW_AS)) extra->alias = expect(Tok::NAME, "alias").text;
+            s->body.push_back(std::move(extra));
+        }
+        return s;
+    }
+
+    std::string parse_dotted_name() {
+        std::string n = expect(Tok::NAME, "module name").text;
+        while (match(Tok::DOT)) n += "." + expect(Tok::NAME, "module name").text;
+        return n;
+    }
+
+    StmtPtr parse_from_import() {
+        int line = advance().line;
+        auto s = mks(StmtKind::FromImport, line);
+        if (check(Tok::DOT))
+            throw CompileError(line, "relative imports (from . import x) are not supported");
+        s->name = parse_dotted_name();
+        expect(Tok::KW_IMPORT, "'import'");
+        if (check(Tok::STAR)) err("'from X import *' is not supported");
+        do {
+            std::string n = expect(Tok::NAME, "name").text;
+            std::string a = n;
+            if (match(Tok::KW_AS)) a = expect(Tok::NAME, "alias").text;
+            s->import_names.emplace_back(n, a);
+        } while (match(Tok::COMMA));
+        return s;
     }
 
     StmtPtr parse_if() {
@@ -373,7 +726,7 @@ struct Parser {
         expect(Tok::COLON, "':'");
         s->body = parse_block();
         if (check(Tok::KW_ELIF)) {
-            s->orelse.push_back(parse_if()); // desugar elif → nested if
+            s->orelse.push_back(parse_if());
         } else if (match(Tok::KW_ELSE)) {
             expect(Tok::COLON, "':'");
             s->orelse = parse_block();
@@ -389,19 +742,64 @@ struct Parser {
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
+        if (check(Tok::KW_ELSE)) err("'while ... else' is not supported");
         return s;
     }
 
     StmtPtr parse_for() {
         int line = advance().line;
         auto s = mks(StmtKind::For, line);
-        s->name = expect(Tok::NAME, "loop variable").text;
+        s->params.push_back(expect(Tok::NAME, "loop variable").text);
+        while (match(Tok::COMMA))
+            s->params.push_back(expect(Tok::NAME, "loop variable").text);
+        s->name = s->params[0];
         expect(Tok::KW_IN, "'in'");
         s->e1 = parse_expr();
+        if (check(Tok::COMMA)) { // for x in a, b, c → iterate a tuple(list)
+            auto lst = std::make_unique<Expr>();
+            lst->kind = ExprKind::ListLit;
+            lst->line = line;
+            lst->args.push_back(std::move(s->e1));
+            while (match(Tok::COMMA)) lst->args.push_back(parse_expr());
+            s->e1 = std::move(lst);
+        }
         expect(Tok::COLON, "':'");
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
+        if (check(Tok::KW_ELSE)) err("'for ... else' is not supported");
+        return s;
+    }
+
+    StmtPtr parse_try() {
+        int line = advance().line;
+        auto s = mks(StmtKind::Try, line);
+        expect(Tok::COLON, "':'");
+        s->body = parse_block();
+        bool any = false;
+        while (check(Tok::KW_EXCEPT)) {
+            any = true;
+            advance();
+            ExceptClause h;
+            if (!check(Tok::COLON)) {
+                parse_expr(); // exception type (or tuple): parsed and ignored
+                if (match(Tok::KW_AS)) h.as_name = expect(Tok::NAME, "name").text;
+            }
+            expect(Tok::COLON, "':'");
+            h.body = parse_block();
+            s->handlers.push_back(std::move(h));
+        }
+        if (match(Tok::KW_ELSE)) {
+            if (!any) err("'else' requires at least one 'except' clause");
+            expect(Tok::COLON, "':'");
+            s->orelse = parse_block();
+        }
+        if (match(Tok::KW_FINALLY)) {
+            any = true;
+            expect(Tok::COLON, "':'");
+            s->final_body = parse_block();
+        }
+        if (!any) err("'try' requires 'except' or 'finally'");
         return s;
     }
 
@@ -411,12 +809,31 @@ struct Parser {
         auto s = mks(StmtKind::FuncDef, line);
         s->name = expect(Tok::NAME, "function name").text;
         expect(Tok::LPAREN, "'('");
+        bool seen_default = false;
         if (!check(Tok::RPAREN)) {
-            do { s->params.push_back(expect(Tok::NAME, "parameter name").text); }
-            while (match(Tok::COMMA));
+            do {
+                if (check(Tok::RPAREN)) break; // trailing comma
+                if (check(Tok::SLASH)) { advance(); continue; } // positional-only marker
+                if (check(Tok::STAR) || check(Tok::POW))
+                    throw CompileError(peek().line, "*args/**kwargs are not supported");
+                s->params.push_back(expect(Tok::NAME, "parameter name").text);
+                if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
+                if (match(Tok::ASSIGN)) {
+                    seen_default = true;
+                    ExprPtr d = parse_expr();
+                    if (!is_literal(d.get()))
+                        throw CompileError(d->line,
+                                           "default parameter values must be literals");
+                    s->defaults.push_back(std::move(d));
+                } else if (seen_default) {
+                    throw CompileError(peek().line,
+                                       "non-default parameter after default parameter");
+                }
+            } while (match(Tok::COMMA));
         }
         expect(Tok::RPAREN, "')'");
         if (s->params.size() > 16) throw CompileError(line, "too many parameters (max 16)");
+        if (match(Tok::ARROW)) parse_expr(); // return annotation: ignored
         expect(Tok::COLON, "':'");
         func_depth++;
         int save_loops = loop_depth;
@@ -427,73 +844,231 @@ struct Parser {
         return s;
     }
 
-    // assignment / expression statement
+    static bool is_literal(const Expr* e) {
+        switch (e->kind) {
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::StrLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NoneLit: return true;
+        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal(e->a.get());
+        case ExprKind::ListLit: return e->args.empty();
+        case ExprKind::MapLit: return e->pairs.empty();
+        case ExprKind::Call: // float("inf"), int(0), ...
+            if (e->a->kind != ExprKind::Name || !e->kwargs.empty()) return false;
+            if (e->a->sval != "float" && e->a->sval != "int" && e->a->sval != "str")
+                return false;
+            for (auto& a : e->args)
+                if (!is_literal(a.get())) return false;
+            return true;
+        default: return false;
+        }
+    }
+
+    StmtPtr parse_class() {
+        int line = advance().line;
+        if (func_depth > 0 || class_depth > 0)
+            throw CompileError(line, "nested classes are not supported");
+        auto s = mks(StmtKind::ClassDef, line);
+        s->name = expect(Tok::NAME, "class name").text;
+        if (match(Tok::LPAREN)) {
+            if (!check(Tok::RPAREN)) {
+                std::string base = expect(Tok::NAME, "base class name").text;
+                if (base != "object") s->alias = base; // alias = base class name
+                if (check(Tok::COMMA))
+                    throw CompileError(line, "multiple inheritance is not supported");
+            }
+            expect(Tok::RPAREN, "')'");
+        }
+        expect(Tok::COLON, "':'");
+        expect(Tok::NEWLINE, "newline");
+        expect(Tok::INDENT, "an indented block");
+        class_depth++;
+        while (!check(Tok::DEDENT) && !check(Tok::END)) {
+            if (check(Tok::KW_DEF)) {
+                s->body.push_back(parse_def());
+            } else if (check(Tok::KW_PASS)) {
+                advance();
+                expect(Tok::NEWLINE, "newline");
+            } else if (check(Tok::STRING)) { // docstring
+                advance();
+                expect(Tok::NEWLINE, "newline");
+            } else if (check(Tok::NAME) &&
+                       (peek(1).kind == Tok::ASSIGN || peek(1).kind == Tok::COLON)) {
+                // class attribute: NAME [":" type] "=" expr
+                auto a = mks(StmtKind::Assign, peek().line);
+                a->name = advance().text;
+                if (match(Tok::COLON)) parse_expr();
+                if (check(Tok::NEWLINE)) { // bare annotation: declares nothing
+                    advance();
+                    continue;
+                }
+                expect(Tok::ASSIGN, "'='");
+                a->e1 = parse_expr();
+                expect(Tok::NEWLINE, "newline");
+                s->body.push_back(std::move(a));
+            } else if (check(Tok::AT)) {
+                throw CompileError(peek().line,
+                                   "decorators (@staticmethod, @property, ...) are not supported");
+            } else {
+                throw CompileError(peek().line,
+                                   "only methods and simple attribute assignments are "
+                                   "supported in class bodies");
+            }
+        }
+        class_depth--;
+        expect(Tok::DEDENT, "dedent");
+        return s;
+    }
+
+    // assignment / expression statement (NEWLINE/SEMI left unconsumed)
     StmtPtr parse_simple() {
         int line = peek().line;
         ExprPtr e = parse_expr();
+
+        // variable annotation:  x: int [= value]  /  self.x: T = v  /  a[i]: T = v
+        if (check(Tok::COLON) && (e->kind == ExprKind::Name || e->kind == ExprKind::Attr ||
+                                  e->kind == ExprKind::Index)) {
+            advance();
+            parse_expr(); // annotation ignored
+            if (match(Tok::ASSIGN)) {
+                ExprPtr value = parse_rhs_values_as_one(line);
+                return make_assign(std::move(e), std::move(value), line);
+            }
+            return mks(StmtKind::Pass, line); // bare annotation declares nothing
+        }
+
+        // multi-target tuple assignment:  a, b = ...
+        if (check(Tok::COMMA)) {
+            auto s = mks(StmtKind::MultiAssign, line);
+            s->targets.push_back(std::move(e));
+            while (match(Tok::COMMA)) {
+                if (check(Tok::ASSIGN)) break;
+                s->targets.push_back(parse_expr());
+            }
+            expect(Tok::ASSIGN, "'='");
+            s->values.push_back(parse_expr());
+            while (match(Tok::COMMA)) {
+                if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
+                s->values.push_back(parse_expr());
+            }
+            for (auto& t2 : s->targets) check_target(t2.get());
+            if (s->values.size() > 1 && s->values.size() != s->targets.size())
+                throw CompileError(line, "unbalanced tuple assignment");
+            return s;
+        }
+
         Tok k = peek().kind;
-        if (k == Tok::ASSIGN || k == Tok::PLUSEQ || k == Tok::MINUSEQ || k == Tok::STAREQ ||
-            k == Tok::SLASHEQ) {
+        if (k == Tok::ASSIGN) {
             advance();
             ExprPtr value = parse_expr();
-            expect(Tok::NEWLINE, "newline");
-            if (k != Tok::ASSIGN) { // desugar augmented assignment: x += v → x = x + v
-                int op = k == Tok::PLUSEQ    ? KOP_ADD
-                         : k == Tok::MINUSEQ ? KOP_SUB
-                         : k == Tok::STAREQ  ? KOP_MUL
-                                             : KOP_DIV;
-                auto lhs_copy = clone_expr(e.get());
-                auto bin = std::make_unique<Expr>();
-                bin->kind = ExprKind::Binary;
-                bin->line = line;
-                bin->op = op;
-                bin->a = std::move(lhs_copy);
-                bin->b = std::move(value);
-                value = std::move(bin);
-            }
-            if (e->kind == ExprKind::Name) {
-                auto s = mks(StmtKind::Assign, line);
-                s->name = e->sval;
-                s->e1 = std::move(value);
+            // chained assignment: a = b = value
+            if (check(Tok::ASSIGN)) {
+                auto s = mks(StmtKind::MultiAssign, line);
+                s->alias = "chain";
+                check_target(e.get());
+                s->targets.push_back(std::move(e));
+                while (match(Tok::ASSIGN)) {
+                    check_target(value.get());
+                    s->targets.push_back(std::move(value));
+                    value = parse_expr();
+                }
+                s->values.push_back(std::move(value));
                 return s;
             }
-            if (e->kind == ExprKind::Index) {
-                auto s = mks(StmtKind::IndexAssign, line);
-                s->e1 = std::move(e->a);
-                s->e2 = std::move(e->b);
-                s->e3 = std::move(value);
-                return s;
+            // tuple RHS: x = 1, 2 → x = [1, 2]
+            if (check(Tok::COMMA)) {
+                auto lst = std::make_unique<Expr>();
+                lst->kind = ExprKind::ListLit;
+                lst->line = line;
+                lst->args.push_back(std::move(value));
+                while (match(Tok::COMMA)) {
+                    if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
+                    lst->args.push_back(parse_expr());
+                }
+                value = std::move(lst);
             }
-            throw CompileError(line, "invalid assignment target");
+            return make_assign(std::move(e), std::move(value), line);
         }
-        expect(Tok::NEWLINE, "newline");
+        int aug = -1;
+        switch (k) {
+        case Tok::PLUSEQ: aug = KOP_ADD; break;
+        case Tok::MINUSEQ: aug = KOP_SUB; break;
+        case Tok::STAREQ: aug = KOP_MUL; break;
+        case Tok::SLASHEQ: aug = KOP_DIV; break;
+        case Tok::DSLASHEQ: aug = KOP_FLOORDIV; break;
+        case Tok::PERCENTEQ: aug = KOP_MOD; break;
+        case Tok::POWEQ: aug = KOP_POW; break;
+        case Tok::AMPEQ: aug = KOP_BITAND; break;
+        case Tok::PIPEEQ: aug = KOP_BITOR; break;
+        case Tok::CARETEQ: aug = KOP_BITXOR; break;
+        case Tok::LSHIFTEQ: aug = KOP_SHL; break;
+        case Tok::RSHIFTEQ: aug = KOP_SHR; break;
+        default: break;
+        }
+        if (aug >= 0) {
+            advance();
+            ExprPtr rhs = parse_expr();
+            ExprPtr lhs_copy = clone_expr(e.get());
+            ExprPtr value = mkbin(aug, line, std::move(lhs_copy), std::move(rhs));
+            return make_assign(std::move(e), std::move(value), line);
+        }
         auto s = mks(StmtKind::ExprStmt, line);
         s->e1 = std::move(e);
         return s;
     }
 
-    static ExprPtr clone_expr(const Expr* e) {
-        auto c = std::make_unique<Expr>();
-        c->kind = e->kind;
-        c->line = e->line;
-        c->ival = e->ival;
-        c->fval = e->fval;
-        c->sval = e->sval;
-        c->op = e->op;
-        if (e->a) c->a = clone_expr(e->a.get());
-        if (e->b) c->b = clone_expr(e->b.get());
-        for (auto& a : e->args) c->args.push_back(clone_expr(a.get()));
-        for (auto& p : e->pairs)
-            c->pairs.emplace_back(clone_expr(p.first.get()), clone_expr(p.second.get()));
-        return c;
+    ExprPtr parse_rhs_values_as_one(int line) {
+        ExprPtr v = parse_expr();
+        if (check(Tok::COMMA)) {
+            auto lst = std::make_unique<Expr>();
+            lst->kind = ExprKind::ListLit;
+            lst->line = line;
+            lst->args.push_back(std::move(v));
+            while (match(Tok::COMMA)) {
+                if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
+                lst->args.push_back(parse_expr());
+            }
+            return lst;
+        }
+        return v;
+    }
+
+    void check_target(const Expr* e) {
+        if (e->kind != ExprKind::Name && e->kind != ExprKind::Index &&
+            e->kind != ExprKind::Attr)
+            throw CompileError(e->line, "invalid assignment target");
+    }
+
+    StmtPtr make_assign(ExprPtr target, ExprPtr value, int line) {
+        if (target->kind == ExprKind::Name) {
+            auto s = mks(StmtKind::Assign, line);
+            s->name = target->sval;
+            s->e1 = std::move(value);
+            return s;
+        }
+        if (target->kind == ExprKind::Index) {
+            auto s = mks(StmtKind::IndexAssign, line);
+            s->e1 = std::move(target->a);
+            s->e2 = std::move(target->b);
+            s->e3 = std::move(value);
+            return s;
+        }
+        if (target->kind == ExprKind::Attr) {
+            auto s = mks(StmtKind::AttrAssign, line);
+            s->e1 = std::move(target->a);
+            s->name = target->sval;
+            s->e3 = std::move(value);
+            return s;
+        }
+        throw CompileError(line, "invalid assignment target");
     }
 
     Module run() {
         Module m;
         while (!check(Tok::END)) {
-            // tolerate stray layout tokens at top level
             if (match(Tok::NEWLINE)) continue;
-            m.body.push_back(parse_stmt());
+            parse_stmt_into(m.body);
         }
         return m;
     }
@@ -522,6 +1097,14 @@ static const char* binop_name(int op) {
     case KOP_LE: return "<=";
     case KOP_GE: return ">=";
     case KOP_IN: return "in";
+    case KOP_POW: return "**";
+    case KOP_IS: return "is";
+    case KOP_ISNOT: return "is-not";
+    case KOP_BITAND: return "&";
+    case KOP_BITOR: return "|";
+    case KOP_BITXOR: return "^";
+    case KOP_SHL: return "<<";
+    case KOP_SHR: return ">>";
     default: return "?";
     }
 }
@@ -529,10 +1112,7 @@ static const char* binop_name(int op) {
 std::string dump_expr(const Expr* e) {
     switch (e->kind) {
     case ExprKind::IntLit: return std::to_string(e->ival);
-    case ExprKind::FloatLit: {
-        std::string s = std::to_string(e->fval);
-        return s;
-    }
+    case ExprKind::FloatLit: return std::to_string(e->fval);
     case ExprKind::StrLit: return "\"" + e->sval + "\"";
     case ExprKind::BoolLit: return e->ival ? "True" : "False";
     case ExprKind::NoneLit: return "None";
@@ -546,18 +1126,28 @@ std::string dump_expr(const Expr* e) {
     case ExprKind::BoolOp:
         return std::string("(") + (e->op ? "or " : "and ") + dump_expr(e->a.get()) + " " +
                dump_expr(e->b.get()) + ")";
+    case ExprKind::IfExp:
+        return "(ifexp " + dump_expr(e->b.get()) + " " + dump_expr(e->a.get()) + " " +
+               dump_expr(e->c.get()) + ")";
     case ExprKind::Call: {
         std::string s = "(call " + dump_expr(e->a.get());
         for (auto& a : e->args) s += " " + dump_expr(a.get());
+        for (auto& kv : e->kwargs) s += " " + kv.first + "=" + dump_expr(kv.second.get());
         return s + ")";
     }
     case ExprKind::MethodCall: {
         std::string s = "(method " + dump_expr(e->a.get()) + " ." + e->sval;
         for (auto& a : e->args) s += " " + dump_expr(a.get());
+        for (auto& kv : e->kwargs) s += " " + kv.first + "=" + dump_expr(kv.second.get());
         return s + ")";
     }
     case ExprKind::Index:
         return "(index " + dump_expr(e->a.get()) + " " + dump_expr(e->b.get()) + ")";
+    case ExprKind::Slice: {
+        std::string s = "(slice " + dump_expr(e->a.get());
+        for (auto& p : e->args) s += " " + (p ? dump_expr(p.get()) : std::string("_"));
+        return s + ")";
+    }
     case ExprKind::Attr: return "(attr " + dump_expr(e->a.get()) + " ." + e->sval + ")";
     case ExprKind::ListLit: {
         std::string s = "(list";
@@ -568,6 +1158,13 @@ std::string dump_expr(const Expr* e) {
         std::string s = "(map";
         for (auto& p : e->pairs)
             s += " (" + dump_expr(p.first.get()) + " " + dump_expr(p.second.get()) + ")";
+        return s + ")";
+    }
+    case ExprKind::ListComp: {
+        std::string s = "(comp " + dump_expr(e->a.get()) + " for";
+        for (auto& p : e->params) s += " " + p;
+        s += " in " + dump_expr(e->b.get());
+        if (e->c) s += " if " + dump_expr(e->c.get());
         return s + ")";
     }
     }
@@ -588,6 +1185,18 @@ std::string dump_stmt(const Stmt* s, int indent) {
     case StmtKind::IndexAssign:
         return pad + "(setindex " + dump_expr(s->e1.get()) + " " + dump_expr(s->e2.get()) + " " +
                dump_expr(s->e3.get()) + ")\n";
+    case StmtKind::AttrAssign:
+        return pad + "(setattr " + dump_expr(s->e1.get()) + " ." + s->name + " " +
+               dump_expr(s->e3.get()) + ")\n";
+    case StmtKind::MultiAssign: {
+        std::string r = pad + "(multi= (";
+        for (size_t i = 0; i < s->targets.size(); i++)
+            r += (i ? " " : "") + dump_expr(s->targets[i].get());
+        r += ") (";
+        for (size_t i = 0; i < s->values.size(); i++)
+            r += (i ? " " : "") + dump_expr(s->values[i].get());
+        return r + "))\n";
+    }
     case StmtKind::If: {
         std::string r = pad + "(if " + dump_expr(s->e1.get()) + "\n" + block(s->body);
         if (!s->orelse.empty()) r += pad + " else\n" + block(s->orelse);
@@ -595,21 +1204,58 @@ std::string dump_stmt(const Stmt* s, int indent) {
     }
     case StmtKind::While:
         return pad + "(while " + dump_expr(s->e1.get()) + "\n" + block(s->body) + pad + ")\n";
-    case StmtKind::For:
-        return pad + "(for " + s->name + " " + dump_expr(s->e1.get()) + "\n" + block(s->body) +
+    case StmtKind::For: {
+        std::string vars = s->params[0];
+        for (size_t i = 1; i < s->params.size(); i++) vars += "," + s->params[i];
+        return pad + "(for " + vars + " " + dump_expr(s->e1.get()) + "\n" + block(s->body) +
                pad + ")\n";
+    }
     case StmtKind::FuncDef: {
         std::string r = pad + "(def " + s->name + " (";
         for (size_t i = 0; i < s->params.size(); i++)
             r += (i ? " " : "") + s->params[i];
         return r + ")\n" + block(s->body) + pad + ")\n";
     }
+    case StmtKind::ClassDef: {
+        std::string r = pad + "(class " + s->name;
+        if (!s->alias.empty()) r += "(" + s->alias + ")";
+        return r + "\n" + block(s->body) + pad + ")\n";
+    }
     case StmtKind::Return:
         return pad + "(return" + (s->e1 ? " " + dump_expr(s->e1.get()) : "") + ")\n";
     case StmtKind::Break: return pad + "(break)\n";
     case StmtKind::Continue: return pad + "(continue)\n";
     case StmtKind::Pass: return pad + "(pass)\n";
-    case StmtKind::Import: return pad + "(import " + s->name + ")\n";
+    case StmtKind::Import:
+        return pad + "(import " + s->name +
+               (s->alias.empty() ? "" : " as " + s->alias) + ")\n";
+    case StmtKind::FromImport: {
+        std::string r = pad + "(from " + s->name + " import";
+        for (auto& p : s->import_names)
+            r += " " + p.first + (p.second != p.first ? " as " + p.second : "");
+        return r + ")\n";
+    }
+    case StmtKind::Global: {
+        std::string r = pad + "(global";
+        for (auto& n : s->params) r += " " + n;
+        return r + ")\n";
+    }
+    case StmtKind::Try: {
+        std::string r = pad + "(try\n" + block(s->body);
+        for (auto& h : s->handlers) {
+            r += pad + " except" + (h.as_name.empty() ? "" : " as " + h.as_name) + "\n";
+            for (auto& st : h.body) r += dump_stmt(st.get(), indent + 1);
+        }
+        if (!s->orelse.empty()) r += pad + " else\n" + block(s->orelse);
+        if (!s->final_body.empty()) r += pad + " finally\n" + block(s->final_body);
+        return r + pad + ")\n";
+    }
+    case StmtKind::Raise:
+        if (s->raise_mode == 1) return pad + "(raise)\n";
+        if (s->raise_mode == 2)
+            return pad + "(raise " + s->name +
+                   (s->e1 ? " " + dump_expr(s->e1.get()) : "") + ")\n";
+        return pad + "(raise " + dump_expr(s->e1.get()) + ")\n";
     }
     return pad + "?\n";
 }

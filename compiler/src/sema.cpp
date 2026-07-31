@@ -17,20 +17,29 @@ struct BuiltinSig {
     int max_args;
 };
 
-// Unqualified builtins available without import.
 static const std::unordered_map<std::string, BuiltinSig>& builtins() {
     static const std::unordered_map<std::string, BuiltinSig> b = {
         {"print", {KB_PRINT, 0, 16}}, {"len", {KB_LEN, 1, 1}},
         {"str", {KB_STR, 1, 1}},      {"int", {KB_INT, 1, 1}},
         {"float", {KB_FLOAT, 1, 1}},  {"abs", {KB_ABS, 1, 1}},
-        {"min", {KB_MIN, 2, 16}},     {"max", {KB_MAX, 2, 16}},
+        {"min", {KB_MIN, 1, 16}},     {"max", {KB_MAX, 1, 16}},
         {"ord", {KB_ORD, 1, 1}},      {"chr", {KB_CHR, 1, 1}},
         {"type", {KB_TYPE, 1, 1}},    {"range", {KB_RANGE, 1, 3}},
+        {"sum", {KB_SUM, 1, 2}},      {"sorted", {KB_SORTED, 1, 1}},
+        {"reversed", {KB_REVERSED, 1, 1}}, {"enumerate", {KB_ENUMERATE, 1, 1}},
+        {"zip", {KB_ZIP, 2, 2}},      {"bool", {KB_BOOL, 1, 1}},
+        {"round", {KB_ROUND, 1, 2}},  {"input", {KB_INPUT, 0, 1}},
+        {"pow", {KB_POW, 2, 2}},      {"all", {KB_ALL, 1, 1}},
+        {"any", {KB_ANY, 1, 1}},      {"bin", {KB_BIN, 1, 1}},
+        {"hex", {KB_HEX, 1, 1}},      {"oct", {KB_OCT, 1, 1}},
+        {"list", {KB_LIST, 0, 1}},    {"dict", {KB_DICT, 0, 0}},
+        {"tuple", {KB_TUPLE, 0, 1}},  {"isinstance", {KB_ISINSTANCE, 2, 2}},
+        {"format", {KB_FORMAT, 1, 2}}, {"divmod", {KB_DIVMOD, 2, 2}},
+        {"exit", {KB_SYS_EXIT, 0, 1}}, {"quit", {KB_SYS_EXIT, 0, 1}},
     };
     return b;
 }
 
-// module name -> attr name -> builtin
 static const std::unordered_map<std::string, std::unordered_map<std::string, BuiltinSig>>&
 modules() {
     static const std::unordered_map<std::string, std::unordered_map<std::string, BuiltinSig>>
@@ -48,25 +57,71 @@ modules() {
               {"seed", {KB_RANDOM_SEED, 1, 1}}}},
             {"threading",
              {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}}}},
+            {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
+            {"doctest", {{"testmod", {KB_NOOP, 0, 2}}}},
+            {"string", {}},
         };
     return m;
 }
 
+// Imports that are accepted and ignored (annotation-only / test helpers).
+static bool noop_module(const std::string& name) {
+    return name == "typing" || name == "__future__" || name == "abc" ||
+           name == "dataclasses" || name == "collections.abc";
+}
+
+// module constants
+struct ModConst {
+    bool is_str;
+    double f;
+    const char* s;
+};
+static bool module_const(const std::string& mod, const std::string& attr, ModConst& out) {
+    if (mod == "math" && attr == "pi") { out = {false, 3.14159265358979323846, ""}; return true; }
+    if (mod == "math" && attr == "e") { out = {false, 2.71828182845904523536, ""}; return true; }
+    if (mod == "math" && attr == "inf") { out = {false, 1e999, ""}; return true; }
+    if (mod == "string") {
+        if (attr == "ascii_lowercase") { out = {true, 0, "abcdefghijklmnopqrstuvwxyz"}; return true; }
+        if (attr == "ascii_uppercase") { out = {true, 0, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}; return true; }
+        if (attr == "ascii_letters") {
+            out = {true, 0, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+            return true;
+        }
+        if (attr == "digits") { out = {true, 0, "0123456789"}; return true; }
+        if (attr == "punctuation") {
+            out = {true, 0, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"};
+            return true;
+        }
+        if (attr == "whitespace") { out = {true, 0, " \t\n\r\x0b\x0c"}; return true; }
+    }
+    return false;
+}
+
 struct FuncEntry {
     Stmt* def;
-    int index;       // in Module::functions
-    int64_t global;  // global slot holding the function value
+    int index;
+    int64_t global;
+};
+
+struct ClassEntry {
+    Stmt* def;
+    int64_t global;
+    std::unordered_map<std::string, Stmt*> methods;
 };
 
 struct Sema {
     Module& mod;
     std::unordered_map<std::string, FuncEntry> funcs;
+    std::unordered_map<std::string, ClassEntry> classes;
     std::unordered_map<std::string, int64_t> globals;
-    std::set<std::string> imports;
+    std::unordered_map<std::string, std::string> imports;      // alias → module
+    std::unordered_map<std::string, BuiltinSig> from_imports;  // name → builtin
+    std::unordered_map<std::string, ModConst> from_consts;     // name → const value
 
-    // current function scope (nullptr at module level)
+    int try_depth = 0; // imports inside try/except may fail softly
     Stmt* cur_func = nullptr;
     std::unordered_map<std::string, int64_t> locals;
+    std::set<std::string> global_decls; // 'global x' names in current function
 
     explicit Sema(Module& m) : mod(m) {}
 
@@ -80,65 +135,6 @@ struct Sema {
         return idx;
     }
 
-    // ---- pass A: collect module-level names ----
-    void collect_module() {
-        for (auto& sp : mod.body) {
-            Stmt* s = sp.get();
-            switch (s->kind) {
-            case StmtKind::FuncDef: {
-                if (funcs.count(s->name)) err(s->line, "function '" + s->name + "' redefined");
-                if (builtins().count(s->name))
-                    err(s->line, "cannot redefine builtin '" + s->name + "'");
-                s->func_index = (int)mod.functions.size();
-                s->global_idx = global_slot(s->name);
-                mod.functions.push_back(s);
-                funcs[s->name] = {s, s->func_index, s->global_idx};
-                break;
-            }
-            case StmtKind::Assign: global_slot(s->name); break;
-            case StmtKind::For: global_slot(s->name); collect_nested_assigns(s->body, true); break;
-            case StmtKind::If:
-                collect_nested_assigns(s->body, true);
-                collect_nested_assigns(s->orelse, true);
-                break;
-            case StmtKind::While: collect_nested_assigns(s->body, true); break;
-            case StmtKind::Import: {
-                if (!modules().count(s->name))
-                    err(s->line, "unknown module '" + s->name +
-                                     "' (available: math, time, random, threading)");
-                imports.insert(s->name);
-                break;
-            }
-            default: break;
-            }
-        }
-    }
-
-    void collect_nested_assigns(std::vector<StmtPtr>& body, bool as_globals) {
-        for (auto& sp : body) {
-            Stmt* s = sp.get();
-            switch (s->kind) {
-            case StmtKind::Assign:
-                if (as_globals) global_slot(s->name);
-                else local_slot(s->name);
-                break;
-            case StmtKind::For:
-                if (as_globals) global_slot(s->name);
-                else local_slot(s->name);
-                collect_nested_assigns(s->body, as_globals);
-                break;
-            case StmtKind::If:
-                collect_nested_assigns(s->body, as_globals);
-                collect_nested_assigns(s->orelse, as_globals);
-                break;
-            case StmtKind::While: collect_nested_assigns(s->body, as_globals); break;
-            case StmtKind::FuncDef:
-                err(s->line, "nested functions are not supported");
-            default: break;
-            }
-        }
-    }
-
     int64_t local_slot(const std::string& name) {
         auto it = locals.find(name);
         if (it != locals.end()) return it->second;
@@ -147,20 +143,194 @@ struct Sema {
         return idx;
     }
 
-    // ---- resolution ----
-    void resolve_target(Stmt* s, const std::string& name) {
-        if (cur_func) {
-            s->target_res = Res::Local;
-            s->target_idx = local_slot(name);
-        } else {
-            s->target_res = Res::Global;
-            s->target_idx = global_slot(name);
+    void register_import(Stmt* s) {
+        const std::string& modname = s->name;
+        if (noop_module(modname)) {
+            for (auto& extra : s->body) register_import(extra.get());
+            return;
         }
+        if (modname.find('.') != std::string::npos || !modules().count(modname)) {
+            if (try_depth > 0) return; // try: import X / except ImportError: pass
+            err(s->line, "unknown module '" + modname +
+                             "' (available: math, time, random, threading, sys, string, "
+                             "doctest)");
+        }
+        imports[s->alias.empty() ? modname : s->alias] = modname;
+        for (auto& extra : s->body) register_import(extra.get());
+    }
+
+    void register_from_import(Stmt* s) {
+        const std::string& modname = s->name;
+        if (noop_module(modname)) return; // names are annotation-only
+        if (modname.find('.') != std::string::npos || !modules().count(modname)) {
+            if (try_depth > 0) return;
+            err(s->line, "unknown module '" + modname +
+                             "' (available: math, time, random, threading, sys, string, "
+                             "doctest)");
+        }
+        auto& tbl = modules().at(modname);
+        for (auto& [n, alias] : s->import_names) {
+            ModConst cv;
+            if (module_const(modname, n, cv)) {
+                from_consts[alias] = cv;
+                continue;
+            }
+            auto it = tbl.find(n);
+            if (it == tbl.end())
+                err(s->line, "module '" + modname + "' has no name '" + n + "'");
+            from_imports[alias] = it->second;
+        }
+    }
+
+    // ---- pass A: collect module-level names ----
+    void register_funcdef(Stmt* s, const std::string& symbol, bool bind_global) {
+        s->alias = symbol; // codegen symbol name
+        s->func_index = (int)mod.functions.size();
+        mod.functions.push_back(s);
+        if (bind_global) {
+            s->global_idx = global_slot(s->name);
+            funcs[s->name] = {s, s->func_index, s->global_idx};
+        }
+    }
+
+    void collect_module() {
+        for (auto& sp : mod.body) {
+            Stmt* s = sp.get();
+            switch (s->kind) {
+            case StmtKind::FuncDef:
+                if (funcs.count(s->name)) err(s->line, "function '" + s->name + "' redefined");
+                register_funcdef(s, s->name, true);
+                break;
+            case StmtKind::ClassDef: {
+                if (classes.count(s->name)) err(s->line, "class '" + s->name + "' redefined");
+                s->global_idx = global_slot(s->name);
+                mod.classes.push_back(s);
+                ClassEntry ce;
+                ce.def = s;
+                ce.global = s->global_idx;
+                for (auto& msp : s->body) {
+                    if (msp->kind == StmtKind::FuncDef) {
+                        Stmt* m = msp.get();
+                        register_funcdef(m, s->name + "__" + m->name, false);
+                        ce.methods[m->name] = m;
+                    }
+                }
+                classes[s->name] = std::move(ce);
+                break;
+            }
+            case StmtKind::Assign: global_slot(s->name); break;
+            case StmtKind::MultiAssign:
+                for (auto& t : s->targets)
+                    if (t->kind == ExprKind::Name) global_slot(t->sval);
+                break;
+            case StmtKind::For:
+                for (auto& n : s->params) global_slot(n);
+                collect_assigned(s->body, true);
+                break;
+            case StmtKind::If:
+                collect_assigned(s->body, true);
+                collect_assigned(s->orelse, true);
+                break;
+            case StmtKind::While: collect_assigned(s->body, true); break;
+            case StmtKind::Try:
+                try_depth++;
+                collect_assigned(s->body, true);
+                try_depth--;
+                for (auto& h : s->handlers) {
+                    if (!h.as_name.empty()) global_slot(h.as_name);
+                    collect_assigned(h.body, true);
+                }
+                collect_assigned(s->orelse, true);
+                collect_assigned(s->final_body, true);
+                break;
+            case StmtKind::Import: register_import(s); break;
+            case StmtKind::FromImport: register_from_import(s); break;
+            default: break;
+            }
+        }
+    }
+
+    void collect_assigned(std::vector<StmtPtr>& body, bool as_globals) {
+        auto slot = [&](const std::string& n) {
+            if (as_globals) global_slot(n);
+            else if (!global_decls.count(n)) local_slot(n);
+        };
+        for (auto& sp : body) {
+            Stmt* s = sp.get();
+            switch (s->kind) {
+            case StmtKind::Assign: slot(s->name); break;
+            case StmtKind::Import: register_import(s); break;
+            case StmtKind::FromImport: register_from_import(s); break;
+            case StmtKind::MultiAssign:
+                for (auto& t : s->targets)
+                    if (t->kind == ExprKind::Name) slot(t->sval);
+                break;
+            case StmtKind::For:
+                for (auto& n : s->params) slot(n);
+                collect_assigned(s->body, as_globals);
+                break;
+            case StmtKind::If:
+                collect_assigned(s->body, as_globals);
+                collect_assigned(s->orelse, as_globals);
+                break;
+            case StmtKind::While: collect_assigned(s->body, as_globals); break;
+            case StmtKind::Try:
+                try_depth++;
+                collect_assigned(s->body, as_globals);
+                try_depth--;
+                for (auto& h : s->handlers) {
+                    if (!h.as_name.empty()) slot(h.as_name);
+                    collect_assigned(h.body, as_globals);
+                }
+                collect_assigned(s->orelse, as_globals);
+                collect_assigned(s->final_body, as_globals);
+                break;
+            case StmtKind::FuncDef:
+                err(s->line, "nested functions are not supported");
+            case StmtKind::ClassDef:
+                err(s->line, "classes may only be defined at module level");
+            default: break;
+            }
+        }
+    }
+
+    void collect_global_decls(std::vector<StmtPtr>& body) {
+        for (auto& sp : body) {
+            Stmt* s = sp.get();
+            if (s->kind == StmtKind::Global)
+                for (auto& n : s->params) {
+                    global_decls.insert(n);
+                    global_slot(n);
+                }
+            collect_global_decls(s->body);
+            collect_global_decls(s->orelse);
+            collect_global_decls(s->final_body);
+            for (auto& h : s->handlers) collect_global_decls(h.body);
+        }
+    }
+
+    // ---- resolution ----
+    void resolve_target_name(int& kind, int64_t& idx, const std::string& name) {
+        if (cur_func && !global_decls.count(name)) {
+            kind = 1;
+            idx = local_slot(name);
+        } else {
+            kind = 2;
+            idx = global_slot(name);
+        }
+    }
+
+    void resolve_target(Stmt* s, const std::string& name) {
+        int k;
+        int64_t idx;
+        resolve_target_name(k, idx, name);
+        s->target_res = k == 1 ? Res::Local : Res::Global;
+        s->target_idx = idx;
     }
 
     void resolve_name(Expr* e) {
         const std::string& n = e->sval;
-        if (cur_func) {
+        if (cur_func && !global_decls.count(n)) {
             auto it = locals.find(n);
             if (it != locals.end()) {
                 e->res = Res::Local;
@@ -174,11 +344,121 @@ struct Sema {
             e->res_idx = g->second;
             return;
         }
+        auto fc = from_consts.find(n);
+        if (fc != from_consts.end()) {
+            if (fc->second.is_str) {
+                e->kind = ExprKind::StrLit;
+                e->sval = fc->second.s;
+            } else {
+                e->kind = ExprKind::FloatLit;
+                e->fval = fc->second.f;
+            }
+            return;
+        }
+        if (n == "__name__") {
+            e->kind = ExprKind::StrLit;
+            e->sval = "__main__";
+            return;
+        }
         if (imports.count(n))
             err(e->line, "module '" + n + "' can only be used as '" + n + ".<name>'");
-        if (builtins().count(n))
+        if (from_imports.count(n) || builtins().count(n))
             err(e->line, "builtin '" + n + "' can only be called, not used as a value");
         err(e->line, "undefined variable '" + n + "'");
+    }
+
+    bool name_is_bound(const std::string& n) {
+        if (cur_func && locals.count(n) && !global_decls.count(n)) return true;
+        return globals.count(n) || funcs.count(n) || classes.count(n) ||
+               builtins().count(n) || from_imports.count(n) || from_consts.count(n) ||
+               imports.count(n);
+    }
+
+    // Rewrites call kwargs/defaults into plain positional args when the callee
+    // signature is known (user function or class constructor).
+    void apply_signature(Expr* e, Stmt* def, bool skip_self) {
+        size_t nparams = def->params.size() - (skip_self ? 1 : 0);
+        size_t ndefaults = def->defaults.size();
+        size_t first_param = skip_self ? 1 : 0;
+        std::vector<ExprPtr> final_args(nparams);
+        if (e->args.size() > nparams)
+            err(e->line, def->name + "() takes " + std::to_string(nparams) +
+                             " argument(s) but " + std::to_string(e->args.size()) +
+                             " were given");
+        for (size_t i = 0; i < e->args.size(); i++) final_args[i] = std::move(e->args[i]);
+        for (auto& [kw, val] : e->kwargs) {
+            bool found = false;
+            for (size_t i = 0; i < nparams; i++) {
+                if (def->params[first_param + i] == kw) {
+                    if (final_args[i])
+                        err(e->line, def->name + "() got multiple values for '" + kw + "'");
+                    final_args[i] = std::move(val);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
+        }
+        e->kwargs.clear();
+        for (size_t i = 0; i < nparams; i++) {
+            if (final_args[i]) continue;
+            size_t di = i + ndefaults;
+            if (di >= nparams) { // default exists (defaults align to the tail)
+                const Expr* d = def->defaults[di - nparams].get();
+                final_args[i] = clone_literal(d);
+            } else {
+                err(e->line, def->name + "() missing required argument '" +
+                                 def->params[first_param + i] + "'");
+            }
+        }
+        e->args = std::move(final_args);
+    }
+
+    static ExprPtr clone_literal(const Expr* e) {
+        auto c = std::make_unique<Expr>();
+        c->kind = e->kind;
+        c->line = e->line;
+        c->ival = e->ival;
+        c->fval = e->fval;
+        c->sval = e->sval;
+        c->op = e->op;
+        c->res = e->res;
+        c->res_idx = e->res_idx;
+        if (e->a) c->a = clone_literal(e->a.get());
+        if (e->b) c->b = clone_literal(e->b.get());
+        for (auto& a : e->args) c->args.push_back(clone_literal(a.get()));
+        return c;
+    }
+
+    void resolve_print_kwargs(Expr* e) {
+        // print(..., sep=?, end=?) → KB_PRINT_EX(sep, end, ...)
+        ExprPtr sep, end;
+        for (auto& [kw, val] : e->kwargs) {
+            if (kw == "sep") sep = std::move(val);
+            else if (kw == "end") end = std::move(val);
+            else if (kw == "flush") continue; // accepted and ignored
+            else err(e->line, "print() got an unexpected keyword argument '" + kw + "'");
+        }
+        e->kwargs.clear();
+        if (!sep) {
+            sep = std::make_unique<Expr>();
+            sep->kind = ExprKind::StrLit;
+            sep->line = e->line;
+            sep->sval = " ";
+        }
+        if (!end) {
+            end = std::make_unique<Expr>();
+            end->kind = ExprKind::StrLit;
+            end->line = e->line;
+            end->sval = "\n";
+        }
+        std::vector<ExprPtr> na;
+        na.push_back(std::move(sep));
+        na.push_back(std::move(end));
+        for (auto& a : e->args) na.push_back(std::move(a));
+        e->args = std::move(na);
+        e->a->res_idx = KB_PRINT_EX;
     }
 
     void resolve_expr(Expr* e) {
@@ -199,89 +479,173 @@ struct Sema {
             resolve_expr(e->a.get());
             fold(e);
             return;
+        case ExprKind::IfExp:
+            resolve_expr(e->a.get());
+            resolve_expr(e->b.get());
+            resolve_expr(e->c.get());
+            return;
         case ExprKind::Index:
             resolve_expr(e->a.get());
             resolve_expr(e->b.get());
             return;
+        case ExprKind::Slice:
+            resolve_expr(e->a.get());
+            for (auto& p : e->args)
+                if (p) resolve_expr(p.get());
+            return;
         case ExprKind::Attr: {
-            // Only module attribute constants reach here (module.attr not called).
-            if (e->a->kind == ExprKind::Name && imports.count(e->a->sval)) {
-                const std::string& mn = e->a->sval;
-                if (mn == "math" && e->sval == "pi") {
-                    e->kind = ExprKind::FloatLit;
-                    e->fval = 3.14159265358979323846;
+            if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
+                !name_shadowed(e->a->sval)) {
+                const std::string& modname = imports.at(e->a->sval);
+                ModConst cv;
+                if (module_const(modname, e->sval, cv)) {
+                    if (cv.is_str) {
+                        e->kind = ExprKind::StrLit;
+                        e->sval = cv.s;
+                    } else {
+                        e->kind = ExprKind::FloatLit;
+                        e->fval = cv.f;
+                    }
                     e->a.reset();
                     return;
                 }
-                if (mn == "math" && e->sval == "e") {
-                    e->kind = ExprKind::FloatLit;
-                    e->fval = 2.71828182845904523536;
-                    e->a.reset();
+                if (modname == "sys" && e->sval == "argv") {
+                    // sys.argv → zero-arg builtin call
+                    e->kind = ExprKind::Call;
+                    auto callee = std::make_unique<Expr>();
+                    callee->kind = ExprKind::Name;
+                    callee->line = e->line;
+                    callee->sval = "sys.argv";
+                    callee->res = Res::BuiltinFunc;
+                    callee->res_idx = KB_SYS_ARGV;
+                    e->a = std::move(callee);
+                    e->sval.clear();
                     return;
                 }
-                err(e->line, "module '" + mn + "' has no constant '" + e->sval + "'");
+                err(e->line, "module '" + modname + "' has no constant '" + e->sval + "'");
             }
-            err(e->line, "attribute access is only supported on modules and method calls");
+            resolve_expr(e->a.get()); // generic attribute access (objects/classes)
+            return;
         }
         case ExprKind::Call: {
-            for (auto& a : e->args) resolve_expr(a.get());
-            Expr* callee = e->a.get();
-            if (callee->kind == ExprKind::Name) {
-                const std::string& n = callee->sval;
-                // local variable holding a function?
-                if (cur_func && locals.count(n)) {
-                    resolve_expr(callee);
-                    return; // dynamic call through value
-                }
-                auto f = funcs.find(n);
-                if (f != funcs.end()) {
-                    if ((int)e->args.size() != (int)f->second.def->params.size())
-                        err(e->line, n + "() takes " +
-                                         std::to_string(f->second.def->params.size()) +
-                                         " argument(s) but " + std::to_string(e->args.size()) +
-                                         " were given");
-                    callee->res = Res::UserFunc;
-                    callee->res_idx = f->second.index;
-                    return;
-                }
-                auto b = builtins().find(n);
-                if (b != builtins().end() && !globals.count(n)) {
-                    if ((int)e->args.size() < b->second.min_args ||
-                        (int)e->args.size() > b->second.max_args)
-                        err(e->line, n + "() got " + std::to_string(e->args.size()) +
-                                         " argument(s)");
-                    callee->res = Res::BuiltinFunc;
-                    callee->res_idx = b->second.id;
-                    return;
+            // isinstance(x, int) / isinstance(x, (int, float)): type names are
+            // rewritten to string literals before normal name resolution.
+            if (e->a->kind == ExprKind::Name && e->a->sval == "isinstance" &&
+                !name_shadowed("isinstance") && e->args.size() == 2) {
+                auto rewrite_type = [&](ExprPtr& t) {
+                    static const std::set<std::string> tn = {"int",  "float", "str",
+                                                             "bool", "list",  "dict",
+                                                             "tuple"};
+                    if (t->kind == ExprKind::Name && tn.count(t->sval) &&
+                        !name_shadowed(t->sval)) {
+                        t->kind = ExprKind::StrLit;
+                    }
+                };
+                if (e->args[1]->kind == ExprKind::ListLit) {
+                    for (auto& t : e->args[1]->args) rewrite_type(t);
+                } else {
+                    rewrite_type(e->args[1]);
                 }
             }
-            resolve_expr(callee); // dynamic call through a value
+            Expr* callee = e->a.get();
+            auto resolve_args = [&]() {
+                for (auto& a : e->args) resolve_expr(a.get());
+                for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
+            };
+            if (callee->kind == ExprKind::Name) {
+                const std::string& n = callee->sval;
+                bool local_shadow = cur_func && locals.count(n) && !global_decls.count(n);
+                if (!local_shadow) {
+                    auto f = funcs.find(n);
+                    if (f != funcs.end()) {
+                        apply_signature(e, f->second.def, false);
+                        resolve_args();
+                        callee->res = Res::UserFunc;
+                        callee->res_idx = f->second.index;
+                        return;
+                    }
+                    auto c = classes.find(n);
+                    if (c != classes.end()) {
+                        auto init = c->second.methods.find("__init__");
+                        if (init != c->second.methods.end())
+                            apply_signature(e, init->second, true);
+                        else if (!e->args.empty() || !e->kwargs.empty())
+                            err(e->line, n + "() takes no arguments");
+                        resolve_args();
+                        callee->res = Res::Global;
+                        callee->res_idx = c->second.global;
+                        return; // dynamic call: runtime instantiates
+                    }
+                    auto fi = from_imports.find(n);
+                    if (fi != from_imports.end() && !globals.count(n)) {
+                        resolve_args();
+                        check_builtin_call(e, n, fi->second);
+                        callee->res = Res::BuiltinFunc;
+                        callee->res_idx = fi->second.id;
+                        return;
+                    }
+                    auto b = builtins().find(n);
+                    if (b != builtins().end() && !globals.count(n)) {
+                        resolve_args();
+                        check_builtin_call(e, n, b->second);
+                        callee->res = Res::BuiltinFunc;
+                        callee->res_idx = b->second.id;
+                        if (n == "print" && !e->kwargs.empty()) resolve_print_kwargs(e);
+                        else if (!e->kwargs.empty())
+                            err(e->line, n + "() does not accept keyword arguments");
+                        return;
+                    }
+                }
+            }
+            resolve_args();
+            if (!e->kwargs.empty())
+                err(e->line, "keyword arguments are only supported when calling functions "
+                             "and classes defined in this file");
+            resolve_expr(callee);
             return;
         }
         case ExprKind::MethodCall: {
             for (auto& a : e->args) resolve_expr(a.get());
-            // module function call?  math.sqrt(x)
+            for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
-                !(cur_func && locals.count(e->a->sval)) && !globals.count(e->a->sval)) {
-                const std::string& mn = e->a->sval;
-                auto& mm = modules().at(mn);
+                !name_shadowed(e->a->sval)) {
+                const std::string& modname = imports.at(e->a->sval);
+                auto& mm = modules().at(modname);
                 auto it = mm.find(e->sval);
                 if (it == mm.end())
-                    err(e->line, "module '" + mn + "' has no function '" + e->sval + "'");
-                if ((int)e->args.size() < it->second.min_args ||
-                    (int)e->args.size() > it->second.max_args)
-                    err(e->line, mn + "." + e->sval + "() got " +
+                    err(e->line, "module '" + modname + "' has no function '" + e->sval + "'");
+                BuiltinSig sig = it->second;
+                if ((int)e->args.size() < sig.min_args || (int)e->args.size() > sig.max_args)
+                    err(e->line, modname + "." + e->sval + "() got " +
                                      std::to_string(e->args.size()) + " argument(s)");
-                // rewrite into a builtin call
+                if (!e->kwargs.empty())
+                    err(e->line, modname + "." + e->sval +
+                                     "() does not accept keyword arguments");
                 e->kind = ExprKind::Call;
                 auto callee = std::make_unique<Expr>();
                 callee->kind = ExprKind::Name;
                 callee->line = e->line;
-                callee->sval = mn + "." + e->sval;
+                callee->sval = modname + "." + e->sval;
                 callee->res = Res::BuiltinFunc;
-                callee->res_idx = it->second.id;
+                callee->res_idx = sig.id;
                 e->a = std::move(callee);
                 return;
+            }
+            if (!e->kwargs.empty()) {
+                // ClassName.method(self, x=..) — signature known at compile time
+                bool local_shadow = cur_func && locals.count(e->a->sval) &&
+                                    !global_decls.count(e->a->sval);
+                if (e->a->kind == ExprKind::Name && classes.count(e->a->sval) &&
+                    !local_shadow) {
+                    auto& ce = classes.at(e->a->sval);
+                    auto mit = ce.methods.find(e->sval);
+                    if (mit == ce.methods.end())
+                        err(e->line, "class '" + e->a->sval + "' has no method '" + e->sval +
+                                         "'");
+                    apply_signature(e, mit->second, false);
+                } else {
+                    err(e->line, "keyword arguments are not supported on method calls");
+                }
             }
             resolve_expr(e->a.get());
             return;
@@ -295,10 +659,33 @@ struct Sema {
                 resolve_expr(p.second.get());
             }
             return;
+        case ExprKind::ListComp: {
+            resolve_expr(e->b.get()); // iterable first (targets not yet bound)
+            for (auto& n : e->params) {
+                int k;
+                int64_t idx;
+                resolve_target_name(k, idx, n);
+                e->comp_tkind.push_back(k);
+                e->comp_tidx.push_back(idx);
+            }
+            resolve_expr(e->a.get());
+            if (e->c) resolve_expr(e->c.get());
+            return;
+        }
         }
     }
 
-    // ---- constant folding (int/float/bool arithmetic, string concat) ----
+    bool name_shadowed(const std::string& n) {
+        return (cur_func && locals.count(n) && !global_decls.count(n)) || globals.count(n);
+    }
+
+    void check_builtin_call(Expr* e, const std::string& n, const BuiltinSig& sig) {
+        int total = (int)e->args.size();
+        if (total < sig.min_args || total > sig.max_args)
+            err(e->line, n + "() got " + std::to_string(total) + " argument(s)");
+    }
+
+    // ---- constant folding ----
     static bool is_const(const Expr* e) {
         return e->kind == ExprKind::IntLit || e->kind == ExprKind::FloatLit ||
                e->kind == ExprKind::BoolLit || e->kind == ExprKind::StrLit;
@@ -327,7 +714,6 @@ struct Sema {
         if (e->kind != ExprKind::Binary) return;
         Expr *a = e->a.get(), *b = e->b.get();
         if (!a || !b || !is_const(a) || !is_const(b)) return;
-        // string concat
         if (e->op == KOP_ADD && a->kind == ExprKind::StrLit && b->kind == ExprKind::StrLit) {
             e->kind = ExprKind::StrLit;
             e->sval = a->sval + b->sval;
@@ -362,7 +748,7 @@ struct Sema {
         case KOP_SUB: both_int ? set_int(ia - ib) : set_float(fa - fb); return;
         case KOP_MUL: both_int ? set_int(ia * ib) : set_float(fa * fb); return;
         case KOP_DIV:
-            if (fb == 0.0) return; // let runtime raise
+            if (fb == 0.0) return;
             set_float(fa / fb);
             return;
         case KOP_FLOORDIV:
@@ -382,6 +768,15 @@ struct Sema {
                 int64_t r = ia % ib;
                 if (r != 0 && ((r < 0) != (ib < 0))) r += ib;
                 set_int(r);
+            }
+            return;
+        case KOP_POW:
+            if (both_int && ib >= 0 && ib < 63) {
+                int64_t r = 1;
+                for (int64_t i = 0; i < ib; i++) r *= ia;
+                set_int(r);
+            } else {
+                set_float(std::pow(fa, fb));
             }
             return;
         case KOP_EQ: set_bool(fa == fb); return;
@@ -411,6 +806,28 @@ struct Sema {
             resolve_expr(s->e2.get());
             resolve_expr(s->e3.get());
             return;
+        case StmtKind::AttrAssign:
+            resolve_expr(s->e1.get());
+            resolve_expr(s->e3.get());
+            return;
+        case StmtKind::MultiAssign: {
+            for (auto& v : s->values) resolve_expr(v.get());
+            for (auto& t : s->targets) {
+                if (t->kind == ExprKind::Name) {
+                    int k;
+                    int64_t idx;
+                    resolve_target_name(k, idx, t->sval);
+                    t->res = k == 1 ? Res::Local : Res::Global;
+                    t->res_idx = idx;
+                } else if (t->kind == ExprKind::Index) {
+                    resolve_expr(t->a.get());
+                    resolve_expr(t->b.get());
+                } else if (t->kind == ExprKind::Attr) {
+                    resolve_expr(t->a.get());
+                }
+            }
+            return;
+        }
         case StmtKind::If:
             resolve_expr(s->e1.get());
             resolve_stmts(s->body);
@@ -420,34 +837,107 @@ struct Sema {
             resolve_expr(s->e1.get());
             resolve_stmts(s->body);
             return;
-        case StmtKind::For:
+        case StmtKind::For: {
             resolve_expr(s->e1.get());
-            resolve_target(s, s->name);
-            resolve_stmts(s->body);
-            return;
-        case StmtKind::FuncDef: {
-            if (cur_func) err(s->line, "nested functions are not supported");
-            cur_func = s;
-            locals.clear();
-            for (auto& p : s->params) {
-                if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
-                local_slot(p);
+            for (auto& n : s->params) {
+                int k;
+                int64_t idx;
+                resolve_target_name(k, idx, n);
+                s->multi_tkind.push_back(k);
+                s->multi_tidx.push_back(idx);
             }
-            collect_nested_assigns(s->body, false);
+            s->target_res = s->multi_tkind[0] == 1 ? Res::Local : Res::Global;
+            s->target_idx = s->multi_tidx[0];
             resolve_stmts(s->body);
-            s->nlocals = (int)locals.size();
-            cur_func = nullptr;
-            locals.clear();
             return;
         }
+        case StmtKind::FuncDef: resolve_function(s); return;
+        case StmtKind::ClassDef:
+            // resolve methods; class attribute assigns resolved as class-attr sets
+            for (auto& msp : s->body) {
+                if (msp->kind == StmtKind::FuncDef) resolve_function(msp.get());
+                else if (msp->kind == StmtKind::Assign) resolve_expr(msp->e1.get());
+            }
+            if (!s->alias.empty() && !classes.count(s->alias))
+                err(s->line, "unknown base class '" + s->alias + "'");
+            return;
         case StmtKind::Return:
             if (s->e1) resolve_expr(s->e1.get());
             return;
+        case StmtKind::Raise: {
+            if (s->raise_mode == 1) return;
+            if (s->raise_mode == 2) { // AssertionError from assert
+                if (s->e1) resolve_expr(s->e1.get());
+                return;
+            }
+            Expr* ex = s->e1.get();
+            // raise ValueError("msg") / raise RuntimeError — error-type names are
+            // not variables; recognize them structurally.
+            if (ex->kind == ExprKind::Call && ex->a->kind == ExprKind::Name &&
+                !name_is_bound(ex->a->sval)) {
+                s->raise_mode = 2;
+                s->name = ex->a->sval;
+                if (ex->args.size() > 1)
+                    err(s->line, "raise: at most one exception argument is supported");
+                if (!ex->args.empty()) {
+                    s->e1 = std::move(ex->args[0]);
+                    resolve_expr(s->e1.get());
+                } else {
+                    s->e1.reset();
+                }
+                return;
+            }
+            if (ex->kind == ExprKind::Name && !name_is_bound(ex->sval)) {
+                s->raise_mode = 2;
+                s->name = ex->sval;
+                s->e1.reset();
+                return;
+            }
+            resolve_expr(ex);
+            return;
+        }
+        case StmtKind::Try: {
+            resolve_stmts(s->body);
+            for (auto& h : s->handlers) {
+                if (!h.as_name.empty()) {
+                    int k;
+                    int64_t idx;
+                    resolve_target_name(k, idx, h.as_name);
+                    h.as_kind = k;
+                    h.as_idx = idx;
+                }
+                resolve_stmts(h.body);
+            }
+            resolve_stmts(s->orelse);
+            resolve_stmts(s->final_body);
+            return;
+        }
         case StmtKind::Break:
         case StmtKind::Continue:
         case StmtKind::Pass:
-        case StmtKind::Import: return;
+        case StmtKind::Import:
+        case StmtKind::FromImport:
+        case StmtKind::Global: return;
         }
+    }
+
+    void resolve_function(Stmt* s) {
+        cur_func = s;
+        locals.clear();
+        global_decls.clear();
+        collect_global_decls(s->body);
+        for (auto& p : s->params) {
+            if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
+            if (global_decls.count(p)) err(s->line, "parameter '" + p + "' declared global");
+            local_slot(p);
+        }
+        collect_assigned(s->body, false);
+        for (auto& d : s->defaults) resolve_expr(d.get());
+        resolve_stmts(s->body);
+        s->nlocals = (int)locals.size();
+        cur_func = nullptr;
+        locals.clear();
+        global_decls.clear();
     }
 };
 
@@ -456,7 +946,7 @@ struct Sema {
 void analyze(Module& m) {
     Sema s(m);
     s.collect_module();
-    s.resolve_stmts(m.body);
+    for (auto& sp : m.body) s.resolve_stmt(sp.get());
     m.nglobals = (int64_t)s.globals.size();
 }
 

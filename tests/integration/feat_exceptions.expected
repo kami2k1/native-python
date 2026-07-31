@@ -1,0 +1,15 @@
+5
+caught: ZeroDivisionError: division by zero
+finally 1
+else ran: 3
+index error caught
+key error caught
+re-raised ok
+100
+finally in f
+from try
+12
+finally in g
+propagated: RuntimeError: boom
+assert caught: AssertionError: math is broken
+done

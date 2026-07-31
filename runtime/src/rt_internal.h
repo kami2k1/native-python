@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace kami {
@@ -49,7 +50,8 @@ struct KamiMap {
 struct KamiFuncObj {
     ObjHeader h;
     void* fn; // KamiFn
-    int64_t arity;
+    int64_t min_arity;
+    int64_t arity; // max
     const char* name; // static string from generated code
 };
 
@@ -61,6 +63,24 @@ struct ThreadData {
 struct KamiThreadObj {
     ObjHeader h;
     ThreadData* td;
+};
+
+struct KamiClassObj {
+    ObjHeader h;
+    const char* name;                                // static string
+    KamiClassObj* parent;                            // may be null
+    std::unordered_map<std::string, KamiValue>* members; // methods + class attrs
+};
+
+struct KamiInstance {
+    ObjHeader h;
+    KamiClassObj* cls;
+    std::unordered_map<std::string, KamiValue>* fields;
+};
+
+// Runtime error used for Python-level exceptions (try/except).
+struct KamiError {
+    std::string msg;
 };
 
 // ---------------- global runtime state ----------------
@@ -92,6 +112,8 @@ struct Lock {
 };
 
 extern std::vector<KamiValue> g_globals;
+extern int64_t g_argc;
+extern char** g_argv;
 extern std::vector<std::pair<KamiValue*, int64_t>> g_pins;
 extern std::vector<FrameStack*> g_frame_stacks;
 
@@ -112,11 +134,14 @@ void map_set(KamiMap* m, const KamiValue* k, const KamiValue* v); // lock held
 bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out);     // lock held
 uint64_t value_hash(const KamiValue* v);
 bool value_eq(const KamiValue* a, const KamiValue* b);
+KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
 
+std::string format_float(double d);
 std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);
+std::string& tls_error();                    // last caught error message (per thread)
 
-[[noreturn]] void panic(const std::string& msg);
+[[noreturn]] void panic(const std::string& msg); // throws KamiError
 
 } // namespace kami
