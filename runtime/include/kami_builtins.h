@@ -61,5 +61,24 @@ enum KamiBuiltinId : int64_t {
     KB_SYS_EXIT,
     KB_SYS_ARGV,
     KB_DIVMOD,
+    KB_SET,
+    KB_OPEN,
+    KB_WITH_ENTER,
+    KB_WITH_EXIT,
+    // os / os.path
+    KB_OS_GETCWD, KB_OS_LISTDIR, KB_OS_REMOVE, KB_OS_MKDIR, KB_OS_MAKEDIRS,
+    KB_OS_RMDIR, KB_OS_RENAME, KB_OS_SYSTEM, KB_OS_GETENV,
+    KB_OSP_EXISTS, KB_OSP_ISFILE, KB_OSP_ISDIR, KB_OSP_JOIN, KB_OSP_BASENAME,
+    KB_OSP_DIRNAME, KB_OSP_GETSIZE, KB_OSP_ABSPATH,
+    // logging (level encoded as first arg by sema)
+    KB_LOG_BASICCONFIG, KB_LOG_LOG,
+    // json
+    KB_JSON_LOADS, KB_JSON_DUMPS,
+    // socket
+    KB_SOCKET_SOCKET,
+    // requests
+    KB_REQUESTS_GET, KB_REQUESTS_POST,
+    // diagnostics
+    KB_KWARGS_UNSUPPORTED,
     KB__COUNT
 };

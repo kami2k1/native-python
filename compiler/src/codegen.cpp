@@ -111,6 +111,16 @@ struct FnGen {
         return t;
     }
 
+    // Reserve a frame slot that will not be reused when temp_top is reset.
+    int persistent_top = 0;
+    int alloc_slot_persistent() {
+        // grow temps_base region by pinning above current max; simplest: use a
+        // dedicated counter beyond the temp window.
+        int t = temps_base + max_temps + persistent_top;
+        persistent_top++;
+        return t;
+    }
+
     std::string slot_ptr(int slot) {
         std::string p = r();
         emit(p + " = getelementptr inbounds %kv, ptr %frame, i64 " + std::to_string(slot));
@@ -192,6 +202,12 @@ struct FnGen {
             return t;
         }
         case ExprKind::Name:
+            if (e->res == Res::BuiltinFunc) {
+                int t = alloc_temp();
+                emit("call void @kami_make_builtin_func(ptr " + slot_ptr(t) + ", i64 " +
+                     std::to_string(e->res_idx) + ", ptr " + str_const(e->sval) + ")");
+                return t;
+            }
             return read_var(e->res, e->res_idx);
         case ExprKind::Binary: {
             int save = temp_top;
@@ -313,6 +329,18 @@ struct FnGen {
             int t = alloc_temp();
             emit("call void @kami_make_list(ptr " + slot_ptr(t) + ", ptr %argbuf, i64 " +
                  std::to_string(slots.size()) + ")");
+            return t;
+        }
+        case ExprKind::SetLit: {
+            int t = alloc_temp();
+            emit("call void @kami_make_set(ptr " + slot_ptr(t) + ")");
+            for (auto& a : e->args) {
+                int save = temp_top;
+                int v = gen_expr(a.get());
+                emit("call void @kami_set_add(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(v) +
+                     ")");
+                temp_top = save;
+            }
             return t;
         }
         case ExprKind::MapLit: {
@@ -477,7 +505,10 @@ struct FnGen {
             start_block(Lend);
             return;
         }
-        int s_seq = gen_expr(iter);
+        int s_raw = gen_expr(iter);
+        int s_seq = alloc_temp();
+        emit("call void @kami_iter_prep(ptr " + slot_ptr(s_seq) + ", ptr " + slot_ptr(s_raw) +
+             ")");
         int s_idx = alloc_temp();
         emit("call void @kami_make_int(ptr " + slot_ptr(s_idx) + ", i64 0)");
         int s_one = alloc_temp();
@@ -677,6 +708,25 @@ struct FnGen {
         case StmtKind::Try:
             gen_try(s);
             break;
+        case StmtKind::Del:
+            for (auto& t : s->targets) {
+                int save2 = temp_top;
+                if (t->kind == ExprKind::Index) {
+                    int base = gen_expr(t->a.get());
+                    int idx = gen_expr(t->b.get());
+                    emit("call void @kami_del_index(ptr " + slot_ptr(base) + ", ptr " +
+                         slot_ptr(idx) + ")");
+                } else { // Name: rebind to None (best effort)
+                    int none = alloc_temp();
+                    emit("call void @kami_make_none(ptr " + slot_ptr(none) + ")");
+                    assign_var(t->res, t->res_idx, none);
+                }
+                temp_top = save2;
+            }
+            break;
+        case StmtKind::With:
+            gen_with(s);
+            break;
         case StmtKind::Pass:
         case StmtKind::Import:
         case StmtKind::FromImport:
@@ -727,6 +777,100 @@ struct FnGen {
                  ")");
             assign_target(s->targets[i].get(), part);
             temp_top = save2;
+        }
+    }
+
+    // with ctx as name:  body   →  ctx-mgr enter/exit around an outlined body
+    // so __exit__ runs even if the body raises (via kami_try's unwind repair).
+    void gen_with(const Stmt* s) {
+        int save = temp_top;
+        int ctx = gen_expr(s->e1.get());
+        // keep the context manager alive in a stable frame slot
+        int ctx_slot = alloc_slot_persistent();
+        emit("call void @kami_copy(ptr " + slot_ptr(ctx_slot) + ", ptr " + slot_ptr(ctx) + ")");
+        // entered = with_enter(ctx)
+        std::vector<int> a1{ctx_slot};
+        fill_argbuf(a1);
+        int entered = alloc_slot_persistent();
+        emit("call void @kami_builtin(i64 " + std::to_string((int64_t)KB_WITH_ENTER) + ", ptr " +
+             slot_ptr(entered) + ", ptr %argbuf, i64 1)");
+        if (!s->name.empty()) assign_var(s->target_res, s->target_idx, entered);
+        temp_top = save;
+
+        // outline the body so __exit__ always runs
+        std::string fname = "kami_withb_" + std::to_string(g_outline_counter++);
+        ctxs.emplace_back();
+        C().fname = fname;
+        C().outlined = true;
+        gen_stmts(s->body);
+        if (!C().terminated) emit("ret i64 0");
+        {
+            Ctx done = std::move(ctxs.back());
+            ctxs.pop_back();
+            extra_fns += "define internal i64 @" + done.fname +
+                         "(ptr %frame) {\nentry:\n  %argbuf = alloca ptr, i64 @@ARGBUF@@, "
+                         "align 8\n" +
+                         done.body + "}\n\n";
+        }
+        std::string code = r();
+        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame)");
+        // __exit__ always
+        std::vector<int> a2{ctx_slot};
+        fill_argbuf(a2);
+        int dummy = alloc_temp();
+        emit("call void @kami_builtin(i64 " + std::to_string((int64_t)KB_WITH_EXIT) + ", ptr " +
+             slot_ptr(dummy) + ", ptr %argbuf, i64 1)");
+        temp_top = save;
+        // propagate exception / control flow (same protocol as gen_try tail)
+        dispatch_try_code(code);
+    }
+
+    // Reused by gen_with: propagate a kami_try result code (-1 exc, 1 ret, 2/3
+    // break/continue). Returns having possibly terminated the block.
+    void dispatch_try_code(const std::string& code) {
+        std::string isexc = r();
+        emit(isexc + " = icmp eq i64 " + code + ", -1");
+        std::string Lre = newlabel(), Lok = newlabel();
+        emit("br i1 " + isexc + ", label %" + Lre + ", label %" + Lok);
+        C().terminated = true;
+        start_block(Lre);
+        emit("call void @kami_rethrow()");
+        emit("unreachable");
+        C().terminated = true;
+        start_block(Lok);
+        {
+            std::string isret = r();
+            emit(isret + " = icmp eq i64 " + code + ", 1");
+            std::string Lret = newlabel(), Ln = newlabel();
+            emit("br i1 " + isret + ", label %" + Lret + ", label %" + Ln);
+            C().terminated = true;
+            start_block(Lret);
+            if (C().outlined) {
+                emit("ret i64 1");
+            } else {
+                emit("call void @kami_copy(ptr %ret, ptr " + slot_ptr(spill_slot) + ")");
+                emit("call void @kami_frame_pop()");
+                emit("ret void");
+            }
+            C().terminated = true;
+            start_block(Ln);
+        }
+        if (!C().loops.empty() || C().outlined) {
+            for (int64_t k = 2; k <= 3; k++) {
+                std::string is = r();
+                emit(is + " = icmp eq i64 " + code + ", " + std::to_string(k));
+                std::string Ly = newlabel(), Ln = newlabel();
+                emit("br i1 " + is + ", label %" + Ly + ", label %" + Ln);
+                C().terminated = true;
+                start_block(Ly);
+                if (!C().loops.empty())
+                    emit("br label %" +
+                         (k == 2 ? C().loops.back().second : C().loops.back().first));
+                else
+                    emit("ret i64 " + std::to_string(k));
+                C().terminated = true;
+                start_block(Ln);
+            }
         }
     }
 
@@ -928,7 +1072,7 @@ struct FnGen {
     // ---- whole function ----
     std::string finish(const std::string& fn_name, bool has_try) {
         (void)has_try;
-        int total = temps_base + max_temps;
+        int total = temps_base + max_temps + persistent_top;
         if (total < 1) total = 1;
         std::string out;
         out += "define void @" + fn_name +
@@ -975,11 +1119,15 @@ declare void @kami_make_float(ptr, double)
 declare void @kami_make_str(ptr, ptr, i64)
 declare void @kami_make_list(ptr, ptr, i64)
 declare void @kami_make_map(ptr)
+declare void @kami_make_builtin_func(ptr, i64, ptr)
+declare void @kami_make_set(ptr)
+declare void @kami_set_add(ptr, ptr)
 declare i32 @kami_truthy(ptr)
 declare void @kami_binop(i64, ptr, ptr, ptr)
 declare void @kami_unop(i64, ptr, ptr)
 declare void @kami_index_get(ptr, ptr, ptr)
 declare void @kami_index_set(ptr, ptr, ptr)
+declare void @kami_del_index(ptr, ptr)
 declare void @kami_slice(ptr, ptr, ptr, ptr, ptr)
 declare void @kami_attr_get(ptr, ptr, ptr)
 declare void @kami_attr_set(ptr, ptr, ptr)
@@ -987,6 +1135,7 @@ declare void @kami_call_value(ptr, ptr, ptr, i64)
 declare void @kami_method(ptr, ptr, ptr, ptr, i64)
 declare void @kami_builtin(i64, ptr, ptr, i64)
 declare i32 @kami_range_cond(ptr, ptr, ptr)
+declare void @kami_iter_prep(ptr, ptr)
 declare i32 @kami_iter_cond(ptr, ptr)
 declare void @kami_iter_get(ptr, ptr, ptr)
 declare void @kami_unpack(ptr, ptr, i64, i64)

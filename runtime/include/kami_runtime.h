@@ -35,6 +35,9 @@ enum KamiTag : int64_t {
     KT_THREAD = 8,
     KT_CLASS = 9,
     KT_OBJECT = 10,
+    KT_SET = 11,
+    KT_FILE = 12,
+    KT_SOCKET = 13,
 };
 
 enum KamiBinOp : int64_t {
@@ -70,6 +73,9 @@ void kami_make_float(KamiValue* out, double v);
 void kami_make_str(KamiValue* out, const char* data, int64_t len);
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
 void kami_make_map(KamiValue* out);
+void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name);
+void kami_make_set(KamiValue* out);
+void kami_set_add(KamiValue* set, const KamiValue* v);
 
 // --- operations ---
 int32_t kami_truthy(const KamiValue* v);
@@ -77,6 +83,7 @@ void kami_binop(int64_t op, KamiValue* out, const KamiValue* a, const KamiValue*
 void kami_unop(int64_t op, KamiValue* out, const KamiValue* a);
 void kami_index_get(KamiValue* out, const KamiValue* obj, const KamiValue* idx);
 void kami_index_set(KamiValue* obj, const KamiValue* idx, const KamiValue* val);
+void kami_del_index(KamiValue* obj, const KamiValue* idx);
 void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
                  int64_t nargs);
@@ -84,6 +91,9 @@ void kami_builtin(int64_t id, KamiValue* out, KamiValue** argv, int64_t nargs);
 
 // --- loop helpers ---
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);
+// Converts an iterable into an index-able sequence (dict→keys, set→elements,
+// file→lines, list/str→itself). out may alias seq.
+void kami_iter_prep(KamiValue* out, const KamiValue* seq);
 int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx);
 void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx);
 void kami_unpack(KamiValue* out, const KamiValue* seq, int64_t idx, int64_t expect_len);

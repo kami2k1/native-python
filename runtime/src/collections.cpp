@@ -132,6 +132,33 @@ void map_set(KamiMap* m, const KamiValue* k, const KamiValue* v) {
     m->count++;
 }
 
+bool map_del(KamiMap* m, const KamiValue* k) {
+    if (m->cap == 0) return false;
+    uint64_t h = value_hash(k);
+    uint64_t j = h & (uint64_t)(m->cap - 1);
+    while (m->entries[j].used) {
+        if (m->entries[j].hash == h && value_eq(&m->entries[j].key, k)) {
+            // rebuild without this entry (open addressing, no tombstones)
+            MapEntry* old = m->entries;
+            int64_t cap = m->cap;
+            m->entries = (MapEntry*)calloc((size_t)cap, sizeof(MapEntry));
+            if (!m->entries) panic("out of memory");
+            m->count = 0;
+            for (int64_t i = 0; i < cap; i++) {
+                if (!old[i].used || i == (int64_t)j) continue;
+                uint64_t p = old[i].hash & (uint64_t)(cap - 1);
+                while (m->entries[p].used) p = (p + 1) & (uint64_t)(cap - 1);
+                m->entries[p] = old[i];
+                m->count++;
+            }
+            free(old);
+            return true;
+        }
+        j = (j + 1) & (uint64_t)(m->cap - 1);
+    }
+    return false;
+}
+
 bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out) {
     if (m->cap == 0) return false;
     uint64_t h = value_hash(k);

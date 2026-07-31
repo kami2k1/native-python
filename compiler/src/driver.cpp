@@ -131,6 +131,8 @@ std::string build(const BuildOptions& opts) {
     cmd.push_back("-pthread");
     cmd.push_back("-lm");
     cmd.push_back("-Wl,--gc-sections");
+#else
+    cmd.push_back("-lws2_32");
 #endif
     // clang warns about override of module-less IR opt flags; keep output clean:
     cmd.push_back("-Wno-override-module");

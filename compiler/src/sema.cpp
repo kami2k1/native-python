@@ -36,6 +36,7 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"tuple", {KB_TUPLE, 0, 1}},  {"isinstance", {KB_ISINSTANCE, 2, 2}},
         {"format", {KB_FORMAT, 1, 2}}, {"divmod", {KB_DIVMOD, 2, 2}},
         {"exit", {KB_SYS_EXIT, 0, 1}}, {"quit", {KB_SYS_EXIT, 0, 1}},
+        {"set", {KB_SET, 0, 1}}, {"open", {KB_OPEN, 1, 2}},
     };
     return b;
 }
@@ -60,6 +61,23 @@ modules() {
             {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
             {"doctest", {{"testmod", {KB_NOOP, 0, 2}}}},
             {"string", {}},
+            {"logging", {}},
+            {"os",
+             {{"getcwd", {KB_OS_GETCWD, 0, 0}}, {"listdir", {KB_OS_LISTDIR, 0, 1}},
+              {"remove", {KB_OS_REMOVE, 1, 1}}, {"unlink", {KB_OS_REMOVE, 1, 1}},
+              {"mkdir", {KB_OS_MKDIR, 1, 1}},   {"makedirs", {KB_OS_MAKEDIRS, 1, 2}},
+              {"rmdir", {KB_OS_RMDIR, 1, 1}},   {"rename", {KB_OS_RENAME, 2, 2}},
+              {"system", {KB_OS_SYSTEM, 1, 1}}, {"getenv", {KB_OS_GETENV, 1, 2}}}},
+            {"os.path",
+             {{"exists", {KB_OSP_EXISTS, 1, 1}}, {"isfile", {KB_OSP_ISFILE, 1, 1}},
+              {"isdir", {KB_OSP_ISDIR, 1, 1}},   {"join", {KB_OSP_JOIN, 1, 16}},
+              {"basename", {KB_OSP_BASENAME, 1, 1}}, {"dirname", {KB_OSP_DIRNAME, 1, 1}},
+              {"getsize", {KB_OSP_GETSIZE, 1, 1}}, {"abspath", {KB_OSP_ABSPATH, 1, 1}}}},
+            {"json",
+             {{"loads", {KB_JSON_LOADS, 1, 1}}, {"dumps", {KB_JSON_DUMPS, 1, 3}}}},
+            {"socket", {{"socket", {KB_SOCKET_SOCKET, 0, 2}}}},
+            {"requests",
+             {{"get", {KB_REQUESTS_GET, 1, 3}}, {"post", {KB_REQUESTS_POST, 1, 4}}}},
         };
     return m;
 }
@@ -72,27 +90,36 @@ static bool noop_module(const std::string& name) {
 
 // module constants
 struct ModConst {
-    bool is_str;
+    int kind; // 0=float, 1=str, 2=int
     double f;
     const char* s;
+    int64_t i;
 };
 static bool module_const(const std::string& mod, const std::string& attr, ModConst& out) {
-    if (mod == "math" && attr == "pi") { out = {false, 3.14159265358979323846, ""}; return true; }
-    if (mod == "math" && attr == "e") { out = {false, 2.71828182845904523536, ""}; return true; }
-    if (mod == "math" && attr == "inf") { out = {false, 1e999, ""}; return true; }
+    if (mod == "math" && attr == "pi") { out = {0, 3.14159265358979323846, "", 0}; return true; }
+    if (mod == "math" && attr == "e") { out = {0, 2.71828182845904523536, "", 0}; return true; }
+    if (mod == "math" && attr == "inf") { out = {0, 1e999, "", 0}; return true; }
+    if (mod == "logging") {
+        if (attr == "DEBUG") { out = {2, 0, "", 10}; return true; }
+        if (attr == "INFO") { out = {2, 0, "", 20}; return true; }
+        if (attr == "WARNING" || attr == "WARN") { out = {2, 0, "", 30}; return true; }
+        if (attr == "ERROR") { out = {2, 0, "", 40}; return true; }
+        if (attr == "CRITICAL" || attr == "FATAL") { out = {2, 0, "", 50}; return true; }
+        if (attr == "NOTSET") { out = {2, 0, "", 0}; return true; }
+    }
     if (mod == "string") {
-        if (attr == "ascii_lowercase") { out = {true, 0, "abcdefghijklmnopqrstuvwxyz"}; return true; }
-        if (attr == "ascii_uppercase") { out = {true, 0, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}; return true; }
+        if (attr == "ascii_lowercase") { out = {1, 0, "abcdefghijklmnopqrstuvwxyz", 0}; return true; }
+        if (attr == "ascii_uppercase") { out = {1, 0, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0}; return true; }
         if (attr == "ascii_letters") {
-            out = {true, 0, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+            out = {1, 0, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 0};
             return true;
         }
-        if (attr == "digits") { out = {true, 0, "0123456789"}; return true; }
+        if (attr == "digits") { out = {1, 0, "0123456789", 0}; return true; }
         if (attr == "punctuation") {
-            out = {true, 0, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"};
+            out = {1, 0, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", 0};
             return true;
         }
-        if (attr == "whitespace") { out = {true, 0, " \t\n\r\x0b\x0c"}; return true; }
+        if (attr == "whitespace") { out = {1, 0, " \t\n\r\x0b\x0c", 0}; return true; }
     }
     return false;
 }
@@ -152,8 +179,8 @@ struct Sema {
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return; // try: import X / except ImportError: pass
             err(s->line, "unknown module '" + modname +
-                             "' (available: math, time, random, threading, sys, string, "
-                             "doctest)");
+                             "' (available: math, time, random, threading, sys, os, json, "
+                             "socket, requests, logging, string, doctest)");
         }
         imports[s->alias.empty() ? modname : s->alias] = modname;
         for (auto& extra : s->body) register_import(extra.get());
@@ -165,8 +192,8 @@ struct Sema {
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return;
             err(s->line, "unknown module '" + modname +
-                             "' (available: math, time, random, threading, sys, string, "
-                             "doctest)");
+                             "' (available: math, time, random, threading, sys, os, json, "
+                             "socket, requests, logging, string, doctest)");
         }
         auto& tbl = modules().at(modname);
         for (auto& [n, alias] : s->import_names) {
@@ -274,6 +301,10 @@ struct Sema {
                 collect_assigned(s->orelse, as_globals);
                 break;
             case StmtKind::While: collect_assigned(s->body, as_globals); break;
+            case StmtKind::With:
+                if (!s->name.empty()) slot(s->name);
+                collect_assigned(s->body, as_globals);
+                break;
             case StmtKind::Try:
                 try_depth++;
                 collect_assigned(s->body, as_globals);
@@ -346,13 +377,7 @@ struct Sema {
         }
         auto fc = from_consts.find(n);
         if (fc != from_consts.end()) {
-            if (fc->second.is_str) {
-                e->kind = ExprKind::StrLit;
-                e->sval = fc->second.s;
-            } else {
-                e->kind = ExprKind::FloatLit;
-                e->fval = fc->second.f;
-            }
+            apply_const(e, fc->second);
             return;
         }
         if (n == "__name__") {
@@ -362,8 +387,18 @@ struct Sema {
         }
         if (imports.count(n))
             err(e->line, "module '" + n + "' can only be used as '" + n + ".<name>'");
-        if (from_imports.count(n) || builtins().count(n))
-            err(e->line, "builtin '" + n + "' can only be called, not used as a value");
+        auto fi2 = from_imports.find(n);
+        if (fi2 != from_imports.end()) {
+            e->res = Res::BuiltinFunc;
+            e->res_idx = fi2->second.id;
+            return; // first-class builtin reference
+        }
+        auto b2 = builtins().find(n);
+        if (b2 != builtins().end()) {
+            e->res = Res::BuiltinFunc;
+            e->res_idx = b2->second.id;
+            return;
+        }
         err(e->line, "undefined variable '" + n + "'");
     }
 
@@ -415,6 +450,19 @@ struct Sema {
         e->args = std::move(final_args);
     }
 
+    static void apply_const(Expr* e, const ModConst& cv) {
+        if (cv.kind == 1) {
+            e->kind = ExprKind::StrLit;
+            e->sval = cv.s;
+        } else if (cv.kind == 2) {
+            e->kind = ExprKind::IntLit;
+            e->ival = cv.i;
+        } else {
+            e->kind = ExprKind::FloatLit;
+            e->fval = cv.f;
+        }
+    }
+
     static ExprPtr clone_literal(const Expr* e) {
         auto c = std::make_unique<Expr>();
         c->kind = e->kind;
@@ -431,8 +479,146 @@ struct Sema {
         return c;
     }
 
+    // logging.<method>(...) → KB_LOG_LOG / KB_LOG_BASICCONFIG builtin calls.
+    static int64_t logging_level(const std::string& m) {
+        if (m == "debug") return 10;
+        if (m == "info") return 20;
+        if (m == "warning" || m == "warn") return 30;
+        if (m == "error" || m == "exception") return 40;
+        if (m == "critical" || m == "fatal") return 50;
+        return -1;
+    }
+
+    bool rewrite_logging(Expr* e) {
+        const std::string& m = e->sval;
+        if (m == "basicConfig") {
+            // extract level= and format= from kwargs; ignore the rest
+            ExprPtr level, format;
+            for (auto& [kw, val] : e->kwargs) {
+                if (kw == "level") level = std::move(val);
+                else if (kw == "format") format = std::move(val);
+                // filename/datefmt/etc: accepted and ignored
+            }
+            e->kwargs.clear();
+            e->args.clear();
+            auto none = [&]() {
+                auto n = std::make_unique<Expr>();
+                n->kind = ExprKind::NoneLit;
+                n->line = e->line;
+                return n;
+            };
+            e->args.push_back(level ? std::move(level) : none());
+            e->args.push_back(format ? std::move(format) : none());
+            for (auto& a : e->args) resolve_expr(a.get());
+            become_builtin_call(e, "logging.basicConfig", KB_LOG_BASICCONFIG);
+            return true;
+        }
+        int64_t lv = logging_level(m);
+        if (lv < 0) return false; // getLogger etc: fall through (error later)
+        if (!e->kwargs.empty()) {
+            for (auto& [kw, v] : e->kwargs)
+                if (kw != "exc_info") // logging.exception passes exc_info implicitly
+                    err(e->line, "logging." + m + "() does not accept keyword '" + kw + "'");
+            e->kwargs.clear();
+        }
+        // prepend the level as the first positional argument
+        std::vector<ExprPtr> na;
+        auto lvl = std::make_unique<Expr>();
+        lvl->kind = ExprKind::IntLit;
+        lvl->line = e->line;
+        lvl->ival = lv;
+        na.push_back(std::move(lvl));
+        for (auto& a : e->args) na.push_back(std::move(a));
+        e->args = std::move(na);
+        for (auto& a : e->args) resolve_expr(a.get());
+        become_builtin_call(e, "logging.log", KB_LOG_LOG);
+        return true;
+    }
+
+    void become_builtin_call(Expr* e, const std::string& name, int64_t id) {
+        e->kind = ExprKind::Call;
+        auto callee = std::make_unique<Expr>();
+        callee->kind = ExprKind::Name;
+        callee->line = e->line;
+        callee->sval = name;
+        callee->res = Res::BuiltinFunc;
+        callee->res_idx = id;
+        e->a = std::move(callee);
+    }
+
+    // requests.get(url, timeout=..) / requests.post(url, json=.., data=.., timeout=..)
+    bool rewrite_module_kwargs(Expr* e, const std::string& mod, const std::string& fn) {
+        if (mod == "requests" && fn == "get") {
+            ExprPtr timeout;
+            for (auto& [kw, v] : e->kwargs) {
+                if (kw == "timeout") timeout = std::move(v);
+                else if (kw == "headers" || kw == "params" || kw == "verify") continue;
+                else return false;
+            }
+            e->kwargs.clear();
+            if (e->args.size() < 2) e->args.resize(2);
+            if (timeout) e->args[1] = std::move(timeout);
+            for (auto& a : e->args)
+                if (!a) {
+                    a = std::make_unique<Expr>();
+                    a->kind = ExprKind::NoneLit;
+                    a->line = e->line;
+                }
+            for (auto& a : e->args) resolve_expr(a.get());
+            return true;
+        }
+        if (mod == "requests" && fn == "post") {
+            ExprPtr payload, timeout;
+            for (auto& [kw, v] : e->kwargs) {
+                if (kw == "json" || kw == "data") payload = std::move(v);
+                else if (kw == "timeout") timeout = std::move(v);
+                else if (kw == "headers" || kw == "verify") continue;
+                else return false;
+            }
+            e->kwargs.clear();
+            if (e->args.size() < 3) e->args.resize(3);
+            if (payload) e->args[1] = std::move(payload);
+            if (timeout) e->args[2] = std::move(timeout);
+            for (auto& a : e->args)
+                if (!a) {
+                    a = std::make_unique<Expr>();
+                    a->kind = ExprKind::NoneLit;
+                    a->line = e->line;
+                }
+            for (auto& a : e->args) resolve_expr(a.get());
+            return true;
+        }
+        return false;
+    }
+
+    void resolve_sorted_kwargs(Expr* e) {
+        // sorted(iterable, key=?, reverse=?) → positional [iterable, key|None, reverse|False]
+        ExprPtr key, reverse;
+        for (auto& [kw, val] : e->kwargs) {
+            if (kw == "key") key = std::move(val);
+            else if (kw == "reverse") reverse = std::move(val);
+            else err(e->line, "sorted() got an unexpected keyword argument '" + kw + "'");
+        }
+        e->kwargs.clear();
+        auto none = [&]() {
+            auto n = std::make_unique<Expr>();
+            n->kind = ExprKind::NoneLit;
+            n->line = e->line;
+            return n;
+        };
+        auto fals = [&]() {
+            auto n = std::make_unique<Expr>();
+            n->kind = ExprKind::BoolLit;
+            n->line = e->line;
+            n->ival = 0;
+            return n;
+        };
+        while (e->args.size() < 1) e->args.push_back(none());
+        e->args.push_back(key ? std::move(key) : none());
+        e->args.push_back(reverse ? std::move(reverse) : fals());
+    }
+
     void resolve_print_kwargs(Expr* e) {
-        // print(..., sep=?, end=?) → KB_PRINT_EX(sep, end, ...)
         ExprPtr sep, end;
         for (auto& [kw, val] : e->kwargs) {
             if (kw == "sep") sep = std::move(val);
@@ -499,13 +685,7 @@ struct Sema {
                 const std::string& modname = imports.at(e->a->sval);
                 ModConst cv;
                 if (module_const(modname, e->sval, cv)) {
-                    if (cv.is_str) {
-                        e->kind = ExprKind::StrLit;
-                        e->sval = cv.s;
-                    } else {
-                        e->kind = ExprKind::FloatLit;
-                        e->fval = cv.f;
-                    }
+                    apply_const(e, cv);
                     e->a.reset();
                     return;
                 }
@@ -591,6 +771,7 @@ struct Sema {
                         callee->res = Res::BuiltinFunc;
                         callee->res_idx = b->second.id;
                         if (n == "print" && !e->kwargs.empty()) resolve_print_kwargs(e);
+                        else if (n == "sorted" && !e->kwargs.empty()) resolve_sorted_kwargs(e);
                         else if (!e->kwargs.empty())
                             err(e->line, n + "() does not accept keyword arguments");
                         return;
@@ -605,6 +786,36 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
+            // logging.<level>(...) and logging.basicConfig(...) — special forms.
+            if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
+                imports.at(e->a->sval) == "logging" && !name_shadowed(e->a->sval)) {
+                if (rewrite_logging(e)) return;
+            }
+            // os.path.<fn>(...) — nested-module call: base is Attr(os, "path").
+            if (e->a->kind == ExprKind::Attr && e->a->a->kind == ExprKind::Name &&
+                imports.count(e->a->a->sval) && imports.at(e->a->a->sval) == "os" &&
+                e->a->sval == "path" && !name_shadowed(e->a->a->sval)) {
+                for (auto& a : e->args) resolve_expr(a.get());
+                if (!e->kwargs.empty())
+                    err(e->line, "os.path." + e->sval + "() does not accept keyword arguments");
+                auto& mm = modules().at("os.path");
+                auto it = mm.find(e->sval);
+                if (it == mm.end())
+                    err(e->line, "module 'os.path' has no function '" + e->sval + "'");
+                if ((int)e->args.size() < it->second.min_args ||
+                    (int)e->args.size() > it->second.max_args)
+                    err(e->line, "os.path." + e->sval + "() got " +
+                                     std::to_string(e->args.size()) + " argument(s)");
+                e->kind = ExprKind::Call;
+                auto callee = std::make_unique<Expr>();
+                callee->kind = ExprKind::Name;
+                callee->line = e->line;
+                callee->sval = "os.path." + e->sval;
+                callee->res = Res::BuiltinFunc;
+                callee->res_idx = it->second.id;
+                e->a = std::move(callee);
+                return;
+            }
             for (auto& a : e->args) resolve_expr(a.get());
             for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
@@ -618,9 +829,12 @@ struct Sema {
                 if ((int)e->args.size() < sig.min_args || (int)e->args.size() > sig.max_args)
                     err(e->line, modname + "." + e->sval + "() got " +
                                      std::to_string(e->args.size()) + " argument(s)");
-                if (!e->kwargs.empty())
-                    err(e->line, modname + "." + e->sval +
-                                     "() does not accept keyword arguments");
+                if (!e->kwargs.empty()) {
+                    // requests.get(url, timeout=...) — map known kwargs positionally
+                    if (!rewrite_module_kwargs(e, modname, e->sval))
+                        err(e->line, modname + "." + e->sval +
+                                         "() does not accept these keyword arguments");
+                }
                 e->kind = ExprKind::Call;
                 auto callee = std::make_unique<Expr>();
                 callee->kind = ExprKind::Name;
@@ -651,6 +865,7 @@ struct Sema {
             return;
         }
         case ExprKind::ListLit:
+        case ExprKind::SetLit:
             for (auto& a : e->args) resolve_expr(a.get());
             return;
         case ExprKind::MapLit:
@@ -918,6 +1133,21 @@ struct Sema {
         case StmtKind::Import:
         case StmtKind::FromImport:
         case StmtKind::Global: return;
+        case StmtKind::Del:
+            for (auto& t : s->targets) resolve_expr(t.get());
+            return;
+        case StmtKind::With: {
+            resolve_expr(s->e1.get());
+            if (!s->name.empty()) {
+                int k;
+                int64_t idx;
+                resolve_target_name(k, idx, s->name);
+                s->target_res = k == 1 ? Res::Local : Res::Global;
+                s->target_idx = idx;
+            }
+            resolve_stmts(s->body);
+            return;
+        }
         }
     }
 

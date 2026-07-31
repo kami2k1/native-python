@@ -15,6 +15,7 @@ enum class ExprKind {
     IfExp,      // a if cond else b:  a=then, b=cond, c=else
     Slice,      // a=base; args[0..2] = start/stop/step (may be null)
     ListComp,   // a=element expr, b=iter, c=cond(opt), params=target names
+    SetLit,     // args = elements
 };
 
 // Name/Call resolution (filled by sema)
@@ -49,7 +50,7 @@ struct Expr {
 enum class StmtKind {
     ExprStmt, Assign, IndexAssign, AttrAssign, MultiAssign,
     If, While, For, FuncDef, ClassDef, Return, Break, Continue, Pass,
-    Import, FromImport, Global, Try, Raise,
+    Import, FromImport, Global, Try, Raise, Del, With,
 };
 
 struct Stmt;

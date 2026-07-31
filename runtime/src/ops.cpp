@@ -47,7 +47,8 @@ static void op_in(KamiValue* out, const KamiValue* a, const KamiValue* b) {
         bool_result(out, false);
         return;
     }
-    case KT_MAP: {
+    case KT_MAP:
+    case KT_SET: {
         KamiValue tmp;
         bool_result(out, map_get((KamiMap*)b->p, a, &tmp));
         return;
@@ -96,6 +97,19 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
               "' and '" + type_name(b->tag) + "'");
     case KOP_SUB:
         if (a->tag == KT_INT && b->tag == KT_INT) { num_result_int(out, a->i - b->i); return; }
+        if (a->tag == KT_SET && b->tag == KT_SET) {
+            KamiMap *x = (KamiMap*)a->p, *y = (KamiMap*)b->p;
+            kami_make_set(out);
+            KamiMap* r = (KamiMap*)out->p;
+            KamiValue none{KT_NONE, {0}};
+            KamiValue tmp;
+            for (int64_t i = 0; i < x->cap; i++) {
+                if (!x->entries[i].used) continue;
+                if (!map_get(y, &x->entries[i].key, &tmp))
+                    map_set(r, &x->entries[i].key, &none);
+            }
+            return;
+        }
         num_result_float(out, as_num(a) - as_num(b));
         return;
     case KOP_MUL:
@@ -166,6 +180,30 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
     case KOP_BITXOR:
     case KOP_SHL:
     case KOP_SHR: {
+        if (a->tag == KT_SET && b->tag == KT_SET &&
+            (op == KOP_BITAND || op == KOP_BITOR || op == KOP_BITXOR)) {
+            KamiMap *x = (KamiMap*)a->p, *y = (KamiMap*)b->p;
+            kami_make_set(out); // rooted via out before inserts
+            KamiMap* r = (KamiMap*)out->p;
+            KamiValue none{KT_NONE, {0}};
+            KamiValue tmp;
+            for (int64_t i = 0; i < x->cap; i++) {
+                if (!x->entries[i].used) continue;
+                bool in_y = map_get(y, &x->entries[i].key, &tmp);
+                if ((op == KOP_BITOR) || (op == KOP_BITAND && in_y) ||
+                    (op == KOP_BITXOR && !in_y))
+                    map_set(r, &x->entries[i].key, &none);
+            }
+            if (op != KOP_BITAND) {
+                for (int64_t i = 0; i < y->cap; i++) {
+                    if (!y->entries[i].used) continue;
+                    bool in_x = map_get(x, &y->entries[i].key, &tmp);
+                    if (op == KOP_BITOR || (op == KOP_BITXOR && !in_x))
+                        map_set(r, &y->entries[i].key, &none);
+                }
+            }
+            return;
+        }
         bool ok_a = a->tag == KT_INT || a->tag == KT_BOOL;
         bool ok_b = b->tag == KT_INT || b->tag == KT_BOOL;
         if (!ok_a || !ok_b)
@@ -303,6 +341,79 @@ void kami_index_set(KamiValue* obj, const KamiValue* idx, const KamiValue* val) 
     }
 }
 
+void kami_del_index(KamiValue* obj, const KamiValue* idx) {
+    Lock lk(g_lock);
+    KamiValue o = *obj, ix = *idx;
+    switch (o.tag) {
+    case KT_LIST: {
+        if (ix.tag != KT_INT) panic("list indices must be integers");
+        KamiList* l = (KamiList*)o.p;
+        int64_t j = norm_index(ix.i, l->len, "list");
+        for (int64_t i = j; i + 1 < l->len; i++) l->items[i] = l->items[i + 1];
+        l->len--;
+        return;
+    }
+    case KT_MAP:
+    case KT_SET:
+        if (!map_del((KamiMap*)o.p, &ix)) panic("KeyError: " + value_repr(&ix));
+        return;
+    default:
+        panic(std::string("'") + type_name(o.tag) + "' object does not support item deletion");
+    }
+}
+
+void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
+    Lock lk(g_lock);
+    KamiValue v = *seq;
+    switch (v.tag) {
+    case KT_LIST:
+    case KT_STR:
+        *out = v;
+        return;
+    case KT_MAP:
+    case KT_SET: {
+        KamiMap* m = (KamiMap*)v.p;
+        KamiList* r = list_new(m->count);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < m->cap; i++)
+            if (m->entries[i].used) r->items[r->len++] = m->entries[i].key;
+        return;
+    }
+    case KT_FILE: {
+        KamiFile* f = (KamiFile*)v.p;
+        if (f->closed) panic("I/O operation on closed file");
+        KamiList* r = list_new(4);
+        out->tag = KT_LIST;
+        out->p = r;
+        std::string line;
+        int c;
+        FILE* fp = (FILE*)f->fp;
+        for (;;) {
+            c = fgetc(fp);
+            if (c == EOF) {
+                if (!line.empty()) {
+                    KamiValue s2{KT_STR, {0}};
+                    s2.p = str_new(line.data(), (int64_t)line.size());
+                    list_push(r, &s2);
+                }
+                break;
+            }
+            line += (char)c;
+            if (c == '\n') {
+                KamiValue s2{KT_STR, {0}};
+                s2.p = str_new(line.data(), (int64_t)line.size());
+                list_push(r, &s2);
+                line.clear();
+            }
+        }
+        return;
+    }
+    default:
+        panic(std::string("'") + type_name(v.tag) + "' object is not iterable");
+    }
+}
+
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step) {
     Lock lk(g_lock);
     if (i->tag != KT_INT || stop->tag != KT_INT || step->tag != KT_INT)
@@ -330,6 +441,7 @@ void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
 void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs) {
     KamiFn f = nullptr;
     KamiFn init = nullptr;
+    int64_t builtin_id = -1;
     {
         Lock lk(g_lock);
         if (fn->tag == KT_CLASS) {
@@ -338,7 +450,7 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             inst->cls = c;
             inst->fields = new std::unordered_map<std::string, KamiValue>();
             out->tag = KT_OBJECT;
-            out->p = inst; // out is a rooted caller slot: instance is safe now
+            out->p = inst; // rooted caller slot
             if (KamiValue* m = class_lookup(c, "__init__")) {
                 KamiFuncObj* fo = (KamiFuncObj*)m->p;
                 if (nargs + 1 < fo->min_arity || nargs + 1 > fo->arity)
@@ -352,13 +464,21 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             if (fn->tag != KT_FUNC)
                 panic(std::string("'") + type_name(fn->tag) + "' object is not callable");
             KamiFuncObj* fo = (KamiFuncObj*)fn->p;
-            if (nargs < fo->min_arity || nargs > fo->arity)
-                panic(std::string(fo->name) + "() takes " + std::to_string(fo->arity) +
-                      " argument(s) but " + std::to_string(nargs) + " were given");
-            f = (KamiFn)fo->fn;
+            if (fo->builtin_id >= 0) {
+                builtin_id = fo->builtin_id;
+            } else {
+                if (nargs < fo->min_arity || nargs > fo->arity)
+                    panic(std::string(fo->name) + "() takes " + std::to_string(fo->arity) +
+                          " argument(s) but " + std::to_string(nargs) + " were given");
+                f = (KamiFn)fo->fn;
+            }
         }
     }
-    // Invoke WITHOUT holding the lock: the callee makes its own runtime calls.
+    // Invoke WITHOUT holding the lock: callees take the lock themselves.
+    if (builtin_id >= 0) {
+        kami_builtin(builtin_id, out, argv, nargs);
+        return;
+    }
     if (init) {
         KamiValue* argv2[17];
         argv2[0] = out; // self
@@ -705,6 +825,87 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                     if (nargs == 2) *out = *argv[1];
                     else { out->tag = KT_NONE; out->i = 0; }
                 }
+                return;
+            }
+        } else if (o.tag == KT_SET) {
+            KamiMap* mp = (KamiMap*)o.p;
+            if (m == "add" && nargs == 1) {
+                KamiValue none{KT_NONE, {0}};
+                map_set(mp, argv[0], &none);
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if ((m == "remove" || m == "discard") && nargs == 1) {
+                bool found = map_del(mp, argv[0]);
+                if (!found && m == "remove") panic("KeyError: " + value_repr(argv[0]));
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if (m == "clear" && nargs == 0) {
+                free(mp->entries);
+                mp->entries = nullptr;
+                mp->cap = 0;
+                mp->count = 0;
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+        } else if (o.tag == KT_SOCKET) {
+            socket_method(lk, out, obj, m, argv, nargs);
+            return;
+        } else if (o.tag == KT_FILE) {
+            KamiFile* f = (KamiFile*)o.p;
+            FILE* fp = (FILE*)f->fp;
+            if (m != "close" && f->closed) panic("I/O operation on closed file");
+            if (m == "read" && nargs <= 1) {
+                std::string data;
+                if (nargs == 1) {
+                    if (argv[0]->tag != KT_INT) panic("file.read() expects an int");
+                    data.resize((size_t)argv[0]->i);
+                    size_t got = fread(data.data(), 1, data.size(), fp);
+                    data.resize(got);
+                } else {
+                    char buf[4096];
+                    size_t got;
+                    while ((got = fread(buf, 1, sizeof buf, fp)) > 0) data.append(buf, got);
+                }
+                out->tag = KT_STR;
+                out->p = str_new(data.data(), (int64_t)data.size());
+                return;
+            }
+            if (m == "readline" && nargs == 0) {
+                std::string line;
+                int c;
+                while ((c = fgetc(fp)) != EOF) {
+                    line += (char)c;
+                    if (c == '\n') break;
+                }
+                out->tag = KT_STR;
+                out->p = str_new(line.data(), (int64_t)line.size());
+                return;
+            }
+            if (m == "readlines" && nargs == 0) {
+                kami_iter_prep(out, &o); // recursive lock is fine
+                return;
+            }
+            if (m == "write" && nargs == 1) {
+                if (argv[0]->tag != KT_STR) panic("file.write() expects a str");
+                KamiStr* s2 = (KamiStr*)argv[0]->p;
+                size_t got = fwrite(s2->data, 1, (size_t)s2->len, fp);
+                out->tag = KT_INT;
+                out->i = (int64_t)got;
+                return;
+            }
+            if (m == "flush" && nargs == 0) {
+                fflush(fp);
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if (m == "close" && nargs == 0) {
+                if (!f->closed) {
+                    fclose(fp);
+                    f->closed = true;
+                }
+                out->tag = KT_NONE; out->i = 0;
                 return;
             }
         } else if (o.tag == KT_OBJECT) {

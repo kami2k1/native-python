@@ -24,10 +24,14 @@ add_library(kamirt STATIC
     runtime/src/collections.cpp
     runtime/src/ops.cpp
     runtime/src/objects.cpp
+    runtime/src/netio.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
+if(WIN32)
+    target_link_libraries(kamirt PUBLIC ws2_32)
+endif()
 target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
 
 # ---- compiler ----

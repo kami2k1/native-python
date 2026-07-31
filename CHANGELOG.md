@@ -4,6 +4,70 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.3.0] — 2026-08-01 — stdlib thực tế: file I/O, os, json, logging, socket, requests + with/set/del
+
+Tiếp tục từ bug report (`try: import ...`, `logging.basicConfig`), bổ sung các module và cú pháp
+mà chương trình thật cần để **thực sự chạy được** (mở file, mở socket, HTTP, JSON, logging).
+Đo lại trên corpus 2.182 file GitHub:
+
+| Mốc | Build được | Chạy được |
+|---|---|---|
+| v0.2.0 | 914 | 704 |
+| **v0.3.0** | **975 (45%)** | **731** |
+
+### Added — I/O & mạng (viết mới `runtime/src/netio.cpp`)
+- **File I/O**: `open(path, mode)`, `.read([n])`, `.readline()`, `.readlines()`, `.write()`,
+  `.flush()`, `.close()`; lặp `for line in f`. GC tự đóng file rò rỉ.
+- **`with ... as ...:`** (context manager) — nhiều manager một dòng; thân được outline + bảo vệ
+  bằng unwinding nên `__exit__`/`close()` luôn chạy kể cả khi có exception; hỗ trợ `__enter__`/
+  `__exit__` cho object người dùng, và tự đóng file.
+- **`socket`**: `socket()`, `.bind/.listen/.accept/.connect/.send/.sendall/.recv/.close/
+  .settimeout` (TCP/IPv4). Kiểm chứng: **server + client TCP thật qua 2 thread** (echo) —
+  ASan/TSan clean. (Windows: link `ws2_32`.)
+- **`requests`**: `requests.get(url, timeout=)`, `requests.post(url, json=/data=, timeout=)`
+  (qua `curl`, hỗ trợ http + https); trả về `Response` với `.status_code`, `.ok`, `.text`,
+  `.json()`. Kiểm chứng: **HTTP server viết bằng KamiPython phục vụ chính client requests của
+  KamiPython**, parse JSON — tất cả native.
+- **`json`**: `json.loads` (parser đầy đủ: object/array/string/number/bool/null, `\uXXXX`,
+  UTF-8), `json.dumps`. Round-trip byte-identical với CPython.
+- **`os` / `os.path`**: `getcwd listdir remove mkdir makedirs rmdir rename system getenv`;
+  `exists isfile isdir join basename dirname getsize abspath`.
+- **`logging`**: `basicConfig(level=, format=)` với `%(asctime)s/%(levelname)s/%(message)s/
+  %(name)s`; `debug/info/warning/error/critical/exception` với %-format args
+  (`logging.info("x=%s", v)`); hằng `logging.INFO/DEBUG/...`.
+
+### Added — kiểu & cú pháp
+- **`set`**: literal `{1, 2, 3}`, `set(iterable)`, `.add/.remove/.discard/.clear`, `in`,
+  phép `& | ^ -` (giao/hợp/hiệu đối xứng/hiệu), lặp, `len`.
+- **`del`**: `del d[k]`, `del xs[i]`, `del name`.
+- **First-class builtins**: dùng builtin như giá trị (`sorted(xs, key=len)`, `map`-style),
+  runtime có function-object mang `builtin_id`.
+- **`sorted(key=, reverse=)`**; các builtin gom iterable (`sorted/sum/min/max/all/any/
+  reversed/set`) nhận set/dict/str/file, không chỉ list.
+- `for` lặp trực tiếp dict (→ keys), set, và file (→ dòng) qua `kami_iter_prep`.
+- Số literal hex/oct/bin/underscore, `logging`/`os.path` submodule dispatch.
+
+### Fixed
+- Cập nhật thông báo lỗi "unknown module" liệt kê đủ module hỗ trợ.
+- `%`-format C-style cho logging/`"%s" % x` (qua logging path).
+
+### Verification
+- Integration **31/31 PASS** (3 suite mới: `feat_files_sets`, `feat_stdlib`, `feat_socket`;
+  files/sets/stdlib **byte-identical CPython 3.11**; socket deterministic).
+- ASan CLEAN: files/sets, stdlib, socket, exceptions, classes; **TSan CLEAN**: socket+threads.
+- Bug report demo (`auto_pull.py`: guarded imports + logging.basicConfig + os.path +
+  requests loop + `__name__`) build & chạy. HTTP server+client demo native hoạt động.
+- Rebuild sạch từ đầu: 0 error, 0 warning.
+
+### Known limitations / Giới hạn
+- `requests` cần `curl` trên PATH (runtime dependency có chủ đích cho HTTPS).
+- `socket.settimeout` chấp nhận nhưng vẫn blocking; chỉ TCP/IPv4.
+- `logging.getLogger(...).info(...)` (logger object) chưa hỗ trợ — dùng `logging.info(...)`.
+- Chưa hỗ trợ: `re`, `numpy`, decorators, lambda, generators, nested functions, `*args/**kwargs`,
+  relative imports.
+
+---
+
 ## [v0.2.0] — 2026-08-01 — Real-world compatibility: exceptions, classes, f-strings + 100s dự án GitHub thật
 
 Xuất phát từ bug report thực tế (`try:` → parse error), toàn bộ frontend + runtime được nâng cấp

@@ -71,7 +71,8 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
         for (int64_t i = 0; i < l->len; i++) mark_value(&l->items[i], stack);
         break;
     }
-    case KT_MAP: {
+    case KT_MAP:
+    case KT_SET: {
         KamiMap* m = (KamiMap*)h;
         for (int64_t i = 0; i < m->cap; i++) {
             if (m->entries[i].used) {
@@ -131,7 +132,13 @@ void gc_collect() {
             *link = h->next;
             switch (h->type) {
             case KT_LIST: free(((KamiList*)h)->items); break;
-            case KT_MAP: free(((KamiMap*)h)->entries); break;
+            case KT_MAP:
+            case KT_SET: free(((KamiMap*)h)->entries); break;
+            case KT_FILE: {
+                KamiFile* f = (KamiFile*)h;
+                if (!f->closed && f->fp) fclose((FILE*)f->fp);
+                break;
+            }
             case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
             case KT_THREAD: {
@@ -237,6 +244,7 @@ void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t 
     f->fn = fnptr;
     f->min_arity = min_arity;
     f->arity = arity;
+    f->builtin_id = -1;
     f->name = name;
     g_globals[(size_t)idx].tag = KT_FUNC;
     g_globals[(size_t)idx].p = f;

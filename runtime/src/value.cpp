@@ -19,6 +19,8 @@ const char* type_name(int64_t tag) {
     case KT_THREAD: return "thread";
     case KT_CLASS: return "type";
     case KT_OBJECT: return "object";
+    case KT_SET: return "set";
+    case KT_FILE: return "file";
     default: return "?";
     }
 }
@@ -75,6 +77,20 @@ std::string value_str(const KamiValue* v) {
         }
         return out + "}";
     }
+    case KT_SET: {
+        KamiMap* m = (KamiMap*)v->p;
+        if (m->count == 0) return "set()";
+        std::string out = "{";
+        bool first = true;
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (!m->entries[i].used) continue;
+            if (!first) out += ", ";
+            first = false;
+            out += value_repr(&m->entries[i].key);
+        }
+        return out + "}";
+    }
+    case KT_FILE: return "<file>";
     case KT_FUNC: {
         KamiFuncObj* f = (KamiFuncObj*)v->p;
         return std::string("<function ") + f->name + ">";
@@ -150,6 +166,33 @@ void kami_make_map(KamiValue* out) {
     out->p = m;
 }
 
+void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name) {
+    Lock lk(g_lock);
+    KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
+    f->fn = nullptr;
+    f->min_arity = 0;
+    f->arity = 16;
+    f->builtin_id = builtin_id;
+    f->name = name;
+    out->tag = KT_FUNC;
+    out->p = f;
+}
+
+void kami_make_set(KamiValue* out) {
+    Lock lk(g_lock);
+    KamiMap* m = map_new();
+    m->h.type = KT_SET;
+    out->tag = KT_SET;
+    out->p = m;
+}
+
+void kami_set_add(KamiValue* set, const KamiValue* v) {
+    Lock lk(g_lock);
+    if (set->tag != KT_SET) panic("internal: set_add on non-set");
+    KamiValue none{KT_NONE, {0}};
+    map_set((KamiMap*)set->p, v, &none);
+}
+
 int32_t kami_truthy(const KamiValue* v) {
     Lock lk(g_lock);
     switch (v->tag) {
@@ -159,7 +202,8 @@ int32_t kami_truthy(const KamiValue* v) {
     case KT_FLOAT: return v->f != 0.0;
     case KT_STR: return ((KamiStr*)v->p)->len != 0;
     case KT_LIST: return ((KamiList*)v->p)->len != 0;
-    case KT_MAP: return ((KamiMap*)v->p)->count != 0;
+    case KT_MAP:
+    case KT_SET: return ((KamiMap*)v->p)->count != 0;
     default: return 1;
     }
 }

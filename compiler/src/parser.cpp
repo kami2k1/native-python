@@ -513,23 +513,41 @@ struct Parser {
             return e;
         }
         case Tok::LBRACE: {
-            auto e = mk(ExprKind::MapLit);
-            advance();
-            if (check(Tok::RBRACE)) {
+            int line = advance().line;
+            if (check(Tok::RBRACE)) { // {} = empty dict
                 advance();
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::MapLit;
+                e->line = line;
                 return e;
             }
-            ExprPtr k = parse_expr();
-            if (!check(Tok::COLON)) err("set literals are not supported (use a list or dict)");
-            advance();
-            ExprPtr v = parse_expr();
-            if (check(Tok::KW_FOR)) err("dict comprehensions are not supported");
-            e->pairs.emplace_back(std::move(k), std::move(v));
+            ExprPtr first = parse_expr();
+            if (check(Tok::COLON)) { // dict
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::MapLit;
+                e->line = line;
+                advance();
+                ExprPtr v = parse_expr();
+                if (check(Tok::KW_FOR)) err("dict comprehensions are not supported");
+                e->pairs.emplace_back(std::move(first), std::move(v));
+                while (match(Tok::COMMA)) {
+                    if (check(Tok::RBRACE)) break;
+                    ExprPtr k2 = parse_expr();
+                    expect(Tok::COLON, "':'");
+                    e->pairs.emplace_back(std::move(k2), parse_expr());
+                }
+                expect(Tok::RBRACE, "'}'");
+                return e;
+            }
+            // set literal
+            auto e = std::make_unique<Expr>();
+            e->kind = ExprKind::SetLit;
+            e->line = line;
+            if (check(Tok::KW_FOR)) err("set comprehensions are not supported");
+            e->args.push_back(std::move(first));
             while (match(Tok::COMMA)) {
                 if (check(Tok::RBRACE)) break;
-                ExprPtr k2 = parse_expr();
-                expect(Tok::COLON, "':'");
-                e->pairs.emplace_back(std::move(k2), parse_expr());
+                e->args.push_back(parse_expr());
             }
             expect(Tok::RBRACE, "'}'");
             return e;
@@ -578,9 +596,9 @@ struct Parser {
         case Tok::KW_DEF: body.push_back(parse_def()); return;
         case Tok::KW_CLASS: body.push_back(parse_class()); return;
         case Tok::KW_TRY: body.push_back(parse_try()); return;
-        case Tok::KW_WITH: err("'with' statements are not supported");
+        case Tok::KW_WITH: body.push_back(parse_with()); return;
         case Tok::AT: err("decorators (@...) are not supported");
-        case Tok::KW_DEL: err("'del' is not supported");
+        case Tok::KW_DEL: break;
         case Tok::KW_NONLOCAL: err("'nonlocal' is not supported");
         default: break;
         }
@@ -666,6 +684,19 @@ struct Parser {
             rs->e1 = std::move(msg); // may be null
             iff->body.push_back(std::move(rs));
             return iff;
+        }
+        case Tok::KW_DEL: {
+            int line = advance().line;
+            auto st = mks(StmtKind::Del, line);
+            st->targets.push_back(parse_expr());
+            while (match(Tok::COMMA)) {
+                if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
+                st->targets.push_back(parse_expr());
+            }
+            for (auto& t : st->targets)
+                if (t->kind != ExprKind::Index && t->kind != ExprKind::Name)
+                    throw CompileError(line, "can only 'del' a name or subscript");
+            return st;
         }
         case Tok::KW_GLOBAL: {
             int line = advance().line;
@@ -768,6 +799,31 @@ struct Parser {
         s->body = parse_block();
         loop_depth--;
         if (check(Tok::KW_ELSE)) err("'for ... else' is not supported");
+        return s;
+    }
+
+    StmtPtr parse_with() {
+        int line = advance().line; // 'with'
+        auto s = mks(StmtKind::With, line);
+        s->e1 = parse_expr();
+        if (match(Tok::KW_AS)) s->name = expect(Tok::NAME, "name").text;
+        // additional context managers: with a as x, b as y:
+        std::vector<StmtPtr> extra;
+        while (match(Tok::COMMA)) {
+            auto w2 = mks(StmtKind::With, line);
+            w2->e1 = parse_expr();
+            if (match(Tok::KW_AS)) w2->name = expect(Tok::NAME, "name").text;
+            extra.push_back(std::move(w2));
+        }
+        expect(Tok::COLON, "':'");
+        std::vector<StmtPtr> body = parse_block();
+        // nest extra context managers inside
+        for (size_t i = extra.size(); i-- > 0;) {
+            extra[i]->body = std::move(body);
+            body.clear();
+            body.push_back(std::move(extra[i]));
+        }
+        s->body = std::move(body);
         return s;
     }
 
@@ -1160,6 +1216,11 @@ std::string dump_expr(const Expr* e) {
             s += " (" + dump_expr(p.first.get()) + " " + dump_expr(p.second.get()) + ")";
         return s + ")";
     }
+    case ExprKind::SetLit: {
+        std::string s = "(set";
+        for (auto& a : e->args) s += " " + dump_expr(a.get());
+        return s + ")";
+    }
     case ExprKind::ListComp: {
         std::string s = "(comp " + dump_expr(e->a.get()) + " for";
         for (auto& p : e->params) s += " " + p;
@@ -1249,6 +1310,16 @@ std::string dump_stmt(const Stmt* s, int indent) {
         if (!s->orelse.empty()) r += pad + " else\n" + block(s->orelse);
         if (!s->final_body.empty()) r += pad + " finally\n" + block(s->final_body);
         return r + pad + ")\n";
+    }
+    case StmtKind::Del: {
+        std::string r = pad + "(del";
+        for (auto& t : s->targets) r += " " + dump_expr(t.get());
+        return r + ")\n";
+    }
+    case StmtKind::With: {
+        std::string r = pad + "(with " + dump_expr(s->e1.get());
+        if (!s->name.empty()) r += " as " + s->name;
+        return r + "\n" + block(s->body) + pad + ")\n";
     }
     case StmtKind::Raise:
         if (s->raise_mode == 1) return pad + "(raise)\n";

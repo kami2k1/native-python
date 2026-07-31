@@ -49,10 +49,11 @@ struct KamiMap {
 
 struct KamiFuncObj {
     ObjHeader h;
-    void* fn; // KamiFn
+    void* fn;          // KamiFn (null when builtin_id >= 0)
     int64_t min_arity;
-    int64_t arity; // max
-    const char* name; // static string from generated code
+    int64_t arity;     // max
+    int64_t builtin_id; // >= 0 => call via kami_builtin
+    const char* name;
 };
 
 struct ThreadData {
@@ -76,6 +77,19 @@ struct KamiInstance {
     ObjHeader h;
     KamiClassObj* cls;
     std::unordered_map<std::string, KamiValue>* fields;
+};
+
+struct KamiFile {
+    ObjHeader h;
+    void* fp; // FILE*
+    bool closed;
+};
+
+struct KamiSocket {
+    ObjHeader h;
+    int64_t fd;
+    bool closed;
+    double timeout; // seconds; <0 = blocking
 };
 
 // Runtime error used for Python-level exceptions (try/except).
@@ -132,11 +146,18 @@ KamiMap* map_new();                                    // lock held
 void list_push(KamiList* l, const KamiValue* v);       // lock held
 void map_set(KamiMap* m, const KamiValue* k, const KamiValue* v); // lock held
 bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out);     // lock held
+bool map_del(KamiMap* m, const KamiValue* k);                     // lock held
 uint64_t value_hash(const KamiValue* v);
 bool value_eq(const KamiValue* a, const KamiValue* b);
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
 
 std::string format_float(double d);
+std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs);
+void json_loads(KamiValue* out, const std::string& text);          // lock held
+std::string json_dumps(const KamiValue* v);                        // lock held
+KamiClassObj* internal_class(const char* name);                    // lock held
+void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
+                   const std::string& m, KamiValue** argv, int64_t nargs);
 std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);
