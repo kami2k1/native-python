@@ -37,6 +37,7 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"format", {KB_FORMAT, 1, 2}}, {"divmod", {KB_DIVMOD, 2, 2}},
         {"exit", {KB_SYS_EXIT, 0, 1}}, {"quit", {KB_SYS_EXIT, 0, 1}},
         {"set", {KB_SET, 0, 1}}, {"open", {KB_OPEN, 1, 2}},
+        {"map", {KB_MAP, 2, 2}}, {"filter", {KB_FILTER, 2, 2}},
     };
     return b;
 }
@@ -78,6 +79,10 @@ modules() {
             {"socket", {{"socket", {KB_SOCKET_SOCKET, 0, 2}}}},
             {"requests",
              {{"get", {KB_REQUESTS_GET, 1, 3}}, {"post", {KB_REQUESTS_POST, 1, 4}}}},
+            {"re",
+             {{"match", {KB_RE_MATCH, 2, 3}}, {"search", {KB_RE_SEARCH, 2, 3}},
+              {"fullmatch", {KB_RE_FULLMATCH, 2, 3}}, {"findall", {KB_RE_FINDALL, 2, 2}},
+              {"sub", {KB_RE_SUB, 3, 4}}, {"split", {KB_RE_SPLIT, 2, 3}}}},
         };
     return m;
 }
@@ -150,7 +155,54 @@ struct Sema {
     std::unordered_map<std::string, int64_t> locals;
     std::set<std::string> global_decls; // 'global x' names in current function
 
+    // closure support: capture state of the CURRENT function + a stack of
+    // enclosing frames (only the immediately-enclosing one is consulted).
+    bool cur_is_closure = false;
+    std::unordered_map<std::string, int64_t> cur_capture_map; // name -> capture idx
+    std::vector<std::pair<int, int64_t>> cur_capture_src;     // (kind,idx) in enclosing terms
+    struct Frame {
+        Stmt* def;
+        std::unordered_map<std::string, int64_t> locals;
+        std::set<std::string> global_decls;
+        bool is_closure;
+        std::unordered_map<std::string, int64_t> capture_map;
+        std::vector<std::pair<int, int64_t>> capture_src;
+    };
+    std::vector<Frame> encl;
+    int synth_counter = 0;
+
     explicit Sema(Module& m) : mod(m) {}
+
+    int64_t add_capture(const std::string& name, int kind, int64_t idx) {
+        auto it = cur_capture_map.find(name);
+        if (it != cur_capture_map.end()) return it->second;
+        int64_t ci = (int64_t)cur_capture_src.size();
+        cur_capture_map[name] = ci;
+        cur_capture_src.push_back({kind, idx});
+        return ci;
+    }
+
+    // Returns true and marks e as a capture if `name` can be captured from the
+    // immediately-enclosing function frame.
+    bool try_capture(Expr* e, const std::string& name) {
+        if (encl.empty()) return false;
+        Frame& E = encl.back();
+        auto itl = E.locals.find(name);
+        if (itl != E.locals.end() && !E.global_decls.count(name)) {
+            e->res = Res::Capture;
+            e->res_idx = add_capture(name, 1, itl->second);
+            return true;
+        }
+        if (E.is_closure) {
+            auto itc = E.capture_map.find(name);
+            if (itc != E.capture_map.end()) {
+                e->res = Res::Capture;
+                e->res_idx = add_capture(name, 3, itc->second);
+                return true;
+            }
+        }
+        return false;
+    }
 
     [[noreturn]] static void err(int line, const std::string& m) { throw CompileError(line, m); }
 
@@ -317,7 +369,9 @@ struct Sema {
                 collect_assigned(s->final_body, as_globals);
                 break;
             case StmtKind::FuncDef:
-                err(s->line, "nested functions are not supported");
+                if (as_globals) global_slot(s->name);
+                else if (!global_decls.count(s->name)) local_slot(s->name);
+                break; // its body is a separate function scope
             case StmtKind::ClassDef:
                 err(s->line, "classes may only be defined at module level");
             default: break;
@@ -328,6 +382,7 @@ struct Sema {
     void collect_global_decls(std::vector<StmtPtr>& body) {
         for (auto& sp : body) {
             Stmt* s = sp.get();
+            if (s->kind == StmtKind::FuncDef) continue; // nested fn: its own scope
             if (s->kind == StmtKind::Global)
                 for (auto& n : s->params) {
                     global_decls.insert(n);
@@ -369,6 +424,12 @@ struct Sema {
                 return;
             }
         }
+        if (cur_is_closure && cur_capture_map.count(n)) {
+            e->res = Res::Capture;
+            e->res_idx = cur_capture_map[n];
+            return;
+        }
+        if (cur_func && try_capture(e, n)) return;
         auto g = globals.find(n);
         if (g != globals.end()) {
             e->res = Res::Global;
@@ -738,6 +799,13 @@ struct Sema {
                 if (!local_shadow) {
                     auto f = funcs.find(n);
                     if (f != funcs.end()) {
+                        if (!f->second.def->decorators.empty()) {
+                            // decorated: must call the (possibly wrapped) global value
+                            resolve_args();
+                            callee->res = Res::Global;
+                            callee->res_idx = f->second.global;
+                            return;
+                        }
                         apply_signature(e, f->second.def, false);
                         resolve_args();
                         callee->res = Res::UserFunc;
@@ -867,6 +935,17 @@ struct Sema {
         case ExprKind::ListLit:
         case ExprKind::SetLit:
             for (auto& a : e->args) resolve_expr(a.get());
+            return;
+        case ExprKind::Lambda: {
+            Stmt* fn = make_lambda_func(e);
+            resolve_function(fn, /*as_closure=*/true);
+            e->kind = ExprKind::Closure;
+            e->res_idx = fn->func_index;
+            e->params.clear();
+            e->a.reset();
+            return;
+        }
+        case ExprKind::Closure:
             return;
         case ExprKind::MapLit:
             for (auto& p : e->pairs) {
@@ -1066,13 +1145,48 @@ struct Sema {
             resolve_stmts(s->body);
             return;
         }
-        case StmtKind::FuncDef: resolve_function(s); return;
+        case StmtKind::FuncDef:
+            if (cur_func) {
+                // nested function -> becomes a closure value bound to a local
+                if (!s->decorators.empty())
+                    err(s->line, "decorators on nested functions are not supported");
+                s->alias = "nested_" + std::to_string(synth_counter++) + "_" + s->name;
+                s->func_index = (int)mod.functions.size();
+                s->global_idx = -1;
+                mod.functions.push_back(s);
+                resolve_function(s, /*as_closure=*/true);
+                int k;
+                int64_t idx;
+                resolve_target_name(k, idx, s->name);
+                s->target_res = k == 1 ? Res::Local : Res::Global;
+                s->target_idx = idx;
+            } else {
+                resolve_function(s, /*as_closure=*/false);
+                for (auto& d : s->decorators) resolve_expr(d.get());
+            }
+            return;
         case StmtKind::ClassDef:
             // resolve methods; class attribute assigns resolved as class-attr sets
             for (auto& msp : s->body) {
-                if (msp->kind == StmtKind::FuncDef) resolve_function(msp.get());
-                else if (msp->kind == StmtKind::Assign) resolve_expr(msp->e1.get());
+                if (msp->kind == StmtKind::FuncDef) {
+                    Stmt* m = msp.get();
+                    for (auto& d : m->decorators) {
+                        if (!(d->kind == ExprKind::Name &&
+                              (d->sval == "staticmethod" || d->sval == "classmethod" ||
+                               d->sval == "abstractmethod" || d->sval == "property" ||
+                               d->sval == "override")))
+                            err(m->line, "unsupported method decorator (only "
+                                         "@staticmethod/@classmethod/@property/@abstractmethod "
+                                         "are recognized, and are treated as no-ops)");
+                        if (d->sval == "staticmethod" || d->sval == "classmethod")
+                            err(m->line, "@staticmethod/@classmethod are not supported yet");
+                    }
+                    resolve_function(m, /*as_closure=*/false);
+                } else if (msp->kind == StmtKind::Assign) {
+                    resolve_expr(msp->e1.get());
+                }
             }
+            for (auto& d : s->decorators) resolve_expr(d.get());
             if (!s->alias.empty() && !classes.count(s->alias))
                 err(s->line, "unknown base class '" + s->alias + "'");
             return;
@@ -1151,10 +1265,25 @@ struct Sema {
         }
     }
 
-    void resolve_function(Stmt* s) {
+    void resolve_function(Stmt* s, bool as_closure) {
+        // defaults are evaluated in the DEFINING (enclosing) scope
+        for (auto& d : s->defaults) resolve_expr(d.get());
+        // push current frame
+        Frame f;
+        f.def = cur_func;
+        f.locals = std::move(locals);
+        f.global_decls = std::move(global_decls);
+        f.is_closure = cur_is_closure;
+        f.capture_map = std::move(cur_capture_map);
+        f.capture_src = std::move(cur_capture_src);
+        encl.push_back(std::move(f));
+        // new frame
         cur_func = s;
         locals.clear();
         global_decls.clear();
+        cur_is_closure = as_closure;
+        cur_capture_map.clear();
+        cur_capture_src.clear();
         collect_global_decls(s->body);
         for (auto& p : s->params) {
             if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
@@ -1162,12 +1291,47 @@ struct Sema {
             local_slot(p);
         }
         collect_assigned(s->body, false);
-        for (auto& d : s->defaults) resolve_expr(d.get());
         resolve_stmts(s->body);
         s->nlocals = (int)locals.size();
-        cur_func = nullptr;
-        locals.clear();
-        global_decls.clear();
+        s->is_closure = as_closure;
+        s->ncaptures = (int)cur_capture_src.size();
+        // export capture sources onto the Stmt for codegen (enclosing terms)
+        s->multi_tkind.clear();
+        s->multi_tidx.clear();
+        for (auto& cs : cur_capture_src) {
+            s->multi_tkind.push_back(cs.first);
+            s->multi_tidx.push_back(cs.second);
+        }
+        // restore enclosing frame
+        Frame& e = encl.back();
+        cur_func = e.def;
+        locals = std::move(e.locals);
+        global_decls = std::move(e.global_decls);
+        cur_is_closure = e.is_closure;
+        cur_capture_map = std::move(e.capture_map);
+        cur_capture_src = std::move(e.capture_src);
+        encl.pop_back();
+    }
+
+    // Build a synthetic function for a lambda: body = 'return <expr>'.
+    Stmt* make_lambda_func(Expr* lam) {
+        auto fn = std::make_unique<Stmt>();
+        fn->kind = StmtKind::FuncDef;
+        fn->line = lam->line;
+        fn->name = "<lambda>";
+        fn->params = lam->params;
+        fn->alias = "lambda_" + std::to_string(synth_counter++);
+        auto ret = std::make_unique<Stmt>();
+        ret->kind = StmtKind::Return;
+        ret->line = lam->line;
+        ret->e1 = std::move(lam->a);
+        fn->body.push_back(std::move(ret));
+        fn->func_index = (int)mod.functions.size();
+        fn->global_idx = -1;
+        Stmt* raw = fn.get();
+        mod.functions.push_back(raw);
+        mod.synth.push_back(std::move(fn));
+        return raw;
     }
 };
 

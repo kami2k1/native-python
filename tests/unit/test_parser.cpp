@@ -75,7 +75,11 @@ int main() {
     ERR("return 1\n");                  // return outside function
     ERR("break\n");                     // break outside loop
     ERR("1 + 2 = 3\n");                 // bad assignment target
-    ERR("def f():\n    def g():\n        pass\n"); // nested def
+    // nested functions are now supported (compiled as closures)
+    DUMP("def f():\n    def g():\n        return 1\n    return g\n",
+         "(def f ()\n  (def g ()\n    (return 1)\n  )\n  (return g)\n)\n");
+    // lambda
+    DUMP("f = lambda x: x + 1\n", "(= f (lambda (x) (+ x 1)))\n");
 
     if (failures) {
         fprintf(stderr, "%d parser check(s) failed\n", failures);

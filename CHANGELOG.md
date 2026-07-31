@@ -4,6 +4,60 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.4.0] — 2026-08-01 — Functional Python: lambda, closures, decorators, map/filter + regex (`re`)
+
+Bổ sung lớp "functional" của Python và module `re` — nhóm lỗi lớn tiếp theo trong corpus.
+Đo lại trên 2.182 file GitHub:
+
+| Mốc | Build được | Chạy được |
+|---|---|---|
+| v0.3.0 | 975 | 731 |
+| **v0.4.0** | **1015 (47%)** | **748** |
+
+### Added — ngôn ngữ
+- **lambda**: `lambda x: expr`, dùng trực tiếp `sorted(xs, key=lambda p: p[1])`,
+  `map(lambda x: x*x, xs)`. Biên dịch thành hàm tổng hợp + closure.
+- **Nested functions / closures**: `def inner()` bên trong `def outer()`; **bắt biến
+  enclosing theo giá trị** (capture-by-value) — `make_adder(n)` → `add(x): return x+n`
+  hoạt động. Hỗ trợ bắt qua 1 cấp lồng, và 2 cấp nếu cấp giữa cũng bắt biến đó.
+- **Decorators**: `@deco` trên hàm/lớp cấp module (`name = deco(name)`), xếp chồng nhiều
+  decorator (`@a\n@b`). Lời gọi hàm đã decorate đi qua giá trị global (đúng ngữ nghĩa).
+  Method decorator: nhận diện `@staticmethod/@classmethod/@property/@abstractmethod`
+  (báo lỗi rõ ràng vì chưa hỗ trợ ngữ nghĩa đầy đủ).
+- **First-class functions** hoàn chỉnh: builtins + hàm người dùng + closure đều là giá trị
+  gọi được, truyền vào `map/filter/sorted(key=)`.
+- Calling convention thêm tham số `captures` (ẩn) — hàm thường bỏ qua, closure đọc biến bắt.
+
+### Added — module `re` (regex engine tự viết, `runtime/src/kami_regex.cpp`)
+Backtracking matcher (CPS) hỗ trợ: literal, `. * + ? {m,n}` (greedy + lazy `?`),
+lớp ký tự `[...]`/`[^...]` + range, neo `^ $`, nhóm `(...)`/non-capturing `(?:...)`,
+alternation `|`, escapes `\d \D \w \W \s \S \b \B` + `\n\t\r`.
+Hàm: `re.match/search/fullmatch/findall/sub/split`; Match object `.group([n])/.groups()/
+.start([n])/.end([n])/.span()`. Byte-identical với CPython (trừ findall nhiều nhóm hiển thị
+list thay vì tuple — theo quy ước tuple≈list đã ghi).
+
+### Added — builtins
+`map`, `filter` (eager, trả list); nhận iterable bất kỳ.
+
+### Fixed
+- Lời gọi trực tiếp tới hàm đã decorate bị bỏ qua wrapper → chuyển sang gọi động qua global.
+- `re` matcher: sửa đệ quy template vô hạn (dùng `std::function` cho continuation).
+
+### Verification
+- Integration **33/33 PASS** (2 suite mới: `feat_closures`, `feat_regex` — **byte-identical
+  CPython 3.11**).
+- ASan CLEAN trên closures + regex; rebuild sạch 0 error/0 warning.
+- Corpus 2.182 file: build 975→**1015**, chạy 731→**748**.
+
+### Known limitations
+- Closure bắt biến **theo giá trị lúc tạo** (snapshot) — không phản ánh thay đổi biến enclosing
+  sau khi tạo closure (khác Python; đủ cho sort key/callback thông thường). Không có `nonlocal`.
+- `@staticmethod/@classmethod/@property` chưa hỗ trợ (báo lỗi rõ).
+- `re`: chưa có flags (IGNORECASE...), named groups `(?P<>)`, lookahead/lookbehind, backref
+  trong pattern.
+
+---
+
 ## [v0.3.0] — 2026-08-01 — stdlib thực tế: file I/O, os, json, logging, socket, requests + with/set/del
 
 Tiếp tục từ bug report (`try: import ...`, `logging.basicConfig`), bổ sung các module và cú pháp

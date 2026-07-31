@@ -459,7 +459,22 @@ struct Parser {
             advance();
             return e;
         }
-        case Tok::KW_LAMBDA: err("lambda expressions are not supported");
+        case Tok::KW_LAMBDA: {
+            int line = advance().line;
+            auto e = std::make_unique<Expr>();
+            e->kind = ExprKind::Lambda;
+            e->line = line;
+            if (!check(Tok::COLON)) {
+                do {
+                    if (check(Tok::COLON)) break;
+                    e->params.push_back(expect(Tok::NAME, "lambda parameter").text);
+                } while (match(Tok::COMMA));
+            }
+            expect(Tok::COLON, "':' in lambda");
+            e->a = parse_ternary(); // lambda body is a single expression
+            if (e->params.size() > 16) err("too many lambda parameters (max 16)");
+            return e;
+        }
         case Tok::KW_YIELD: err("generators (yield) are not supported");
         case Tok::LPAREN: {
             int line = advance().line;
@@ -597,7 +612,7 @@ struct Parser {
         case Tok::KW_CLASS: body.push_back(parse_class()); return;
         case Tok::KW_TRY: body.push_back(parse_try()); return;
         case Tok::KW_WITH: body.push_back(parse_with()); return;
-        case Tok::AT: err("decorators (@...) are not supported");
+        case Tok::AT: body.push_back(parse_decorated()); return;
         case Tok::KW_DEL: break;
         case Tok::KW_NONLOCAL: err("'nonlocal' is not supported");
         default: break;
@@ -859,9 +874,23 @@ struct Parser {
         return s;
     }
 
+    StmtPtr parse_decorated() {
+        std::vector<ExprPtr> decos;
+        while (check(Tok::AT)) {
+            advance();
+            decos.push_back(parse_expr());
+            expect(Tok::NEWLINE, "newline after decorator");
+        }
+        StmtPtr target;
+        if (check(Tok::KW_DEF)) target = parse_def();
+        else if (check(Tok::KW_CLASS)) target = parse_class();
+        else err("expected 'def' or 'class' after decorator");
+        target->decorators = std::move(decos);
+        return target;
+    }
+
     StmtPtr parse_def() {
         int line = advance().line;
-        if (func_depth > 0) throw CompileError(line, "nested functions are not supported");
         auto s = mks(StmtKind::FuncDef, line);
         s->name = expect(Tok::NAME, "function name").text;
         expect(Tok::LPAREN, "'('");
@@ -964,8 +993,7 @@ struct Parser {
                 expect(Tok::NEWLINE, "newline");
                 s->body.push_back(std::move(a));
             } else if (check(Tok::AT)) {
-                throw CompileError(peek().line,
-                                   "decorators (@staticmethod, @property, ...) are not supported");
+                s->body.push_back(parse_decorated());
             } else {
                 throw CompileError(peek().line,
                                    "only methods and simple attribute assignments are "
@@ -1221,6 +1249,12 @@ std::string dump_expr(const Expr* e) {
         for (auto& a : e->args) s += " " + dump_expr(a.get());
         return s + ")";
     }
+    case ExprKind::Lambda: {
+        std::string s = "(lambda (";
+        for (size_t i = 0; i < e->params.size(); i++) s += (i ? " " : "") + e->params[i];
+        return s + ") " + dump_expr(e->a.get()) + ")";
+    }
+    case ExprKind::Closure: return "(closure " + std::to_string(e->res_idx) + ")";
     case ExprKind::ListComp: {
         std::string s = "(comp " + dump_expr(e->a.get()) + " for";
         for (auto& p : e->params) s += " " + p;
