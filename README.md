@@ -64,6 +64,7 @@ kamipy clean                # xóa .kamipy-cache
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post via curl, http+https), **`json`** (loads/dumps) |
 | Collections | + **`set`** (`{1,2}`, `&\|^-`, add/remove), **`del`**, first-class builtins (`sorted(xs, key=len)`) |
 | Modules | `math time random threading sys os os.path json logging socket requests re string doctest`; `re` = self-written regex engine (match/search/findall/sub/split, groups); no-op `typing`/`__future__` |
+| Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
 | Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
 | Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |

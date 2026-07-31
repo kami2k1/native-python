@@ -2,6 +2,7 @@
 #include "token.h"
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,10 @@ struct Module {
     std::vector<Stmt*> classes;        // all ClassDefs (borrowed)
     std::vector<StmtPtr> synth;        // synthetic functions (lambdas), owned
     int64_t nglobals = 0;
+    // Local .py modules whose source was bundled into this module by the
+    // driver ("import utils" → utils.py compiled in). Their top-level code is
+    // spliced before the main body; sema maps "utils.x" to plain "x".
+    std::set<std::string> user_modules;
 };
 
 // S-expression dump for tests/debugging.
