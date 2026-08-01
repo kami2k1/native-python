@@ -308,7 +308,7 @@ struct TypeInf {
             return TY_ANY;
         case ExprKind::MapLit:
             for (auto& p : e->pairs) {
-                type_expr(c, p.first.get());
+                if (p.first) type_expr(c, p.first.get()); // null = **unpacking
                 type_expr(c, p.second.get());
             }
             return TY_ANY;

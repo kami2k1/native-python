@@ -680,6 +680,13 @@ struct FnGen {
             emit("call void @kami_make_map(ptr " + slot_ptr(t) + ")");
             for (auto& p : e->pairs) {
                 int save = temp_top;
+                if (!p.first) { // {**other}: merge at runtime
+                    int v = gen_expr(p.second.get());
+                    emit("call void @kami_map_merge(ptr " + slot_ptr(t) + ", ptr " +
+                         slot_ptr(v) + ")");
+                    temp_top = save;
+                    continue;
+                }
                 int k = gen_expr(p.first.get());
                 int v = gen_expr(p.second.get());
                 emit("call void @kami_index_set(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(k) +

@@ -614,6 +614,25 @@ struct Parser {
                 e->line = line;
                 return e;
             }
+            if (check(Tok::POW)) { // {**base, ...}: dict with unpacking
+                advance();
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::MapLit;
+                e->line = line;
+                e->pairs.emplace_back(nullptr, parse_expr());
+                while (match(Tok::COMMA)) {
+                    if (check(Tok::RBRACE)) break;
+                    if (match(Tok::POW)) {
+                        e->pairs.emplace_back(nullptr, parse_expr());
+                        continue;
+                    }
+                    ExprPtr k2 = parse_expr();
+                    expect(Tok::COLON, "':'");
+                    e->pairs.emplace_back(std::move(k2), parse_expr());
+                }
+                expect(Tok::RBRACE, "'}'");
+                return e;
+            }
             ExprPtr first = parse_expr();
             if (check(Tok::COLON)) { // dict or dict-comprehension
                 advance();
@@ -633,6 +652,10 @@ struct Parser {
                 e->pairs.emplace_back(std::move(first), std::move(v));
                 while (match(Tok::COMMA)) {
                     if (check(Tok::RBRACE)) break;
+                    if (match(Tok::POW)) { // {"a": 1, **other}
+                        e->pairs.emplace_back(nullptr, parse_expr());
+                        continue;
+                    }
                     ExprPtr k2 = parse_expr();
                     expect(Tok::COLON, "':'");
                     e->pairs.emplace_back(std::move(k2), parse_expr());
@@ -1403,7 +1426,8 @@ std::string dump_expr(const Expr* e) {
     case ExprKind::MapLit: {
         std::string s = "(map";
         for (auto& p : e->pairs)
-            s += " (" + dump_expr(p.first.get()) + " " + dump_expr(p.second.get()) + ")";
+            s += " (" + (p.first ? dump_expr(p.first.get()) : std::string("**")) + " " +
+                 dump_expr(p.second.get()) + ")";
         return s + ")";
     }
     case ExprKind::SetLit: {

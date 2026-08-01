@@ -1460,7 +1460,7 @@ struct Sema {
             return; // produced by this pass, never fed back into it
         case ExprKind::MapLit:
             for (auto& p : e->pairs) {
-                resolve_expr(p.first.get());
+                if (p.first) resolve_expr(p.first.get()); // null = **unpacking
                 resolve_expr(p.second.get());
             }
             return;
