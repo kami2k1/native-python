@@ -30,7 +30,18 @@ namespace kami {
 //   /usr/lib/python3.*, /usr/local/lib/python3.* and friends on Unix).
 const std::vector<std::filesystem::path>& find_system_python_stdlib();
 
-enum class ModuleOrigin { NotFound, Project, Pylib, Native, SystemPython };
+// Third-party package directories (site-packages / dist-packages) belonging
+// to the discovered Python installations, best first. Pure-Python packages
+// found here are compiled in when possible; everything else is bridged
+// through the embedded CPython interpreter at runtime (KT_PYOBJ).
+const std::vector<std::filesystem::path>& find_site_packages();
+
+// Does a third-party package named `dotted` exist in any site-packages dir —
+// as pure-Python source, a package directory, or a compiled C extension
+// (.so/.pyd)? Used to route unknown imports through the CPython bridge.
+bool site_packages_has(const std::string& dotted);
+
+enum class ModuleOrigin { NotFound, Project, Pylib, Native, SystemPython, SitePackages };
 
 struct ResolvedModule {
     ModuleOrigin origin = ModuleOrigin::NotFound;
@@ -57,6 +68,11 @@ void bundle_imported_modules(Module& mod, const ImportPolicy& pol);
 // "std_re_"), and the AST rename that applies it.
 std::string library_prefix(const std::string& dotted);
 void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix);
+
+// The global name a library module's top-level binding ends up under after
+// mangling. Dunders (__version__, __all__) are NOT prefixed (mangle_module
+// skips them), so every name mapping must go through this helper.
+std::string mangled_library_name(const std::string& prefix, const std::string& name);
 
 // Default pylib search path for a kamipy binary living in `bindir`.
 std::vector<std::filesystem::path> bundled_pylib_dirs(const std::filesystem::path& bindir);

@@ -158,6 +158,11 @@ struct Stmt {
     // without __init__ accept any message argument and stringify as
     // "Name: message" so raise/str work like CPython's Exception.
     bool is_exception = false;
+    // ClassDef: the base class is a bridged CPython class (KT_PYOBJ). The
+    // class is created at runtime with type(name, (base,), {...}) and the
+    // compiled methods are installed as bound-able callables; target_idx
+    // holds the global slot of the base value.
+    bool pyobj_base = false;
 };
 
 // A C function the compiled program calls directly (from a C extension mapping

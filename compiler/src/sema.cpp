@@ -1,6 +1,7 @@
 #include "sema.h"
 
 #include "cext.h"
+#include "modules.h"
 
 #include "../../runtime/include/kami_builtins.h"
 #include "../../runtime/include/kami_runtime.h"
@@ -297,6 +298,7 @@ struct Sema {
     std::unordered_map<std::string, BuiltinSig> from_imports;  // name → builtin
     std::unordered_map<std::string, ModConst> from_consts;     // name → const value
     std::unordered_map<std::string, std::string> user_imports; // alias → bundled local module
+    std::set<std::string> pyext_names; // globals bound through the CPython bridge
     // `from re import search` on a mangled pylib module: alias → mangled global.
     std::unordered_map<std::string, std::string> bundled_names;
 
@@ -429,11 +431,15 @@ struct Sema {
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
-        if (pyext_module(modname)) {
-            // Bridged CPython extension: the module becomes an ordinary global
-            // holding a KT_PYOBJ; codegen emits the runtime import here.
+        if (pyext_module(modname) ||
+            (site_packages_has(modname) && !known_builtin_module(modname))) {
+            // Bridged CPython module: either a known C extension, or a
+            // third-party package from site-packages that could not be
+            // compiled whole — the module becomes an ordinary global holding
+            // a KT_PYOBJ; codegen emits the runtime import here.
             s->pyext = true;
             s->global_idx = global_slot(s->alias.empty() ? modname : s->alias);
+            pyext_names.insert(s->alias.empty() ? modname : s->alias);
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
@@ -469,24 +475,51 @@ struct Sema {
             // .py file the name is already correct, so only plain (non-"as")
             // imports work there.
             const std::string& pfx = module_prefix(modname);
+            // Two-phase: names that don't resolve to any compiled binding may
+            // belong to submodules that could not be compiled (PIL bundles its
+            // __init__ but not Image) — those route the WHOLE import through
+            // the CPython bridge instead.
+            std::vector<std::pair<std::string, std::string>> user_adds;
+            std::vector<std::pair<std::string, std::string>> name_adds;
+            bool unresolved = false;
             for (auto& [n, alias] : s->import_names) {
                 // `from concurrent.futures import _base` — a sibling MODULE
                 if (mod.user_modules.count(modname + "." + n)) {
-                    user_imports[alias] = modname + "." + n;
+                    user_adds.emplace_back(alias, modname + "." + n);
                     continue;
                 }
                 // package re-export recorded by the bundler
                 auto xit = mod.module_exports.find(modname + "." + n);
                 if (xit != mod.module_exports.end()) {
-                    bundled_names[alias] = xit->second;
+                    name_adds.emplace_back(alias, xit->second);
                     continue;
                 }
-                if (!pfx.empty()) bundled_names[alias] = pfx + n;
-                else if (alias != n)
-                    err(s->line, "'from " + modname + " import " + n + " as " + alias +
-                                     "' — 'as' renames are not supported for bundled "
-                                     "local modules yet; use the original name");
+                if (pfx.empty()) { // local project module: flat namespace
+                    if (alias != n)
+                        err(s->line, "'from " + modname + " import " + n + " as " + alias +
+                                         "' — 'as' renames are not supported for bundled "
+                                         "local modules yet; use the original name");
+                    continue;
+                }
+                std::string target = mangled_library_name(pfx, n);
+                if (globals.count(target)) {
+                    name_adds.emplace_back(alias, target);
+                    continue;
+                }
+                unresolved = true;
             }
+            if (unresolved && site_packages_has(modname)) {
+                // e.g. `from PIL import Image`: PIL.Image was skipped by the
+                // compiler — bind every name through the embedded CPython.
+                s->pyext = true;
+                for (auto& [n, alias] : s->import_names) {
+                    s->multi_tidx.push_back(global_slot(alias));
+                    pyext_names.insert(alias);
+                }
+                return;
+            }
+            for (auto& [alias, target] : user_adds) user_imports[alias] = target;
+            for (auto& [alias, target] : name_adds) bundled_names[alias] = target;
             return;
         }
         if (is_cext_module(modname)) {
@@ -506,12 +539,16 @@ struct Sema {
             for (auto& [n, alias] : s->import_names) ffi_names[alias] = modname + "." + n;
             return;
         }
-        if (pyext_module(modname)) {
-            // `from _hashlib import openssl_sha256`: each name becomes a
-            // global bound to getattr(module, name) at this point at runtime.
+        if (pyext_module(modname) ||
+            (site_packages_has(modname) && !known_builtin_module(modname))) {
+            // `from _hashlib import openssl_sha256` / `from flask import
+            // Flask`: each name becomes a global bound to getattr(module,
+            // name) at this point at runtime (through the CPython bridge).
             s->pyext = true;
-            for (auto& [n, alias] : s->import_names)
+            for (auto& [n, alias] : s->import_names) {
                 s->multi_tidx.push_back(global_slot(alias));
+                pyext_names.insert(alias);
+            }
             return;
         }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
@@ -554,6 +591,21 @@ struct Sema {
             case StmtKind::ClassDef: {
                 if (classes.count(s->name)) err(s->line, "class '" + s->name + "' redefined");
                 s->global_idx = global_slot(s->name);
+                // Base bound through the CPython bridge (`class Bot(ZaloAPI)`
+                // after `from zlapi import ZaloAPI`, or `mod.Class`): the
+                // class is a runtime type(name, (base,), {...}) — a KT_PYOBJ,
+                // not a kami class. Its methods still compile as functions.
+                if (!s->alias.empty() &&
+                    pyext_names.count(chain_root(s->alias)) &&
+                    !classes.count(s->alias)) {
+                    s->pyobj_base = true;
+                    for (auto& msp : s->body) {
+                        if (msp->kind != StmtKind::FuncDef) continue;
+                        Stmt* m = msp.get();
+                        register_funcdef(m, s->name + "__" + m->name, false);
+                    }
+                    break;
+                }
                 mod.classes.push_back(s);
                 ClassEntry ce;
                 ce.def = s;
@@ -1164,7 +1216,7 @@ struct Sema {
                 auto xit = mod.module_exports.find(modname + "." + e->sval);
                 std::string attr = xit != mod.module_exports.end()
                                        ? xit->second
-                                       : module_prefix(modname) + e->sval;
+                                       : mangled_library_name(module_prefix(modname), e->sval);
                 e->kind = ExprKind::Name;
                 e->sval = attr;
                 e->a.reset();
@@ -1314,9 +1366,21 @@ struct Sema {
                     }
                     auto c = classes.find(n);
                     if (c != classes.end()) {
-                        auto init = c->second.methods.find("__init__");
-                        if (init != c->second.methods.end())
-                            apply_signature(e, init->second, true);
+                        // nearest __init__ up the (single-inheritance) chain
+                        Stmt* init_def = nullptr;
+                        std::string cls = n;
+                        std::set<std::string> seen;
+                        while (classes.count(cls) && seen.insert(cls).second) {
+                            auto& ce = classes.at(cls);
+                            auto init = ce.methods.find("__init__");
+                            if (init != ce.methods.end()) {
+                                init_def = init->second;
+                                break;
+                            }
+                            cls = ce.def->alias;
+                        }
+                        if (init_def)
+                            apply_signature(e, init_def, true);
                         else if (!c->second.def->is_exception &&
                                  (!e->args.empty() || !e->kwargs.empty()))
                             err(e->line, n + "() takes no arguments");
@@ -1356,9 +1420,22 @@ struct Sema {
                 }
             }
             resolve_args();
-            if (!e->kwargs.empty())
-                err(e->line, "keyword arguments are only supported when calling functions "
-                             "and classes defined in this file");
+            if (!e->kwargs.empty()) {
+                // Dynamic callee (a value: bridged CPython function, closure,
+                // function stored in a variable, ...): lower to CallStar so
+                // the keywords are matched at runtime.
+                for (auto& [kw, v] : e->kwargs) {
+                    auto key = std::make_unique<Expr>();
+                    key->kind = ExprKind::StrLit;
+                    key->line = e->line;
+                    key->sval = kw;
+                    e->pairs.emplace_back(std::move(key), std::move(v));
+                }
+                e->kwargs.clear();
+                e->kind = ExprKind::CallStar;
+                resolve_expr(e->a.get());
+                return;
+            }
             resolve_expr(callee);
             return;
         }
@@ -1371,10 +1448,24 @@ struct Sema {
                 !cur_func->params.empty()) {
                 if (cur_class->alias.empty())
                     err(e->line, "super(): class '" + cur_class->name + "' has no base class");
-                auto recv = std::make_unique<Expr>();
-                recv->kind = ExprKind::Name;
-                recv->line = e->line;
-                recv->sval = cur_class->alias;
+                ExprPtr recv;
+                size_t basedot = cur_class->alias.find('.');
+                if (basedot == std::string::npos) {
+                    recv = std::make_unique<Expr>();
+                    recv->kind = ExprKind::Name;
+                    recv->line = e->line;
+                    recv->sval = cur_class->alias;
+                } else { // dotted base (mod.Class): receiver is an Attr chain
+                    auto root = std::make_unique<Expr>();
+                    root->kind = ExprKind::Name;
+                    root->line = e->line;
+                    root->sval = cur_class->alias.substr(0, basedot);
+                    recv = std::make_unique<Expr>();
+                    recv->kind = ExprKind::Attr;
+                    recv->line = e->line;
+                    recv->sval = cur_class->alias.substr(basedot + 1);
+                    recv->a = std::move(root);
+                }
                 auto selfe = std::make_unique<Expr>();
                 selfe->kind = ExprKind::Name;
                 selfe->line = e->line;
@@ -1398,7 +1489,7 @@ struct Sema {
                     callee->line = e->line;
                     callee->sval = xit != mod.module_exports.end()
                                        ? xit->second
-                                       : module_prefix(modname) + e->sval;
+                                       : mangled_library_name(module_prefix(modname), e->sval);
                     e->kind = ExprKind::Call;
                     e->a = std::move(callee);
                     e->sval.clear();
@@ -1966,6 +2057,31 @@ struct Sema {
             }
             return;
         case StmtKind::ClassDef:
+            if (s->pyobj_base) {
+                // CPython-bridged subclass: resolve the base to its global
+                // slot (Name, or one-level dotted `mod.Class`) and compile the
+                // methods; codegen creates the type at this statement.
+                std::string root = chain_root(s->alias);
+                size_t dot = s->alias.find('.');
+                if (dot != std::string::npos)
+                    s->vararg = s->alias.substr(dot + 1); // attr on the module
+                auto git = globals.find(root);
+                if (git == globals.end())
+                    err(s->line, "unknown base class '" + s->alias + "'");
+                s->target_idx = git->second;
+                cur_class = s;
+                for (auto& msp : s->body) {
+                    if (msp->kind == StmtKind::FuncDef)
+                        resolve_function(msp.get(), /*as_closure=*/false);
+                    else if (msp->kind == StmtKind::Assign)
+                        resolve_expr(msp->e1.get());
+                }
+                cur_class = nullptr;
+                if (!s->decorators.empty())
+                    err(s->line, "decorators on CPython-bridged subclasses are not "
+                                 "supported yet");
+                return;
+            }
             // Dotted base (`class TPE(_base.Executor)`): resolve through the
             // bundled-module prefix so the mangled class name is found.
             if (!s->alias.empty()) {
@@ -1984,6 +2100,10 @@ struct Sema {
                 else if (classes.count(s->alias) &&
                          classes.at(s->alias).def->is_exception)
                     s->is_exception = true;
+                // `from fakezalo import ZaloAPI; class Bot(ZaloAPI)` — the
+                // base came from a bundled (mangled) library module
+                if (!classes.count(s->alias) && bundled_names.count(s->alias))
+                    s->alias = bundled_names.at(s->alias);
             }
             // resolve methods; class attribute assigns resolved as class-attr sets
             cur_class = s;
@@ -2110,9 +2230,24 @@ struct Sema {
         case StmtKind::Import:
         case StmtKind::FromImport:
         case StmtKind::Global: return;
-        case StmtKind::Del:
-            for (auto& t : s->targets) resolve_expr(t.get());
+        case StmtKind::Del: {
+            // `del _version` on an imported module name (PIL/__init__.py's
+            // namespace cleanup): module bindings are compile-time constructs
+            // here — dropping the del is exactly the right semantics.
+            auto& tgts = s->targets;
+            for (size_t i = 0; i < tgts.size();) {
+                Expr* t = tgts[i].get();
+                if (t->kind == ExprKind::Name && !name_shadowed(t->sval) &&
+                    (imports.count(t->sval) || user_imports.count(t->sval))) {
+                    tgts.erase(tgts.begin() + (long)i);
+                    continue;
+                }
+                resolve_expr(t);
+                i++;
+            }
+            if (tgts.empty()) s->kind = StmtKind::Pass;
             return;
+        }
         case StmtKind::With: {
             resolve_expr(s->e1.get());
             if (!s->name.empty()) {

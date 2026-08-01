@@ -271,9 +271,14 @@ std::string& tls_error();                    // last caught error message (per t
 // called with it held as documented.
 void pyobj_finalize(ObjHeader* h);                                  // GC sweep
 void pyobj_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
+void pyobj_attr_set(const KamiValue* obj, const char* name, const KamiValue* val);
 void pyobj_method(KamiValue* out, KamiValue* obj, const std::string& m,
-                  KamiValue** argv, int64_t nargs);
-void pyobj_call(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
+                  KamiValue** argv, int64_t nargs, KamiMap* kwmap = nullptr);
+void pyobj_call(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs,
+                KamiMap* kwmap = nullptr);
+void pyobj_index_get(KamiValue* out, const KamiValue* obj, const KamiValue* idx);
+void pyobj_index_set(const KamiValue* obj, const KamiValue* idx, const KamiValue* val);
+void pyobj_iter_list(KamiValue* out, const KamiValue* obj); // iter(pyobj) → list
 std::string pyobj_str(const KamiValue* v);
 int32_t pyobj_truthy(const KamiValue* v);
 
