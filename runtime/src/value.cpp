@@ -176,12 +176,16 @@ void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name
     f->name = name;
     f->captures = nullptr;
     f->ncaptures = 0;
+    f->flags = 0;
+    f->pnames = nullptr;
+    f->npos = 0;
     out->tag = KT_FUNC;
     out->p = f;
 }
 
 void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
-                       const char* name, KamiValue** capture_slots, int64_t ncap) {
+                       const char* name, KamiValue** capture_slots, int64_t ncap,
+                       int64_t flags, const char* const* pnames, int64_t npos) {
     Lock lk(g_lock);
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
@@ -191,6 +195,9 @@ void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t a
     f->name = name;
     f->ncaptures = ncap;
     f->captures = nullptr;
+    f->flags = flags;
+    f->pnames = pnames;
+    f->npos = npos;
     out->tag = KT_FUNC;
     out->p = f; // root before the capture array alloc (which can GC)
     if (ncap > 0) {

@@ -53,6 +53,20 @@ struct KamiMap {
     int64_t icap;
 };
 
+// Python's calling convention, as compiled:
+//   [fixed params...] [extra positional args...] [keyword dict]
+// The keyword dict is present exactly when the callee declares **kwargs, and it
+// is always the LAST argument. Static call sites build it; the dynamic paths
+// (kami_call_value / kami_method / kami_call_spread) append an empty one.
+// Fixed argv buffers: 16 user arguments + self + a keyword dict, with slack.
+#define KAMI_MAX_ARGS 24
+
+enum KamiFuncFlags : int64_t {
+    KFF_KWARG = 1,   // declares **kwargs
+    KFF_VARARG = 2,  // declares *args
+    KFF_KWONLY = 4,  // has keyword-only parameters (declared after '*')
+};
+
 struct KamiFuncObj {
     ObjHeader h;
     void* fn;          // KamiFn (null when builtin_id >= 0)
@@ -62,6 +76,11 @@ struct KamiFuncObj {
     const char* name;
     KamiValue* captures; // heap array, null when not a closure
     int64_t ncaptures;
+    int64_t flags;      // KamiFuncFlags
+    // Names of the positional parameters (static strings from the compiled
+    // program), so a runtime keyword mapping can be bound by name.
+    const char* const* pnames;
+    int64_t npos;
 };
 
 struct ThreadData {

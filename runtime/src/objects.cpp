@@ -38,14 +38,21 @@ void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx) 
 }
 
 void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
-                           int64_t min_arity, int64_t arity) {
+                           int64_t min_arity, int64_t arity, int64_t flags,
+                           const char* const* pnames, int64_t npos) {
     Lock lk(g_lock);
     KamiClassObj* c = (KamiClassObj*)g_globals[(size_t)cls_gidx].p;
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
     f->min_arity = min_arity;
     f->arity = arity;
+    f->builtin_id = -1; // a method is never a builtin (0 would mean print())
     f->name = name;
+    f->captures = nullptr;
+    f->ncaptures = 0;
+    f->flags = flags;
+    f->pnames = pnames;
+    f->npos = npos;
     KamiValue v;
     v.tag = KT_FUNC;
     v.p = f;
@@ -105,6 +112,44 @@ void kami_unpack(KamiValue* out, const KamiValue* seq, int64_t idx, int64_t expe
         panic("unpack expected " + std::to_string(expect_len) + " values, got " +
               std::to_string(l->len));
     *out = l->items[idx];
+}
+
+void kami_unpack_star(KamiValue* out, const KamiValue* seq, int64_t idx, int64_t ntargets,
+                      int64_t star) {
+    Lock lk(g_lock);
+    KamiValue as_list;
+    if (seq->tag != KT_LIST) {
+        // kami_iter_prep roots `as_list` while it builds the list.
+        kami_iter_prep(&as_list, seq); // str/dict/set → list, like CPython
+        if (as_list.tag != KT_LIST)
+            panic(std::string("cannot unpack '") + type_name(seq->tag) + "' object");
+        g_pins.push_back({&as_list, 1});
+        kami_unpack_star(out, &as_list, idx, ntargets, star);
+        for (size_t i = g_pins.size(); i-- > 0;)
+            if (g_pins[i].first == &as_list) {
+                g_pins.erase(g_pins.begin() + (long)i);
+                break;
+            }
+        return;
+    }
+    KamiList* l = (KamiList*)seq->p;
+    int64_t nafter = ntargets - star - 1;
+    if (l->len < ntargets - 1)
+        panic("not enough values to unpack (expected at least " +
+              std::to_string(ntargets - 1) + ", got " + std::to_string(l->len) + ")");
+    if (idx < star) {
+        *out = l->items[idx];
+        return;
+    }
+    if (idx > star) {
+        *out = l->items[l->len - nafter + (idx - star - 1)];
+        return;
+    }
+    int64_t n = l->len - nafter - star; // the starred target takes the middle
+    KamiList* r = list_new(n > 0 ? n : 1);
+    out->tag = KT_LIST;
+    out->p = r; // rooted before anything else can allocate
+    for (int64_t i = 0; i < n; i++) r->items[r->len++] = ((KamiList*)seq->p)->items[star + i];
 }
 
 void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,

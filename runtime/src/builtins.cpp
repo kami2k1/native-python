@@ -1134,8 +1134,6 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         unpin_scratch(&seq);
         return;
     }
-    case KB_KWARGS_UNSUPPORTED:
-        panic("keyword arguments are not supported on this call");
     default:
         if (dispatch_syscall(lk, id, out, argv, nargs)) return;
         panic("unknown builtin id " + std::to_string(id));

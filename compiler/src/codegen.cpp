@@ -65,6 +65,45 @@ static bool stmts_have_try(const std::vector<StmtPtr>& body) {
 
 static int g_outline_counter = 0;
 
+// How many positional arguments a compiled function accepts, and which of
+// Python's variadic features it declares (see KamiFuncFlags).
+static int64_t fn_flags(const Stmt* f) {
+    int64_t kwonly = f->nposparams >= 0 && (size_t)f->nposparams < f->params.size() ? 4 : 0;
+    return (f->kwarg.empty() ? 0 : 1) | (f->vararg.empty() ? 0 : 2) | kwonly;
+}
+static size_t fn_npos(const Stmt* f) {
+    return f->nposparams < 0 ? f->params.size() : (size_t)f->nposparams;
+}
+static size_t fn_min_arity(const Stmt* f) {
+    size_t npos = fn_npos(f);
+    size_t nkwonly = f->params.size() - npos;
+    size_t pos_defaults = f->defaults.size() > nkwonly ? f->defaults.size() - nkwonly : 0;
+    return npos - pos_defaults;
+}
+static size_t fn_max_arity(const Stmt* f) {
+    return f->vararg.empty() ? fn_npos(f) : 24; // KAMI_MAX_ARGS
+}
+
+// Positional parameter names, so that f(**mapping) can bind by name at run time.
+// Emitted as a private array of pointers into the string table.
+static std::string param_table(const Stmt* f, StrTable& strtab, std::string& defs) {
+    size_t npos = fn_npos(f);
+    if (npos == 0) return "null";
+    std::string name = "@.pn_" + f->alias;
+    std::string body;
+    for (size_t i = 0; i < npos; i++) {
+        if (i) body += ", ";
+        body += "ptr " + strtab.ref(strtab.intern(f->params[i]));
+    }
+    defs += name + " = private unnamed_addr constant [" + std::to_string(npos) + " x ptr] [" +
+            body + "]\n";
+    return name;
+}
+
+// Parameter-name tables for closures, which are created while generating code
+// (unlike top-level functions, registered in main()).
+static std::string g_closure_param_tables;
+
 struct FnGen {
     const Module& mod;
     StrTable& strtab;
@@ -409,14 +448,20 @@ struct FnGen {
             // alias an argument slot: kami_call_value writes the result (e.g. a
             // new instance) before user __init__ code reads the arguments.
             int t = alloc_temp();
+            if (e->op == 1) return gen_spread_call(e, t); // f(*seq, **map)
             int save = temp_top;
             std::vector<int> slots;
             for (auto& a : e->args) slots.push_back(gen_expr(a.get()));
+            // Keyword arguments the callee collects in **kwargs travel in their
+            // own channel, never as a trailing positional argument.
+            std::string kwptr = "null";
+            if (e->c) kwptr = slot_ptr(gen_expr(e->c.get()));
             if (callee->res == Res::UserFunc) {
                 fill_argbuf(slots);
                 const Stmt* f = mod.functions[(size_t)callee->res_idx];
                 emit("call void @u_" + f->alias + "(ptr " + slot_ptr(t) +
-                     ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr null)");
+                     ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr null, ptr " +
+                     kwptr + ")");
                 temp_top = save;
                 return t;
             }
@@ -428,6 +473,14 @@ struct FnGen {
                 return t;
             }
             int c = gen_expr(callee);
+            if (e->c) {
+                fill_argbuf(slots);
+                emit("call void @kami_call_value_kw(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(c) +
+                     ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr " + kwptr +
+                     ")");
+                temp_top = save;
+                return t;
+            }
             std::string cp = slot_ptr(c);
             fill_argbuf(slots);
             emit("call void @kami_call_value(ptr " + slot_ptr(t) + ", ptr " + cp +
@@ -436,6 +489,52 @@ struct FnGen {
             return t;
         }
         case ExprKind::MethodCall: {
+            if (e->op == 2) { // obj.method(a, kw=v) on a dynamic receiver
+                int t = alloc_temp();
+                int save = temp_top;
+                int obj = gen_expr(e->a.get());
+                std::vector<int> slots;
+                for (auto& a : e->args) slots.push_back(gen_expr(a.get()));
+                int kw = gen_expr(e->c.get());
+                fill_argbuf(slots);
+                emit("call void @kami_method_kw(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(obj) +
+                     ", ptr " + str_const(e->sval) + ", ptr %argbuf, i64 " +
+                     std::to_string(slots.size()) + ", ptr " + slot_ptr(kw) + ")");
+                temp_top = save;
+                return t;
+            }
+            if (e->op == 1) { // obj.method(*seq, **map)
+                int t = alloc_temp();
+                int save = temp_top;
+                int obj = gen_expr(e->a.get());
+                int args = alloc_temp();
+                emit("call void @kami_make_list(ptr " + slot_ptr(args) + ", ptr %argbuf, i64 0)");
+                for (auto& a : e->args) {
+                    int inner = temp_top;
+                    int v = gen_expr(a->kind == ExprKind::Starred ? a->a.get() : a.get());
+                    std::vector<int> one{v};
+                    fill_argbuf(one);
+                    int dummy = alloc_temp();
+                    emit("call void @kami_method(ptr " + slot_ptr(dummy) + ", ptr " +
+                         slot_ptr(args) + ", ptr " +
+                         str_const(a->kind == ExprKind::Starred ? "extend" : "append") +
+                         ", ptr %argbuf, i64 1)");
+                    temp_top = inner;
+                }
+                int kw = alloc_temp();
+                if (e->c) {
+                    int m = gen_expr(e->c.get());
+                    emit("call void @kami_copy(ptr " + slot_ptr(kw) + ", ptr " + slot_ptr(m) +
+                         ")");
+                } else {
+                    emit("call void @kami_make_none(ptr " + slot_ptr(kw) + ")");
+                }
+                emit("call void @kami_method_spread(ptr " + slot_ptr(t) + ", ptr " +
+                     slot_ptr(obj) + ", ptr " + str_const(e->sval) + ", ptr " + slot_ptr(args) +
+                     ", ptr " + slot_ptr(kw) + ")");
+                temp_top = save;
+                return t;
+            }
             int t = alloc_temp(); // before args: see Call above
             int save = temp_top;
             int base = gen_expr(e->a.get());
@@ -480,9 +579,11 @@ struct FnGen {
         fill_argbuf(caps);
         size_t fmin = fn->params.size() - fn->defaults.size();
         emit("call void @kami_make_closure(ptr " + slot_ptr(result) + ", ptr @u_" + fn->alias +
-             ", i64 " + std::to_string(fmin) + ", i64 " + std::to_string(fn->params.size()) +
+             ", i64 " + std::to_string(fmin) + ", i64 " + std::to_string(fn_max_arity(fn)) +
              ", ptr " + str_const(fn->name) + ", ptr %argbuf, i64 " +
-             std::to_string(caps.size()) + ")");
+             std::to_string(caps.size()) + ", i64 " + std::to_string(fn_flags(fn)) + ", ptr " +
+             param_table(fn, strtab, g_closure_param_tables) + ", i64 " +
+             std::to_string(fn_npos(fn)) + ")");
         temp_top = save;
         return result;
     }
@@ -920,14 +1021,25 @@ struct FnGen {
             return;
         }
         // a, b = expr : runtime unpack
+        int star = -1;
+        for (size_t i = 0; i < s->targets.size(); i++)
+            if (s->targets[i]->kind == ExprKind::Starred) star = (int)i;
         int v = gen_expr(s->values[0].get());
         for (size_t i = 0; i < s->targets.size(); i++) {
             int save2 = temp_top;
             int part = alloc_temp();
-            emit("call void @kami_unpack(ptr " + slot_ptr(part) + ", ptr " + slot_ptr(v) +
-                 ", i64 " + std::to_string(i) + ", i64 " + std::to_string(s->targets.size()) +
-                 ")");
-            assign_target(s->targets[i].get(), part);
+            if (star < 0) {
+                emit("call void @kami_unpack(ptr " + slot_ptr(part) + ", ptr " + slot_ptr(v) +
+                     ", i64 " + std::to_string(i) + ", i64 " +
+                     std::to_string(s->targets.size()) + ")");
+            } else {
+                emit("call void @kami_unpack_star(ptr " + slot_ptr(part) + ", ptr " +
+                     slot_ptr(v) + ", i64 " + std::to_string(i) + ", i64 " +
+                     std::to_string(s->targets.size()) + ", i64 " + std::to_string(star) + ")");
+            }
+            const Expr* t = s->targets[i]->kind == ExprKind::Starred ? s->targets[i]->a.get()
+                                                                    : s->targets[i].get();
+            assign_target(t, part);
             temp_top = save2;
         }
     }
@@ -1174,12 +1286,44 @@ struct FnGen {
         }
     }
 
+    // f(*seq, x, **map): the argument list is built at run time as a list, then
+    // handed to the runtime together with the keyword mapping.
+    int gen_spread_call(const Expr* e, int t) {
+        int save = temp_top;
+        int c = gen_expr(e->a.get());
+        int args = alloc_temp();
+        emit("call void @kami_make_list(ptr " + slot_ptr(args) + ", ptr %argbuf, i64 0)");
+        for (auto& a : e->args) {
+            int inner = temp_top;
+            int v = gen_expr(a->kind == ExprKind::Starred ? a->a.get() : a.get());
+            std::vector<int> one{v};
+            fill_argbuf(one);
+            int dummy = alloc_temp();
+            emit("call void @kami_method(ptr " + slot_ptr(dummy) + ", ptr " + slot_ptr(args) +
+                 ", ptr " + str_const(a->kind == ExprKind::Starred ? "extend" : "append") +
+                 ", ptr %argbuf, i64 1)");
+            temp_top = inner;
+        }
+        int kw = alloc_temp();
+        if (e->c) {
+            int m = gen_expr(e->c.get());
+            emit("call void @kami_copy(ptr " + slot_ptr(kw) + ", ptr " + slot_ptr(m) + ")");
+        } else {
+            emit("call void @kami_make_none(ptr " + slot_ptr(kw) + ")");
+        }
+        emit("call void @kami_call_spread(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(c) + ", ptr " +
+             slot_ptr(args) + ", ptr " + slot_ptr(kw) + ")");
+        temp_top = save;
+        return t;
+    }
+
     // Emits parameter copying (with default-value filling) into the current
     // body context. Must be called before generating any statements.
     void gen_prologue(const Stmt* f) {
         size_t nparams = f->params.size();
         size_t ndefaults = f->defaults.size();
-        for (size_t i = 0; i < nparams; i++) {
+        size_t npos = f->nposparams < 0 ? nparams : (size_t)f->nposparams;
+        for (size_t i = 0; i < npos; i++) {
             bool has_default = i + ndefaults >= nparams;
             if (!has_default) {
                 std::string pi = r(), ai = r(), si = r();
@@ -1219,6 +1363,62 @@ struct FnGen {
             }
             start_block(Ln);
         }
+        // Keyword-only parameters: taken by name out of the keyword dict, with
+        // the declared default when the caller did not pass them.
+        for (size_t i = npos; i < nparams; i++) {
+            std::string got = r();
+            emit(got + " = call i32 @kami_kwarg_take(ptr " + slot_ptr((int)i) +
+                 ", ptr %kwargs, ptr " + str_const(f->params[i]) + ")");
+            std::string ok = r();
+            emit(ok + " = icmp ne i32 " + got + ", 0");
+            std::string Lh = newlabel(), Ld = newlabel(), Ln2 = newlabel();
+            emit("br i1 " + ok + ", label %" + Lh + ", label %" + Ld);
+            C().terminated = true;
+            start_block(Lh);
+            emit("br label %" + Ln2);
+            C().terminated = true;
+            start_block(Ld);
+            if (i + ndefaults >= nparams) {
+                int save = temp_top;
+                int v = gen_expr(f->defaults[i + ndefaults - nparams].get());
+                emit("call void @kami_copy(ptr " + slot_ptr((int)i) + ", ptr " + slot_ptr(v) +
+                     ")");
+                temp_top = save;
+            } else {
+                emit("call void @kami_panic(ptr " +
+                     str_const("TypeError: missing keyword-only argument '" + f->params[i] +
+                               "'") +
+                     ")");
+            }
+            emit("br label %" + Ln2);
+            C().terminated = true;
+            start_block(Ln2);
+        }
+        // *args: everything past the positional parameters becomes a list.
+        size_t slot = nparams;
+        if (!f->vararg.empty()) {
+            emit("call void @kami_pack_args(ptr " + slot_ptr((int)slot) +
+                 ", ptr %argv, i64 %nargs, i64 " + std::to_string(npos) + ")");
+            slot++;
+        }
+        // **kwargs: the caller either passed a dict through the kwargs channel
+        // or nothing at all, in which case the parameter is an empty dict.
+        if (!f->kwarg.empty()) {
+            std::string isnull = r();
+            emit(isnull + " = icmp eq ptr %kwargs, null");
+            std::string Le = newlabel(), Lh = newlabel(), Ld = newlabel();
+            emit("br i1 " + isnull + ", label %" + Le + ", label %" + Lh);
+            C().terminated = true;
+            start_block(Le);
+            emit("call void @kami_make_map(ptr " + slot_ptr((int)slot) + ")");
+            emit("br label %" + Ld);
+            C().terminated = true;
+            start_block(Lh);
+            emit("call void @kami_copy(ptr " + slot_ptr((int)slot) + ", ptr %kwargs)");
+            emit("br label %" + Ld);
+            C().terminated = true;
+            start_block(Ld);
+        }
     }
 
     // ---- whole function ----
@@ -1228,7 +1428,7 @@ struct FnGen {
         if (total < 1) total = 1;
         std::string out;
         out += "define void @" + fn_name +
-               "(ptr %ret, ptr %argv, i64 %nargs, ptr %captures) {\n";
+               "(ptr %ret, ptr %argv, i64 %nargs, ptr %captures, ptr %kwargs) {\n";
         out += "entry:\n";
         out += "  %frame = alloca %kv, i64 " + std::to_string(total) + ", align 8\n";
         out += "  %argbuf = alloca ptr, i64 " + std::to_string(max_call_args) + ", align 8\n";
@@ -1258,9 +1458,9 @@ declare void @kami_rt_shutdown()
 declare void @kami_globals_init(i64)
 declare void @kami_global_get(ptr, i64)
 declare void @kami_global_set(i64, ptr)
-declare void @kami_global_make_func(i64, ptr, i64, i64, ptr)
+declare void @kami_global_make_func(i64, ptr, i64, i64, ptr, i64, ptr, i64)
 declare void @kami_global_make_class(i64, ptr, i64)
-declare void @kami_class_add_method(i64, ptr, ptr, i64, i64)
+declare void @kami_class_add_method(i64, ptr, ptr, i64, i64, i64, ptr, i64)
 declare void @kami_frame_push(ptr, i64)
 declare void @kami_frame_pop()
 declare void @kami_copy(ptr, ptr)
@@ -1272,7 +1472,7 @@ declare void @kami_make_str(ptr, ptr, i64)
 declare void @kami_make_list(ptr, ptr, i64)
 declare void @kami_make_map(ptr)
 declare void @kami_make_builtin_func(ptr, i64, ptr)
-declare void @kami_make_closure(ptr, ptr, i64, i64, ptr, ptr, i64)
+declare void @kami_make_closure(ptr, ptr, i64, i64, ptr, ptr, i64, i64, ptr, i64)
 declare void @kami_make_set(ptr)
 declare void @kami_set_add(ptr, ptr)
 declare i32 @kami_truthy(ptr)
@@ -1285,6 +1485,12 @@ declare void @kami_slice(ptr, ptr, ptr, ptr, ptr)
 declare void @kami_attr_get(ptr, ptr, ptr)
 declare void @kami_attr_set(ptr, ptr, ptr)
 declare void @kami_call_value(ptr, ptr, ptr, i64)
+declare void @kami_call_value_kw(ptr, ptr, ptr, i64, ptr)
+declare void @kami_call_spread(ptr, ptr, ptr, ptr)
+declare void @kami_pack_args(ptr, ptr, i64, i64)
+declare i32 @kami_kwarg_take(ptr, ptr, ptr)
+declare void @kami_method_kw(ptr, ptr, ptr, ptr, i64, ptr)
+declare void @kami_method_spread(ptr, ptr, ptr, ptr, ptr)
 declare void @kami_method(ptr, ptr, ptr, ptr, i64)
 declare void @kami_builtin(i64, ptr, ptr, i64)
 declare i32 @kami_range_cond(ptr, ptr, ptr)
@@ -1292,9 +1498,11 @@ declare void @kami_iter_prep(ptr, ptr)
 declare i32 @kami_iter_cond(ptr, ptr)
 declare void @kami_iter_get(ptr, ptr, ptr)
 declare void @kami_unpack(ptr, ptr, i64, i64)
+declare void @kami_unpack_star(ptr, ptr, i64, i64, i64)
 declare i64 @kami_try(ptr, ptr)
 declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
+declare void @kami_panic(ptr)
 declare void @kami_rethrow()
 declare void @kami_run_module(ptr)
 
@@ -1335,13 +1543,16 @@ std::string codegen(const Module& m, const std::string& source_name) {
     main_fn += "  %argc64 = sext i32 %argc to i64\n";
     main_fn += "  call void @kami_rt_init(i64 %argc64, ptr %cargv)\n";
     main_fn += "  call void @kami_globals_init(i64 " + std::to_string(m.nglobals) + ")\n";
+    std::string param_tables;
     for (const Stmt* f : m.functions) {
         if (f->global_idx < 0) continue; // methods have no global binding
         int si = strtab.intern(f->name);
-        size_t fmin = f->params.size() - f->defaults.size();
         main_fn += "  call void @kami_global_make_func(i64 " + std::to_string(f->global_idx) +
-                   ", ptr @u_" + f->alias + ", i64 " + std::to_string(fmin) + ", i64 " +
-                   std::to_string(f->params.size()) + ", ptr " + strtab.ref(si) + ")\n";
+                   ", ptr @u_" + f->alias + ", i64 " + std::to_string(fn_min_arity(f)) +
+                   ", i64 " + std::to_string(fn_max_arity(f)) + ", ptr " + strtab.ref(si) +
+                   ", i64 " + std::to_string(fn_flags(f)) + ", ptr " +
+                   param_table(f, strtab, param_tables) + ", i64 " +
+                   std::to_string(fn_npos(f)) + ")\n";
     }
     for (const Stmt* c : m.classes) {
         int si = strtab.intern(c->name);
@@ -1357,11 +1568,13 @@ std::string codegen(const Module& m, const std::string& source_name) {
             if (msp->kind != StmtKind::FuncDef) continue;
             const Stmt* mth = msp.get();
             int mi = strtab.intern(mth->name);
-            size_t mmin = mth->params.size() - mth->defaults.size();
             main_fn += "  call void @kami_class_add_method(i64 " +
                        std::to_string(c->global_idx) + ", ptr " + strtab.ref(mi) + ", ptr @u_" +
-                       mth->alias + ", i64 " + std::to_string(mmin) + ", i64 " +
-                       std::to_string(mth->params.size()) + ")\n";
+                       mth->alias + ", i64 " + std::to_string(fn_min_arity(mth)) + ", i64 " +
+                       std::to_string(fn_max_arity(mth)) + ", i64 " +
+                       std::to_string(fn_flags(mth)) + ", ptr " +
+                       param_table(mth, strtab, param_tables) + ", i64 " +
+                       std::to_string(fn_npos(mth)) + ")\n";
         }
     }
     main_fn += "  call void @kami_run_module(ptr @kamipy_module)\n";
@@ -1376,6 +1589,8 @@ std::string codegen(const Module& m, const std::string& source_name) {
         out += "@.s" + std::to_string(i) + " = private unnamed_addr constant [" +
                std::to_string(s.size() + 1) + " x i8] c\"" + escape_ir_string(s) + "\"\n";
     }
+    out += param_tables;
+    out += g_closure_param_tables;
     out += "\n";
     out += RUNTIME_DECLS;
     out += fns;

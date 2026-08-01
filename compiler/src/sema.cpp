@@ -238,6 +238,20 @@ struct Sema {
 
     [[noreturn]] static void err(int line, const std::string& m) { throw CompileError(line, m); }
 
+    // A class without its own __init__ uses the nearest one it inherits.
+    Stmt* find_init(const ClassEntry& ce) {
+        const ClassEntry* cur = &ce;
+        for (int depth = 0; depth < 32; depth++) {
+            auto it = cur->methods.find("__init__");
+            if (it != cur->methods.end()) return it->second;
+            if (cur->def->alias.empty()) return nullptr;
+            auto base = classes.find(cur->def->alias);
+            if (base == classes.end()) return nullptr;
+            cur = &base->second;
+        }
+        return nullptr;
+    }
+
     // "re__findall" → "re.findall" for diagnostics: users never typed the
     // namespaced spelling, so they should never read it either.
     std::string pretty(const std::string& name) const {
@@ -592,15 +606,28 @@ struct Sema {
         size_t nparams = def->params.size() - (skip_self ? 1 : 0);
         size_t ndefaults = def->defaults.size();
         size_t first_param = skip_self ? 1 : 0;
+        bool has_va = !def->vararg.empty();
+        bool has_kw = !def->kwarg.empty();
+        // Keyword-only parameters (declared after '*') are never filled from the
+        // positional list; they travel by name in the keyword channel.
+        size_t npos = def->nposparams < 0 ? nparams
+                                          : (size_t)def->nposparams - (skip_self ? 1 : 0);
         std::vector<ExprPtr> final_args(nparams);
-        if (e->args.size() > nparams)
-            err(e->line, pretty(def->name) + "() takes " + std::to_string(nparams) +
-                             " argument(s) but " + std::to_string(e->args.size()) +
-                             " were given");
+        std::vector<ExprPtr> overflow; // positional arguments collected by *args
+        if (e->args.size() > npos) {
+            if (!has_va)
+                err(e->line, pretty(def->name) + "() takes " + std::to_string(npos) +
+                                 " positional argument(s) but " +
+                                 std::to_string(e->args.size()) + " were given");
+            for (size_t i = npos; i < e->args.size(); i++)
+                overflow.push_back(std::move(e->args[i]));
+            e->args.resize(npos);
+        }
         for (size_t i = 0; i < e->args.size(); i++) final_args[i] = std::move(e->args[i]);
+        std::vector<std::pair<std::string, ExprPtr>> collected; // → **kwargs
         for (auto& [kw, val] : e->kwargs) {
             bool found = false;
-            for (size_t i = 0; i < nparams; i++) {
+            for (size_t i = 0; i < npos; i++) {
                 if (def->params[first_param + i] == kw) {
                     if (final_args[i])
                         err(e->line,
@@ -610,50 +637,46 @@ struct Sema {
                     break;
                 }
             }
-            if (!found)
+            for (size_t i = npos; i < nparams && !found; i++) {
+                if (def->params[first_param + i] == kw) {
+                    collected.emplace_back(kw, std::move(val)); // keyword-only
+                    found = true;
+                }
+            }
+            if (found) continue;
+            if (!has_kw)
                 err(e->line,
                     pretty(def->name) + "() got an unexpected keyword argument '" + kw + "'");
+            collected.emplace_back(kw, std::move(val));
         }
         e->kwargs.clear();
-        // Trailing holes that have defaults are NOT passed: the callee's
-        // prologue evaluates the default expression in its own (definition)
-        // scope — this is what makes non-literal defaults like
-        // `thread_type=ThreadType.USER` work correctly.
-        size_t pass_n = nparams;
-        while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams)
-            pass_n--;
-        for (size_t i = 0; i < pass_n; i++) {
+        for (size_t i = 0; i < npos; i++) {
             if (final_args[i]) continue;
             size_t di = i + ndefaults;
             if (di >= nparams) { // default exists (defaults align to the tail)
                 const Expr* d = def->defaults[di - nparams].get();
-                if (!is_literal_default(d))
-                    err(e->line, def->name + "(): parameter '" +
-                                     def->params[first_param + i] +
-                                     "' has a non-literal default and cannot be "
-                                     "skipped when later arguments are given — pass "
-                                     "it explicitly");
                 final_args[i] = clone_literal(d);
             } else {
                 err(e->line, pretty(def->name) + "() missing required argument '" +
                                  def->params[first_param + i] + "'");
             }
         }
-        final_args.resize(pass_n);
+        final_args.resize(npos); // keyword-only parameters are filled by the callee
+        for (auto& x : overflow) final_args.push_back(std::move(x));
         e->args = std::move(final_args);
-    }
-
-    static bool is_literal_default(const Expr* e) {
-        switch (e->kind) {
-        case ExprKind::IntLit:
-        case ExprKind::FloatLit:
-        case ExprKind::StrLit:
-        case ExprKind::BoolLit:
-        case ExprKind::NoneLit: return true;
-        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal_default(e->a.get());
-        case ExprKind::ListLit: return e->args.empty();
-        case ExprKind::MapLit: return e->pairs.empty();
-        default: return false;
+        if (!collected.empty()) {
+            // The callee reads them through the dedicated kwargs channel.
+            auto m = std::make_unique<Expr>();
+            m->kind = ExprKind::MapLit;
+            m->line = e->line;
+            for (auto& [kw, val] : collected) {
+                auto k = std::make_unique<Expr>();
+                k->kind = ExprKind::StrLit;
+                k->line = e->line;
+                k->sval = kw;
+                m->pairs.emplace_back(std::move(k), std::move(val));
+            }
+            e->c = std::move(m);
         }
     }
 
@@ -722,6 +745,102 @@ struct Sema {
             return true;
         }
         return false;
+    }
+
+    // f(*seq) / f(**mapping). A `*` argument makes the argument count dynamic, so
+    // the call becomes a spread call on the callee *value*; a lone `**mapping`
+    // keeps the static positional path and only feeds the kwargs channel.
+    bool resolve_spread_call(Expr* e) {
+        bool star = false;
+        ExprPtr mapping;
+        std::vector<ExprPtr> rest;
+        for (auto& a : e->args) {
+            if (a->kind == ExprKind::Starred && a->ival == 2) {
+                if (mapping) err(e->line, "only one ** argument is supported per call");
+                mapping = std::move(a->a);
+                continue;
+            }
+            if (a->kind == ExprKind::Starred) star = true;
+            rest.push_back(std::move(a));
+        }
+        e->args = std::move(rest);
+        if (mapping) {
+            if (!e->kwargs.empty())
+                err(e->line, "mixing '**mapping' with explicit keyword arguments is not "
+                             "supported");
+            resolve_expr(mapping.get());
+            e->c = std::move(mapping);
+        }
+        if (!star) {
+            if (!e->c) return false; // ordinary call
+            // Keyword arguments come from a runtime mapping: the callee must
+            // collect them, so it has to be resolved as a value.
+            for (auto& a : e->args) resolve_expr(a.get());
+            resolve_callee_value(e);
+            e->op = 2; // codegen: dynamic call with a kwargs mapping
+            return true;
+        }
+        for (auto& a : e->args)
+            resolve_expr(a->kind == ExprKind::Starred ? a->a.get() : a.get());
+        if (!e->kwargs.empty()) {
+            auto m = std::make_unique<Expr>();
+            m->kind = ExprKind::MapLit;
+            m->line = e->line;
+            for (auto& [kw, val] : e->kwargs) {
+                auto k = std::make_unique<Expr>();
+                k->kind = ExprKind::StrLit;
+                k->line = e->line;
+                k->sval = kw;
+                resolve_expr(val.get());
+                m->pairs.emplace_back(std::move(k), std::move(val));
+            }
+            e->kwargs.clear();
+            e->c = std::move(m);
+        }
+        resolve_callee_value(e);
+        if (e->c && e->a->res == Res::BuiltinFunc)
+            err(e->line, "keyword arguments cannot be combined with '*' when calling the "
+                         "builtin '" + e->a->sval + "'");
+        e->op = 1; // codegen: spread call
+        return true;
+    }
+
+    // Move a call's keyword arguments into a mapping expression carried in `c`,
+    // which codegen passes through the keyword channel.
+    void collect_kwargs_into_mapping(Expr* e) {
+        auto m = std::make_unique<Expr>();
+        m->kind = ExprKind::MapLit;
+        m->line = e->line;
+        for (auto& [kw, val] : e->kwargs) {
+            auto k = std::make_unique<Expr>();
+            k->kind = ExprKind::StrLit;
+            k->line = e->line;
+            k->sval = kw;
+            m->pairs.emplace_back(std::move(k), std::move(val));
+        }
+        e->kwargs.clear();
+        e->c = std::move(m);
+    }
+
+    // Resolve a call's callee as a first-class value (needed when the argument
+    // list is only known at run time).
+    void resolve_callee_value(Expr* e) {
+        Expr* callee = e->a.get();
+        if (callee->kind == ExprKind::Name && !name_shadowed(callee->sval)) {
+            auto f = funcs.find(callee->sval);
+            if (f != funcs.end()) {
+                callee->res = Res::Global;
+                callee->res_idx = f->second.global;
+                return;
+            }
+            auto c = classes.find(callee->sval);
+            if (c != classes.end()) {
+                callee->res = Res::Global;
+                callee->res_idx = c->second.global;
+                return;
+            }
+        }
+        resolve_expr(callee);
     }
 
     void resolve_sorted_kwargs(Expr* e) {
@@ -876,6 +995,7 @@ struct Sema {
             }
             Expr* callee = e->a.get();
             if (callee->kind == ExprKind::Name) apply_user_rename(callee);
+            if (resolve_spread_call(e)) return;
             auto resolve_args = [&]() {
                 for (auto& a : e->args) resolve_expr(a.get());
                 for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
@@ -889,6 +1009,7 @@ struct Sema {
                         if (!f->second.def->decorators.empty()) {
                             // decorated: must call the (possibly wrapped) global value
                             resolve_args();
+                            if (!e->kwargs.empty()) collect_kwargs_into_mapping(e);
                             callee->res = Res::Global;
                             callee->res_idx = f->second.global;
                             return;
@@ -901,9 +1022,9 @@ struct Sema {
                     }
                     auto c = classes.find(n);
                     if (c != classes.end()) {
-                        auto init = c->second.methods.find("__init__");
-                        if (init != c->second.methods.end())
-                            apply_signature(e, init->second, true);
+                        Stmt* init = find_init(c->second);
+                        if (init)
+                            apply_signature(e, init, true);
                         else if (!e->args.empty() || !e->kwargs.empty())
                             err(e->line, n + "() takes no arguments");
                         resolve_args();
@@ -934,9 +1055,10 @@ struct Sema {
                 }
             }
             resolve_args();
-            if (!e->kwargs.empty())
-                err(e->line, "keyword arguments are only supported when calling functions "
-                             "and classes defined in this file");
+            // Dynamic callee (a decorated function, a variable holding a
+            // function, ...): the keywords become a mapping the runtime binds by
+            // parameter name.
+            if (!e->kwargs.empty()) collect_kwargs_into_mapping(e);
             resolve_expr(callee);
             return;
         }
@@ -955,6 +1077,38 @@ struct Sema {
                 e->sval.clear();
                 resolve_expr(e);
                 return;
+            }
+            // obj.method(*seq, **map)
+            {
+                bool star = false;
+                ExprPtr mapping;
+                std::vector<ExprPtr> rest;
+                for (auto& a : e->args) {
+                    if (a->kind == ExprKind::Starred && a->ival == 2) {
+                        if (mapping) err(e->line, "only one ** argument is supported per call");
+                        mapping = std::move(a->a);
+                        continue;
+                    }
+                    if (a->kind == ExprKind::Starred) star = true;
+                    rest.push_back(std::move(a));
+                }
+                e->args = std::move(rest);
+                if (star || mapping) {
+                    for (auto& a : e->args)
+                        resolve_expr(a->kind == ExprKind::Starred ? a->a.get() : a.get());
+                    if (mapping) {
+                        if (!e->kwargs.empty())
+                            err(e->line, "mixing '**mapping' with explicit keyword arguments "
+                                         "is not supported");
+                        resolve_expr(mapping.get());
+                        e->c = std::move(mapping);
+                    } else if (!e->kwargs.empty()) {
+                        collect_kwargs_into_mapping(e);
+                    }
+                    resolve_expr(e->a.get());
+                    e->op = 1; // codegen: spread method call
+                    return;
+                }
             }
             for (auto& a : e->args) resolve_expr(a.get());
             for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
@@ -995,21 +1149,13 @@ struct Sema {
                                          "'");
                     apply_signature(e, mit->second, false);
                 } else {
-                    // Dynamic receiver (e.g. a module that soft-failed to import
-                    // inside try/except, or an arbitrary object). Don't hard-fail
-                    // the whole build: defer to a catchable runtime error so
-                    // guarded code paths still compile.
-                    e->kind = ExprKind::Call;
-                    e->args.clear();
-                    e->kwargs.clear();
-                    auto callee = std::make_unique<Expr>();
-                    callee->kind = ExprKind::Name;
-                    callee->line = e->line;
-                    callee->sval = "kwargs-unsupported";
-                    callee->res = Res::BuiltinFunc;
-                    callee->res_idx = KB_KWARGS_UNSUPPORTED;
-                    e->a = std::move(callee);
-                    e->sval.clear();
+                    // Dynamic receiver (an object in a variable, or a module that
+                    // soft-failed to import inside try/except): the keywords
+                    // become a mapping that the runtime binds against the
+                    // method's parameter names.
+                    collect_kwargs_into_mapping(e);
+                    e->op = 2; // codegen: method call with a keyword mapping
+                    resolve_expr(e->a.get());
                     return;
                 }
             }
@@ -1204,7 +1350,15 @@ struct Sema {
             return;
         case StmtKind::MultiAssign: {
             for (auto& v : s->values) resolve_expr(v.get());
-            for (auto& t : s->targets) {
+            int nstar = 0;
+            for (auto& t : s->targets)
+                if (t->kind == ExprKind::Starred) nstar++;
+            if (nstar > 1)
+                err(s->line, "only one starred target is allowed in an assignment");
+            if (nstar == 1 && s->values.size() > 1)
+                err(s->line, "a starred target needs a single iterable on the right");
+            for (auto& tp : s->targets) {
+                Expr* t = tp->kind == ExprKind::Starred ? tp->a.get() : tp.get();
                 if (t->kind == ExprKind::Name) {
                     int k;
                     int64_t idx;
@@ -1389,6 +1543,13 @@ struct Sema {
             if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
             if (global_decls.count(p)) err(s->line, "parameter '" + p + "' declared global");
             local_slot(p);
+        }
+        // *args and **kwargs take the slots right after the fixed parameters;
+        // codegen relies on that order to fill them in the prologue.
+        for (const std::string* extra : {&s->vararg, &s->kwarg}) {
+            if (extra->empty()) continue;
+            if (locals.count(*extra)) err(s->line, "duplicate parameter '" + *extra + "'");
+            local_slot(*extra);
         }
         collect_assigned(s->body, false);
         resolve_stmts(s->body);

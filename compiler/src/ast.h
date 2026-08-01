@@ -90,6 +90,11 @@ struct Stmt {
     std::string name;   // Assign target / FuncDef / ClassDef / For var / Import module
     std::string alias;  // import ... as alias / ClassDef base name
     std::vector<std::string> params;            // FuncDef params / For multi-targets / Global names
+    std::string vararg;  // FuncDef: name after '*' (def f(a, *rest))
+    std::string kwarg;   // FuncDef: name after '**' (def f(a, **opts))
+    // FuncDef: how many of `params` may be filled positionally. Parameters after
+    // it are keyword-only (declared after '*'), and are passed by name.
+    int nposparams = -1; // -1 = every parameter is positional-capable
     std::vector<ExprPtr> defaults;              // FuncDef default values (aligned to params tail)
     std::vector<std::pair<std::string, std::string>> import_names; // FromImport (name, alias)
     std::vector<StmtPtr> body, orelse, final_body; // blocks; Try: body/orelse(else)/finally

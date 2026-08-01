@@ -17,8 +17,6 @@ NOTSET = 0
 
 BASIC_FORMAT = "%(levelname)s:%(name)s:%(message)s"
 
-_UNSET = "\x00kami-unset"
-
 _level = WARNING
 _format = BASIC_FORMAT
 _datefmt = "%Y-%m-%d %H:%M:%S"
@@ -214,15 +212,6 @@ def _emit(level, name, msg, args):
     _kami.fd_write(_stream_fd, _render(level, name, text) + "\n")
 
 
-def _pack(a, b, c, d):
-    args = []
-    for value in [a, b, c, d]:
-        if value == _UNSET:
-            break
-        args.append(value)
-    return args
-
-
 class Logger:
     def __init__(self, name):
         self.name = name
@@ -235,31 +224,31 @@ class Logger:
     def setLevel(self, level):
         self.level = level
 
-    def log(self, level, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
+    def log(self, level, msg, *args):
         if self.level != NOTSET and level < self.level:
             return
-        _emit(level, self.name, msg, _pack(a, b, c, d))
+        _emit(level, self.name, msg, args)
 
-    def debug(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(DEBUG, msg, a, b, c, d)
+    def debug(self, msg, *args):
+        self.log(DEBUG, msg, *args)
 
-    def info(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(INFO, msg, a, b, c, d)
+    def info(self, msg, *args):
+        self.log(INFO, msg, *args)
 
-    def warning(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(WARNING, msg, a, b, c, d)
+    def warning(self, msg, *args):
+        self.log(WARNING, msg, *args)
 
-    def warn(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(WARNING, msg, a, b, c, d)
+    def warn(self, msg, *args):
+        self.log(WARNING, msg, *args)
 
-    def error(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(ERROR, msg, a, b, c, d)
+    def error(self, msg, *args):
+        self.log(ERROR, msg, *args)
 
-    def exception(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(ERROR, msg, a, b, c, d)
+    def exception(self, msg, *args):
+        self.log(ERROR, msg, *args)
 
-    def critical(self, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-        self.log(CRITICAL, msg, a, b, c, d)
+    def critical(self, msg, *args):
+        self.log(CRITICAL, msg, *args)
 
 
 _loggers = {}
@@ -277,33 +266,33 @@ def getLogger(name="root"):
     return created
 
 
-def log(level, msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(level, "root", msg, _pack(a, b, c, d))
+def log(level, msg, *args):
+    _emit(level, "root", msg, args)
 
 
-def debug(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(DEBUG, "root", msg, _pack(a, b, c, d))
+def debug(msg, *args):
+    _emit(DEBUG, "root", msg, args)
 
 
-def info(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(INFO, "root", msg, _pack(a, b, c, d))
+def info(msg, *args):
+    _emit(INFO, "root", msg, args)
 
 
-def warning(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(WARNING, "root", msg, _pack(a, b, c, d))
+def warning(msg, *args):
+    _emit(WARNING, "root", msg, args)
 
 
-def warn(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(WARNING, "root", msg, _pack(a, b, c, d))
+def warn(msg, *args):
+    _emit(WARNING, "root", msg, args)
 
 
-def error(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(ERROR, "root", msg, _pack(a, b, c, d))
+def error(msg, *args):
+    _emit(ERROR, "root", msg, args)
 
 
-def exception(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(ERROR, "root", msg, _pack(a, b, c, d))
+def exception(msg, *args):
+    _emit(ERROR, "root", msg, args)
 
 
-def critical(msg, a=_UNSET, b=_UNSET, c=_UNSET, d=_UNSET):
-    _emit(CRITICAL, "root", msg, _pack(a, b, c, d))
+def critical(msg, *args):
+    _emit(CRITICAL, "root", msg, args)

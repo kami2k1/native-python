@@ -89,8 +89,10 @@ void collect_bindings(const std::vector<StmtPtr>& body, std::set<std::string>& o
         switch (s->kind) {
         case StmtKind::Assign: out.insert(s->name); break;
         case StmtKind::MultiAssign:
-            for (const auto& t : s->targets)
-                if (t->kind == ExprKind::Name) out.insert(t->sval);
+            for (const auto& t : s->targets) {
+                const Expr* x = t->kind == ExprKind::Starred ? t->a.get() : t.get();
+                if (x->kind == ExprKind::Name) out.insert(x->sval);
+            }
             break;
         case StmtKind::For:
             for (const auto& n : s->params) out.insert(n);

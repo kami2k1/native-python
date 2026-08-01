@@ -1,0 +1,22 @@
+0 1 6
+a:0 a:2
+ a=1,b=2
+1|0| 1|2|x=9,y=8
+1-2-3 a+b x!
+7
+11
+10
+30 40 100
+10
+api/2/2/0 api/2/2/2
+auth 80
+>api/2/2/0 <api/2/2/1
+bare/0/0/0
+too many positional args caught
+missing keyword-only arg caught
+1 [2, 3, 4]
+1 [2, 3, 4] 5
+9 []
+a ['b', 'c', 'd']
+rex barks
+bit barks True

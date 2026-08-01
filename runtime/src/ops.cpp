@@ -387,8 +387,35 @@ void kami_del_index(KamiValue* obj, const KamiValue* idx) {
     }
 }
 
+static void iter_prep_locked(KamiValue* out, const KamiValue* seq);
+
+// Unpin a scratch root registered by this file (the lock must be held).
+static void unpin_one(KamiValue* p) {
+    for (size_t i = g_pins.size(); i-- > 0;)
+        if (g_pins[i].first == p) {
+            g_pins.erase(g_pins.begin() + (long)i);
+            break;
+        }
+}
+
 void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
     Lock lk(g_lock);
+    KamiValue v = *seq;
+    if (v.tag == KT_LIST) {
+        *out = v;
+        return;
+    }
+    // Materializing a str/dict/set/file allocates one object per element, and
+    // every allocation is a collection point. `out` may be an unrooted scratch
+    // value in the caller, so root it here for the duration.
+    out->tag = KT_NONE;
+    out->i = 0;
+    g_pins.push_back({out, 1});
+    iter_prep_locked(out, &v);
+    unpin_one(out);
+}
+
+static void iter_prep_locked(KamiValue* out, const KamiValue* seq) {
     KamiValue v = *seq;
     switch (v.tag) {
     case KT_LIST:
@@ -478,7 +505,153 @@ void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
     kami_index_get(out, seq, idx);
 }
 
+// kami_call_value without the implicit **kwargs dict (the caller supplied it).
+static void call_value_raw(KamiValue* out, const KamiValue* fn, KamiValue** argv,
+                           int64_t nargs, KamiValue* kwargs);
+
+// Does the callee collect keyword arguments in **kwargs?
+static bool accepts_kwargs(const KamiValue* fn) {
+    if (fn->tag == KT_FUNC) {
+        KamiFuncObj* fo = (KamiFuncObj*)fn->p;
+        return fo->builtin_id < 0 && (fo->flags & (KFF_KWARG | KFF_KWONLY)) != 0;
+    }
+    if (fn->tag == KT_CLASS) {
+        KamiValue* m = class_lookup((KamiClassObj*)fn->p, "__init__");
+        return m && m->tag == KT_FUNC &&
+               (((KamiFuncObj*)m->p)->flags & (KFF_KWARG | KFF_KWONLY)) != 0;
+    }
+    return false;
+}
+
 void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs) {
+    call_value_raw(out, fn, argv, nargs, nullptr);
+}
+
+// The callee whose signature a keyword mapping must be matched against.
+static KamiFuncObj* target_func(const KamiValue* fn) {
+    if (fn->tag == KT_FUNC) {
+        KamiFuncObj* fo = (KamiFuncObj*)fn->p;
+        return fo->builtin_id < 0 ? fo : nullptr;
+    }
+    if (fn->tag == KT_CLASS) {
+        KamiValue* m = class_lookup((KamiClassObj*)fn->p, "__init__");
+        return m && m->tag == KT_FUNC ? (KamiFuncObj*)m->p : nullptr;
+    }
+    return nullptr;
+}
+
+// f(**mapping): keys that name a positional parameter are bound to that
+// position; the rest stay in the mapping for **kwargs / keyword-only parameters
+// to pick up. Only a contiguous run starting at the first unfilled parameter can
+// be bound, because default values live in the callee, not here.
+//
+// `buf` receives the widened argument vector and `copy` a private mapping (the
+// caller's dict is never mutated). Returns the new argument count.
+static int64_t bind_kwargs(KamiFuncObj* fo, KamiValue** argv, int64_t nargs, bool is_method,
+                           KamiValue** buf, KamiValue* copy, const KamiValue* kwargs) {
+    Lock lk(g_lock);
+    KamiMap* src = (KamiMap*)kwargs->p;
+    kami_make_map(copy);
+    KamiMap* dst = (KamiMap*)copy->p;
+    for (int64_t i = 0; i < src->nentries; i++)
+        if (src->entries[i].used) map_set(dst, &src->entries[i].key, &src->entries[i].val);
+
+    int64_t self = is_method ? 1 : 0; // pnames[0] is 'self' for a bound method
+    for (int64_t i = 0; i < nargs; i++) buf[i] = argv[i];
+    int64_t n = nargs;
+    while (fo->pnames && n - self < fo->npos - self) {
+        const char* want = fo->pnames[n];
+        KamiValue key{KT_STR, {0}};
+        key.p = str_new(want, (int64_t)strlen(want));
+        KamiValue got;
+        if (!map_get(dst, &key, &got)) break;
+        if (n + 1 >= KAMI_MAX_ARGS) panic("too many arguments");
+        map_del(dst, &key);
+        copy[1 + n] = got; // scratch storage rooted by the caller
+        buf[n] = &copy[1 + n];
+        n++;
+    }
+    if (dst->count > 0 && (fo->flags & (KFF_KWARG | KFF_KWONLY)) == 0) {
+        for (int64_t i = 0; i < dst->nentries; i++)
+            if (dst->entries[i].used)
+                panic(std::string(fo->name ? fo->name : "call") +
+                      "() got an unexpected keyword argument " +
+                      value_repr(&dst->entries[i].key));
+    }
+    return n;
+}
+
+void kami_call_value_kw(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs,
+                        const KamiValue* kwargs) {
+    bool has_kw = kwargs && kwargs->tag == KT_MAP && ((KamiMap*)kwargs->p)->count > 0;
+    if (!has_kw) {
+        call_value_raw(out, fn, argv, nargs, nullptr);
+        return;
+    }
+    KamiFuncObj* fo = target_func(fn);
+    if (!fo) {
+        Lock lk(g_lock);
+        panic("this callee does not accept keyword arguments");
+    }
+    // scratch[0] = the private mapping, scratch[1..] = values bound by name
+    KamiValue scratch[1 + KAMI_MAX_ARGS];
+    for (auto& v : scratch) v = KamiValue{KT_NONE, {0}};
+    KamiValue* buf[KAMI_MAX_ARGS];
+    int64_t n;
+    {
+        Lock lk(g_lock);
+        g_pins.push_back({scratch, 1 + KAMI_MAX_ARGS});
+    }
+    n = bind_kwargs(fo, argv, nargs, fn->tag == KT_CLASS, buf, scratch, kwargs);
+    KamiValue* pass = ((KamiMap*)scratch[0].p)->count > 0 ? &scratch[0] : nullptr;
+    call_value_raw(out, fn, buf, n, pass);
+    {
+        Lock lk(g_lock);
+        unpin_one(scratch);
+    }
+}
+
+// f(*positional, **keywords) — the argument count is only known at run time.
+void kami_call_spread(KamiValue* out, const KamiValue* fn, const KamiValue* args,
+                      const KamiValue* kwargs) {
+    KamiValue* argv[KAMI_MAX_ARGS];
+    int64_t nargs = 0;
+    {
+        Lock lk(g_lock);
+        if (args->tag != KT_LIST) panic("argument after * must be a sequence");
+        KamiList* l = (KamiList*)args->p;
+        if (l->len > KAMI_MAX_ARGS)
+            panic("too many arguments after * (max " + std::to_string(KAMI_MAX_ARGS) + ")");
+        for (int64_t i = 0; i < l->len; i++) argv[nargs++] = &l->items[i];
+    }
+    // `args` is a rooted caller slot, so its items stay reachable during the call.
+    kami_call_value_kw(out, fn, argv, nargs, kwargs);
+}
+
+// A keyword-only parameter consumes its name from the keyword dict.
+int32_t kami_kwarg_take(KamiValue* out, KamiValue* kwargs, const char* name) {
+    if (!kwargs || kwargs->tag != KT_MAP) return 0;
+    Lock lk(g_lock);
+    KamiValue key{KT_STR, {0}};
+    KamiStr* s = str_new(name, (int64_t)strlen(name));
+    key.p = s;
+    if (!map_get((KamiMap*)kwargs->p, &key, out)) return 0;
+    map_del((KamiMap*)kwargs->p, &key);
+    return 1;
+}
+
+// *args in a function prologue: pack the trailing arguments into a fresh list.
+void kami_pack_args(KamiValue* out, KamiValue** argv, int64_t nargs, int64_t from) {
+    Lock lk(g_lock);
+    int64_t n = nargs > from ? nargs - from : 0;
+    KamiList* l = list_new(n > 0 ? n : 1);
+    out->tag = KT_LIST;
+    out->p = l; // rooted before any further allocation
+    for (int64_t i = from; i < nargs; i++) l->items[l->len++] = *argv[i];
+}
+
+static void call_value_raw(KamiValue* out, const KamiValue* fn, KamiValue** argv,
+                           int64_t nargs, KamiValue* kwargs) {
     KamiFn f = nullptr;
     KamiFn init = nullptr;
     KamiValue* f_caps = nullptr;
@@ -524,22 +697,77 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
         return;
     }
     if (init) {
-        KamiValue* argv2[17];
+        KamiValue* argv2[KAMI_MAX_ARGS];
         argv2[0] = out; // self
         for (int64_t i = 0; i < nargs; i++) argv2[i + 1] = argv[i];
         KamiValue dummy;
-        init(&dummy, argv2, nargs + 1, init_caps);
+        init(&dummy, argv2, nargs + 1, init_caps, kwargs);
         return;
     }
-    if (f) f(out, argv, nargs, f_caps);
+    if (f) f(out, argv, nargs, f_caps, kwargs);
 }
 
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
                  int64_t nargs) {
+    kami_method_kw(out, obj, name, argv, nargs, nullptr);
+}
+
+// obj.method(*positional, **keywords): the argument count is dynamic.
+void kami_method_spread(KamiValue* out, KamiValue* obj, const char* name, const KamiValue* args,
+                        const KamiValue* kwargs) {
+    KamiValue* argv[KAMI_MAX_ARGS];
+    int64_t nargs = 0;
+    {
+        Lock lk(g_lock);
+        if (args->tag != KT_LIST) panic("argument after * must be a sequence");
+        KamiList* l = (KamiList*)args->p;
+        if (l->len > KAMI_MAX_ARGS)
+            panic("too many arguments after * (max " + std::to_string(KAMI_MAX_ARGS) + ")");
+        for (int64_t i = 0; i < l->len; i++) argv[nargs++] = &l->items[i];
+    }
+    kami_method_kw(out, obj, name, argv, nargs, kwargs);
+}
+
+void kami_method_kw(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
+                    int64_t nargs, const KamiValue* kwargs) {
+    // A keyword mapping is bound against the method's own parameter names first.
+    if (kwargs && kwargs->tag == KT_MAP && ((KamiMap*)kwargs->p)->count > 0) {
+        KamiFuncObj* fo = nullptr;
+        {
+            Lock lk(g_lock);
+            if (obj->tag == KT_OBJECT) {
+                KamiValue* m = class_lookup(((KamiInstance*)obj->p)->cls, name);
+                if (m && m->tag == KT_FUNC) fo = (KamiFuncObj*)m->p;
+            }
+        }
+        if (fo) {
+            KamiValue scratch[1 + KAMI_MAX_ARGS];
+            for (auto& v : scratch) v = KamiValue{KT_NONE, {0}};
+            KamiValue* buf[KAMI_MAX_ARGS];
+            {
+                Lock lk(g_lock);
+                g_pins.push_back({scratch, 1 + KAMI_MAX_ARGS});
+            }
+            // pnames[0] is 'self', which the receiver fills, so shift by one.
+            KamiValue* self_and_args[KAMI_MAX_ARGS];
+            self_and_args[0] = obj;
+            for (int64_t i = 0; i < nargs; i++) self_and_args[i + 1] = argv[i];
+            int64_t n = bind_kwargs(fo, self_and_args, nargs + 1, true, buf, scratch, kwargs);
+            KamiValue* pass = ((KamiMap*)scratch[0].p)->count > 0 ? &scratch[0] : nullptr;
+            KamiFn f = (KamiFn)fo->fn;
+            KamiValue* caps = fo->captures;
+            f(out, buf, n, caps, pass);
+            {
+                Lock lk(g_lock);
+                unpin_one(scratch);
+            }
+            return;
+        }
+    }
     KamiFn user_fn = nullptr;
     KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
-    KamiValue* argv2[17];
+    KamiValue* argv2[KAMI_MAX_ARGS];
     {
         std::unique_lock<std::recursive_mutex> lk(g_lock);
         KamiValue o = *obj;
@@ -1205,7 +1433,8 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                   std::to_string(nargs) + " args)");
     }
     // Invoke user method WITHOUT holding the lock.
-    user_fn(out, argv2, user_nargs, user_caps);
+    user_fn(out, argv2, user_nargs, user_caps,
+            kwargs && kwargs->tag == KT_MAP ? const_cast<KamiValue*>(kwargs) : nullptr);
 }
 
 } // extern "C"

@@ -297,8 +297,18 @@ struct Parser {
         if (!check(Tok::RPAREN)) {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
-                if (check(Tok::STAR) || check(Tok::POW))
-                    err("*args/**kwargs are not supported");
+                if (check(Tok::STAR) || check(Tok::POW)) {
+                    // f(*seq) spreads positionally, f(**mapping) as keywords.
+                    bool dbl = check(Tok::POW);
+                    int line = advance().line;
+                    auto sp = std::make_unique<Expr>();
+                    sp->kind = ExprKind::Starred;
+                    sp->line = line;
+                    sp->ival = dbl ? 2 : 1;
+                    sp->a = parse_expr();
+                    call->args.push_back(std::move(sp));
+                    continue;
+                }
                 if (check(Tok::NAME) && peek(1).kind == Tok::ASSIGN) {
                     std::string kw = advance().text;
                     advance(); // '='
@@ -988,8 +998,27 @@ struct Parser {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
                 if (check(Tok::SLASH)) { advance(); continue; } // positional-only marker
-                if (check(Tok::STAR) || check(Tok::POW))
-                    throw CompileError(peek().line, "*args/**kwargs are not supported");
+                if (check(Tok::POW)) { // **kwargs
+                    advance();
+                    if (!s->kwarg.empty())
+                        err("a function can have only one **kwargs parameter");
+                    s->kwarg = expect(Tok::NAME, "parameter name").text;
+                    if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    continue;
+                }
+                if (check(Tok::STAR)) { // *args, or a bare '*' keyword-only marker
+                    advance();
+                    // everything declared after this point is keyword-only
+                    if (s->nposparams < 0) s->nposparams = (int)s->params.size();
+                    if (!check(Tok::NAME)) continue; // bare '*'
+                    if (!s->vararg.empty())
+                        err("a function can have only one *args parameter");
+                    s->vararg = expect(Tok::NAME, "parameter name").text;
+                    if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    continue;
+                }
+                if (!s->kwarg.empty())
+                    err("no parameter may follow **kwargs");
                 s->params.push_back(expect(Tok::NAME, "parameter name").text);
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
@@ -1109,7 +1138,7 @@ struct Parser {
             s->targets.push_back(std::move(e));
             while (match(Tok::COMMA)) {
                 if (check(Tok::ASSIGN)) break;
-                s->targets.push_back(parse_expr());
+                s->targets.push_back(parse_starred_or_expr());
             }
             expect(Tok::ASSIGN, "'='");
             s->values.push_back(parse_expr());
@@ -1200,6 +1229,11 @@ struct Parser {
     }
 
     void check_target(const Expr* e) {
+        // `a, *rest = seq` — a starred target absorbs the middle of the sequence.
+        if (e->kind == ExprKind::Starred) {
+            check_target(e->a.get());
+            return;
+        }
         if (e->kind != ExprKind::Name && e->kind != ExprKind::Index &&
             e->kind != ExprKind::Attr)
             throw CompileError(e->line, "invalid assignment target");
