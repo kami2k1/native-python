@@ -55,7 +55,7 @@ struct KamiMap {
 };
 
 // KamiFuncObj::flags
-enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2 };
+enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2, KFN_GENERATOR = 4 };
 
 struct KamiFuncObj {
     ObjHeader h;
@@ -129,6 +129,15 @@ struct KamiError {
     std::string msg;
 };
 
+// Generator object (generator.cpp). The control block holds the fiber, the
+// communication slots and the generator's own GC FrameStack; it lives outside
+// the GC heap because a suspended fiber keeps raw pointers into it.
+struct GenCtl;
+struct KamiGenObj {
+    ObjHeader h;
+    GenCtl* ctl;
+};
+
 // ---------------- global runtime state ----------------
 struct FrameStack {
     std::vector<std::pair<KamiValue*, int64_t>> frames;
@@ -165,6 +174,10 @@ extern std::vector<std::pair<KamiValue*, int64_t>> g_pins;
 extern std::vector<FrameStack*> g_frame_stacks;
 
 FrameStack* tls_frames(); // registers on first use (lock must be held)
+// Redirect this thread's frame registration to `fs` (a fiber's own stack);
+// returns the previous target so a generator switch can restore it. Passing
+// nullptr restores the thread's native FrameStack.
+FrameStack* set_tls_frames(FrameStack* fs);
 
 // GC (lock must be held by caller)
 void* gc_alloc(uint64_t size, uint32_t type);
@@ -241,6 +254,20 @@ void pyobj_method(KamiValue* out, KamiValue* obj, const std::string& m,
 void pyobj_call(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
 std::string pyobj_str(const KamiValue* v);
 int32_t pyobj_truthy(const KamiValue* v);
+
+// Generators (generator.cpp).
+struct KamiFuncObj;
+bool gen_advance(KamiValue* out, KamiGenObj* gen, const KamiValue* sent);
+void gen_create_from_func(KamiValue* out, KamiFuncObj* fo, const KamiValue* fnval,
+                          KamiValue** argv, int64_t nargs);
+bool gen_pull(KamiGenObj* gen);                       // buffer one element (for-loops)
+void gen_take_buffered(KamiValue* out, KamiGenObj* gen);
+bool gen_method(KamiValue* out, KamiValue* obj, const std::string& m, KamiValue** argv,
+                int64_t nargs);                       // __next__/send/close/throw
+void gen_drain_to_list(KamiValue* out, KamiValue* gen_val); // list(g), sorted(g), ...
+void gen_mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack,
+                       void (*mark)(const KamiValue*, std::vector<ObjHeader*>&));
+void gen_finalize(ObjHeader* h);                      // GC sweep
 
 [[noreturn]] void panic(const std::string& msg); // throws KamiError
 

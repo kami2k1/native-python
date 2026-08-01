@@ -27,6 +27,8 @@ enum class ExprKind {
     CallStar,   // call with *args/**kwargs at the call site: a = callee,
                 // args = positional (may contain Starred), pairs = keyword
                 // entries ((StrLit name, value) or (null, **expr))
+    Yield,      // yield [a] / yield from a (op: 0 = yield, 1 = yield from);
+                // evaluates to the value passed to send() (None for next())
 };
 
 struct Expr;
@@ -149,6 +151,9 @@ struct Stmt {
     // old object is dead — recycle its memory (kami_free_hint).
     bool free_hint = false;
     uint8_t sty = TY_ANY; // For: static type of the loop variable (typeinf.cpp)
+    // FuncDef: body contains `yield` — calls build a generator object instead
+    // of running the body (parser sets it, codegen/runtime consume it).
+    bool is_generator = false;
 };
 
 // A C function the compiled program calls directly (from a C extension mapping

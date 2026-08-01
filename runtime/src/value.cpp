@@ -24,6 +24,7 @@ const char* type_name(int64_t tag) {
     case KT_SOCKET: return "socket";
     case KT_LOCK: return "lock";
     case KT_PYOBJ: return "pyobject";
+    case KT_GEN: return "generator";
     default: return "?";
     }
 }
@@ -112,6 +113,7 @@ std::string value_str(const KamiValue* v) {
         return std::string("<function ") + f->name + ">";
     }
     case KT_THREAD: return "<thread>";
+    case KT_GEN: return "<generator object>";
     case KT_CLASS: return std::string("<class '") + ((KamiClassObj*)v->p)->name + "'>";
     case KT_OBJECT:
         return std::string("<") + ((KamiInstance*)v->p)->cls->name + " object>";

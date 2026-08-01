@@ -58,14 +58,25 @@ struct TlsReg {
     }
 };
 thread_local TlsReg t_reg;
+// When a generator fiber is executing, frame registration is redirected to
+// the fiber's own FrameStack (generator.cpp) so suspended generator frames
+// stay registered as GC roots without interleaving with the thread's frames.
+thread_local FrameStack* t_fs_override = nullptr;
 } // namespace
 
 FrameStack* tls_frames() {
+    if (t_fs_override) return t_fs_override;
     if (!t_reg.registered) {
         g_frame_stacks.push_back(&t_reg.fs);
         t_reg.registered = true;
     }
     return &t_reg.fs;
+}
+
+FrameStack* set_tls_frames(FrameStack* fs) {
+    FrameStack* prev = t_fs_override;
+    t_fs_override = fs;
+    return prev;
 }
 
 // ---- marking ----
@@ -118,6 +129,9 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
         for (int64_t i = 0; i < fo->ncaptures; i++) mark_value(&fo->captures[i], stack);
         break;
     }
+    case KT_GEN:
+        gen_mark_children(h, stack, mark_value);
+        break;
     default: break; // STR / THREAD have no Value children
     }
 }
@@ -175,6 +189,9 @@ void gc_collect() {
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
             case KT_PYOBJ:
                 pyobj_finalize(h);
+                break;
+            case KT_GEN:
+                gen_finalize(h);
                 break;
             case KT_THREAD: {
                 ThreadData* td = ((KamiThreadObj*)h)->td;

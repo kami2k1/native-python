@@ -6,6 +6,7 @@
 #include "../../runtime/include/kami_runtime.h"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <unordered_map>
@@ -42,6 +43,7 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"set", {KB_SET, 0, 1}}, {"open", {KB_OPEN, 1, 2}},
         {"map", {KB_MAP, 2, 2}}, {"filter", {KB_FILTER, 2, 2}},
         {"repr", {KB_REPR, 1, 1}}, {"callable", {KB_CALLABLE, 1, 1}},
+        {"next", {KB_NEXT, 1, 2}}, {"iter", {KB_ITER, 1, 1}},
     };
     return b;
 }
@@ -105,6 +107,22 @@ modules() {
             {"socket", {{"socket", {KB_SOCKET_SOCKET, 0, 2}}}},
         };
     return m;
+}
+
+// Base classes like `class MyError(Exception)`: exceptions are string-matched
+// at runtime, so inheriting from a builtin exception adds no behavior. Any
+// unknown base that *looks like* a builtin exception is accepted and dropped.
+static bool builtin_exception_name(const std::string& n) {
+    static const std::set<std::string> exact = {
+        "Exception", "BaseException", "StopIteration", "StopAsyncIteration",
+        "GeneratorExit", "KeyboardInterrupt", "SystemExit",
+    };
+    if (exact.count(n)) return true;
+    auto ends_with = [&](const char* suf) {
+        size_t l = strlen(suf);
+        return n.size() >= l && n.compare(n.size() - l, l, suf) == 0;
+    };
+    return ends_with("Error") || ends_with("Exception") || ends_with("Warning");
 }
 
 // Imports that are accepted and ignored (annotation-only / test helpers).
@@ -1418,6 +1436,9 @@ struct Sema {
         case ExprKind::Starred:
             resolve_expr(e->a.get());
             return;
+        case ExprKind::Yield:
+            if (e->a) resolve_expr(e->a.get());
+            return;
         case ExprKind::ListComp:
         case ExprKind::SetComp:
         case ExprKind::MapComp: {
@@ -1769,8 +1790,14 @@ struct Sema {
                 }
             }
             for (auto& d : s->decorators) resolve_expr(d.get());
-            if (!s->alias.empty() && !classes.count(s->alias))
-                err(s->line, "unknown base class '" + s->alias + "'");
+            if (!s->alias.empty() && !classes.count(s->alias)) {
+                // `class E(Exception)` / `class E(ValueError)`: exceptions are
+                // string-matched at runtime, so a builtin exception base adds
+                // no behavior — treat the class as base-less instead of
+                // rejecting real-world code.
+                if (builtin_exception_name(s->alias)) s->alias.clear();
+                else err(s->line, "unknown base class '" + s->alias + "'");
+            }
             return;
         case StmtKind::Return:
             if (s->e1) resolve_expr(s->e1.get());
@@ -2082,6 +2109,10 @@ struct AliasScan {
             }
             return;
         case ExprKind::Starred:
+            expr(e->a.get(), true);
+            return;
+        case ExprKind::Yield:
+            // the yielded value escapes to the consumer: always retained
             expr(e->a.get(), true);
             return;
         case ExprKind::ListComp:

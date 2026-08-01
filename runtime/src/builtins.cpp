@@ -233,6 +233,7 @@ static void set_str(KamiValue* out, const std::string& s) {
 // pinned as a GC root until unpin_scratch() is called; callers must pair them.
 static void as_list_pinned(KamiValue* out, KamiValue* v) {
     if (v->tag == KT_LIST) { *out = *v; }
+    else if (v->tag == KT_GEN) gen_drain_to_list(out, v); // run it to exhaustion
     else kami_iter_prep(out, v); // dict/set/str/file → list
     g_pins.push_back({out, 1});
 }
@@ -961,6 +962,8 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             kami_iter_prep(&seq, argv[0]);
             KamiList* src = (KamiList*)seq.p;
             for (int64_t i = 0; i < src->len; i++) list_push(r, &src->items[i]);
+        } else if (argv[0]->tag == KT_GEN) {
+            gen_drain_to_list(out, argv[0]); // fresh list, replaces r
         } else {
             panic("list() expected an iterable");
         }
@@ -1075,6 +1078,28 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         int64_t t = argv[0]->tag;
         out->tag = KT_BOOL;
         out->i = t == KT_FUNC || t == KT_CLASS;
+        return;
+    }
+    case KB_NEXT: { // next(gen[, default])
+        check_arity(nargs, 1, 2, "next");
+        if (argv[0]->tag != KT_GEN)
+            panic(std::string("'") + type_name(argv[0]->tag) + "' object is not an iterator");
+        if (nargs == 1) {
+            kami_gen_next(out, argv[0]);
+            return;
+        }
+        try {
+            kami_gen_next(out, argv[0]);
+        } catch (KamiError& e) {
+            if (e.msg != "StopIteration") throw;
+            *out = *argv[1];
+        }
+        return;
+    }
+    case KB_ITER: { // iter(x): generators pass through; others materialize
+        check_arity(nargs, 1, 1, "iter");
+        if (argv[0]->tag == KT_GEN) *out = *argv[0];
+        else kami_iter_prep(out, argv[0]);
         return;
     }
     case KB_REPR: {

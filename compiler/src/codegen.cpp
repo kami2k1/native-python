@@ -85,7 +85,8 @@ static std::string join_params(const Stmt* f) {
     return s;
 }
 static int64_t func_flags(const Stmt* f) {
-    return (f->vararg.empty() ? 0 : 1) | (f->kwarg.empty() ? 0 : 2);
+    return (f->vararg.empty() ? 0 : 1) | (f->kwarg.empty() ? 0 : 2) |
+           (f->is_generator ? 4 : 0); // KFN_GENERATOR
 }
 static int64_t func_kwonly(const Stmt* f) {
     return f->kwonly >= 0 ? f->kwonly : (int64_t)f->params.size();
@@ -814,6 +815,15 @@ struct FnGen {
                 }
                 fill_argbuf(slots);
                 const Stmt* f = mod.functions[(size_t)callee->res_idx];
+                if (f->is_generator) {
+                    // Calling a generator function builds the generator object;
+                    // the body (@u_...) runs lazily inside the fiber.
+                    emit("call void @kami_gen_create(ptr " + slot_ptr(t) + ", ptr @u_" +
+                         f->alias + ", ptr %argbuf, i64 " + std::to_string(slots.size()) +
+                         ")");
+                    temp_top = save;
+                    return t;
+                }
                 emit("call void @u_" + f->alias + "(ptr " + slot_ptr(t) +
                      ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr null)");
                 temp_top = save;
@@ -883,6 +893,33 @@ struct FnGen {
             return t;
         }
         case ExprKind::CCall: return gen_ccall(e);
+        case ExprKind::Yield: {
+            if (e->op == 1) { // yield from: drive the sub-iterable to exhaustion
+                gen_iteration(e->a.get(), [&](int elem) {
+                    int s2 = temp_top;
+                    int sent = alloc_temp();
+                    emit("call void @kami_gen_yield(ptr " + slot_ptr(sent) + ", ptr " +
+                         slot_ptr(elem) + ")");
+                    temp_top = s2;
+                }, nullptr, nullptr);
+                int t = alloc_temp();
+                emit("call void @kami_make_none(ptr " + slot_ptr(t) + ")");
+                return t;
+            }
+            int t = alloc_temp(); // receives the value passed to send()
+            int save = temp_top;
+            int v;
+            if (e->a) {
+                v = gen_expr(e->a.get());
+            } else {
+                v = alloc_temp();
+                emit("call void @kami_make_none(ptr " + slot_ptr(v) + ")");
+            }
+            emit("call void @kami_gen_yield(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(v) +
+                 ")");
+            temp_top = save;
+            return t;
+        }
         case ExprKind::MethodCall: {
             int t = alloc_temp(); // before args: see Call above
             int save = temp_top;
@@ -2052,6 +2089,8 @@ declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
 declare void @kami_rethrow()
 declare void @kami_run_module(ptr)
+declare void @kami_gen_create(ptr, ptr, ptr, i64)
+declare void @kami_gen_yield(ptr, ptr)
 declare i64 @kami_c_arg_i64(ptr)
 declare double @kami_c_arg_f64(ptr)
 declare ptr @kami_c_arg_cstr(ptr)

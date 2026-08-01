@@ -40,6 +40,7 @@ enum KamiTag : int64_t {
     KT_SOCKET = 13,
     KT_LOCK = 14,  // threading.Lock
     KT_PYOBJ = 15, // CPython object bridged through the embedded C-API layer
+    KT_GEN = 16,   // generator (suspended `yield` function, fiber-backed)
 };
 
 enum KamiBinOp : int64_t {
@@ -156,6 +157,16 @@ void kami_pyext_getattr(KamiValue* out, const KamiValue* module, const char* nam
 // Escape-analysis hint: the container held in this slot is provably dead
 // (about to be overwritten, no aliases) — recycle its memory immediately.
 void kami_free_hint(KamiValue* slot);
+
+// --- generators (yield) ---
+// Direct call of a generator function: builds the generator object instead of
+// running the body (which starts lazily on the first next()).
+void kami_gen_create(KamiValue* out, void* fnptr, KamiValue** argv, int64_t nargs);
+// `yield v` inside a compiled generator body: suspends the fiber; *out
+// receives the value passed to send() (None for plain next()).
+void kami_gen_yield(KamiValue* out, const KamiValue* v);
+// next(g): advances the generator; raises StopIteration when exhausted.
+void kami_gen_next(KamiValue* out, KamiValue* gen);
 
 // --- diagnostics ---
 void kami_panic(const char* msg);

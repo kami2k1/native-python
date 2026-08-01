@@ -324,6 +324,9 @@ struct TypeInf {
                         }
                     }
                 }
+                // Calling a generator function yields a generator object, not
+                // the joined type of its `return` expressions.
+                if (def->is_generator) return TY_ANY;
                 if (!cal.escapes) return cal.ret; // BOT = still settling (optimistic)
                 // Escaping callee: precise only when the speculative signature
                 // is known to apply to this call's argument types.
@@ -384,6 +387,9 @@ struct TypeInf {
                 type_expr(c, p.second.get());
             }
             return TY_ANY;
+        case ExprKind::Yield:
+            if (e->a) type_expr(c, e->a.get());
+            return TY_ANY; // value delivered by send(); None for plain next()
         case ExprKind::Starred:
             type_expr(c, e->a.get());
             return TY_ANY;
@@ -731,7 +737,8 @@ struct TypeInf {
             Stmt* f = mod.functions[i];
             FuncTypeInfo& fi = info(i);
             bool ok = !fi.escapes && f->global_idx >= 0 && f->defaults.empty() &&
-                      f->vararg.empty() && f->kwarg.empty() && f->decorators.empty();
+                      f->vararg.empty() && f->kwarg.empty() && f->decorators.empty() &&
+                      !f->is_generator;
             if (ok)
                 for (uint8_t p : fi.params)
                     if (!is_primitive(p) || p == TY_NONE) ok = false;
@@ -770,7 +777,7 @@ struct TypeInf {
             FuncTypeInfo& fi = info(i);
             if (fi.escapes && !fi.native_ok && f->global_idx >= 0 &&
                 f->defaults.empty() && f->vararg.empty() && f->kwarg.empty() &&
-                f->decorators.empty())
+                f->decorators.empty() && !f->is_generator)
                 cand[i] = 1;
         }
         bool any = false;

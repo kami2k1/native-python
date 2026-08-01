@@ -615,6 +615,7 @@ void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
     KamiValue v = *seq;
     switch (v.tag) {
     case KT_LIST:
+    case KT_GEN: // stays lazy: kami_iter_cond/get pull elements on demand
         *out = v;
         return;
     case KT_STR: {
@@ -686,6 +687,8 @@ int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiVal
 }
 
 int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx) {
+    if (seq->tag == KT_GEN) // pull the next element (buffered for iter_get)
+        return gen_pull((KamiGenObj*)seq->p) ? 1 : 0;
     Lock lk(g_lock);
     int64_t len;
     switch (seq->tag) {
@@ -698,6 +701,10 @@ int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx) {
 }
 
 void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
+    if (seq->tag == KT_GEN) {
+        gen_take_buffered(out, (KamiGenObj*)seq->p);
+        return;
+    }
     kami_index_get(out, seq, idx);
 }
 
@@ -706,6 +713,8 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
     KamiFn init = nullptr;
     KamiValue* f_caps = nullptr;
     KamiValue* init_caps = nullptr;
+    KamiFuncObj* gen_fo = nullptr; // callee is a generator function
+    KamiValue gen_fnval{KT_NONE, {0}};
     int64_t builtin_id = -1;
     int64_t n2 = 0;
     KamiValue* argv2[19];
@@ -740,6 +749,10 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             KamiFuncObj* fo = (KamiFuncObj*)fn->p;
             if (fo->builtin_id >= 0) {
                 builtin_id = fo->builtin_id;
+            } else if (fo->flags & KFN_GENERATOR) {
+                n2 = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
+                gen_fo = fo;
+                gen_fnval = *fn;
             } else {
                 n2 = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
                 f = (KamiFn)fo->fn;
@@ -750,6 +763,10 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
     // Invoke WITHOUT holding the lock: callees take the lock themselves.
     if (builtin_id >= 0) {
         kami_builtin(builtin_id, out, argv, nargs);
+        return;
+    }
+    if (gen_fo) { // build the generator object; the body runs lazily
+        gen_create_from_func(out, gen_fo, &gen_fnval, argv2, n2);
         return;
     }
     if (init) {
@@ -854,6 +871,8 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
     KamiFn user_fn = nullptr;
     KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
+    KamiFuncObj* gen_fo = nullptr; // resolved method is a generator function
+    KamiValue gen_fnval{KT_NONE, {0}};
     KamiValue* argv2[19];
     KamiValue packed[2] = {{KT_NONE, {0}}, {KT_NONE, {0}}};
     PinGuard pin(packed, 2);
@@ -866,6 +885,11 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
         if (o.tag == KT_PYOBJ) { // bridged CPython object: dispatch through the C-API
             pyobj_method(out, obj, m, argv, nargs);
             return;
+        }
+        if (o.tag == KT_GEN) { // __next__ / send / close / throw
+            lk.unlock();
+            if (gen_method(out, obj, m, argv, nargs)) return;
+            panic("'generator' object has no method '" + m + "'");
         }
         if (o.tag == KT_LIST) {
             KamiList* l = (KamiList*)o.p;
@@ -1651,6 +1675,7 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             user_nargs = prep_user_argv(fo, argv1, k, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
+            if (fo->flags & KFN_GENERATOR) { gen_fo = fo; gen_fnval = *mv; }
         } else if (o.tag == KT_CLASS) {
             // unbound call: ClassName.method(self, args...)
             KamiClassObj* c = (KamiClassObj*)o.p;
@@ -1661,10 +1686,15 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             user_nargs = prep_user_argv(fo, argv, nargs, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
+            if (fo->flags & KFN_GENERATOR) { gen_fo = fo; gen_fnval = *mv; }
         }
         if (!user_fn)
             panic(std::string("'") + type_name(o.tag) + "' object has no method '" + m + "'(" +
                   std::to_string(nargs) + " args)");
+    }
+    if (gen_fo) { // generator method: build the generator object lazily
+        gen_create_from_func(out, gen_fo, &gen_fnval, argv2, user_nargs);
+        return;
     }
     // Invoke user method WITHOUT holding the lock.
     user_fn(out, argv2, user_nargs, user_caps);
