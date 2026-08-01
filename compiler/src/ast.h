@@ -19,12 +19,24 @@ enum class ExprKind {
     SetLit,     // args = elements
     Lambda,     // params = arg names, a = body expr
     Closure,    // res_idx = function index; capture sources in comp_t* vectors
+    Starred,    // *a inside a list/call display; a = inner
+    SetComp,    // element a + clauses
+    MapComp,    // pairs[0] = (key,val) + clauses
+};
+
+struct Expr;
+
+struct CompClause {
+    std::vector<std::string> targets;      // loop variables
+    std::unique_ptr<Expr> iter;
+    std::vector<std::unique_ptr<Expr>> conds;
+    std::vector<int> tkind;                // sema: 1=local 2=global
+    std::vector<int64_t> tidx;
 };
 
 // Name/Call resolution (filled by sema)
 enum class Res { Unresolved, Local, Global, BuiltinFunc, UserFunc, Capture };
 
-struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
 
 struct Expr {
@@ -41,6 +53,7 @@ struct Expr {
     std::vector<std::pair<std::string, ExprPtr>> kwargs; // Call keyword args
     std::vector<std::pair<ExprPtr, ExprPtr>> pairs;      // MapLit
     std::vector<std::string> params; // ListComp target names
+    std::vector<CompClause> clauses; // ListComp/SetComp/MapComp
 
     // sema annotations
     Res res = Res::Unresolved;

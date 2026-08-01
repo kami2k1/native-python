@@ -35,16 +35,22 @@ struct KamiList {
 
 struct MapEntry {
     uint64_t hash;
-    bool used;
+    bool used;       // false = deleted tombstone
     KamiValue key;
     KamiValue val;
 };
 
+// Compact, insertion-ordered dict/set (CPython-style): `entries` holds records
+// in insertion order (with tombstones); `index` is a hash table of
+// (entry_index + 1), 0 meaning empty. Iteration walks entries[0..nentries).
 struct KamiMap {
     ObjHeader h;
-    int64_t count;
-    int64_t cap; // power of two, 0 when empty
-    MapEntry* entries; // malloc'ed
+    int64_t count;    // live entries
+    int64_t nentries; // slots used in entries[] (incl. tombstones)
+    int64_t ecap;     // capacity of entries[]
+    MapEntry* entries;
+    int64_t* index;   // malloc'ed hash table (power of two), or null
+    int64_t icap;
 };
 
 struct KamiFuncObj {

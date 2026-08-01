@@ -103,7 +103,7 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
             KamiMap* r = (KamiMap*)out->p;
             KamiValue none{KT_NONE, {0}};
             KamiValue tmp;
-            for (int64_t i = 0; i < x->cap; i++) {
+            for (int64_t i = 0; i < x->nentries; i++) {
                 if (!x->entries[i].used) continue;
                 if (!map_get(y, &x->entries[i].key, &tmp))
                     map_set(r, &x->entries[i].key, &none);
@@ -187,7 +187,7 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
             KamiMap* r = (KamiMap*)out->p;
             KamiValue none{KT_NONE, {0}};
             KamiValue tmp;
-            for (int64_t i = 0; i < x->cap; i++) {
+            for (int64_t i = 0; i < x->nentries; i++) {
                 if (!x->entries[i].used) continue;
                 bool in_y = map_get(y, &x->entries[i].key, &tmp);
                 if ((op == KOP_BITOR) || (op == KOP_BITAND && in_y) ||
@@ -195,7 +195,7 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
                     map_set(r, &x->entries[i].key, &none);
             }
             if (op != KOP_BITAND) {
-                for (int64_t i = 0; i < y->cap; i++) {
+                for (int64_t i = 0; i < y->nentries; i++) {
                     if (!y->entries[i].used) continue;
                     bool in_x = map_get(x, &y->entries[i].key, &tmp);
                     if (op == KOP_BITOR || (op == KOP_BITXOR && !in_x))
@@ -376,7 +376,7 @@ void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
         KamiList* r = list_new(m->count);
         out->tag = KT_LIST;
         out->p = r;
-        for (int64_t i = 0; i < m->cap; i++)
+        for (int64_t i = 0; i < m->nentries; i++)
             if (m->entries[i].used) r->items[r->len++] = m->entries[i].key;
         return;
     }
@@ -797,14 +797,14 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             KamiMap* mp = (KamiMap*)o.p;
             if (m == "keys" && nargs == 0) {
                 KamiList* r = list_new(mp->count);
-                for (int64_t i = 0; i < mp->cap; i++)
+                for (int64_t i = 0; i < mp->nentries; i++)
                     if (mp->entries[i].used) r->items[r->len++] = mp->entries[i].key;
                 out->tag = KT_LIST; out->p = r;
                 return;
             }
             if (m == "values" && nargs == 0) {
                 KamiList* r = list_new(mp->count);
-                for (int64_t i = 0; i < mp->cap; i++)
+                for (int64_t i = 0; i < mp->nentries; i++)
                     if (mp->entries[i].used) r->items[r->len++] = mp->entries[i].val;
                 out->tag = KT_LIST; out->p = r;
                 return;
@@ -813,7 +813,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 KamiList* r = list_new(mp->count);
                 out->tag = KT_LIST;
                 out->p = r; // root before nested allocations
-                for (int64_t i = 0; i < mp->cap; i++) {
+                for (int64_t i = 0; i < mp->nentries; i++) {
                     if (!mp->entries[i].used) continue;
                     KamiList* pair = list_new(2);
                     pair->items[pair->len++] = mp->entries[i].key;
@@ -848,8 +848,12 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             }
             if (m == "clear" && nargs == 0) {
                 free(mp->entries);
+                free(mp->index);
                 mp->entries = nullptr;
-                mp->cap = 0;
+                mp->index = nullptr;
+                mp->ecap = 0;
+                mp->nentries = 0;
+                mp->icap = 0;
                 mp->count = 0;
                 out->tag = KT_NONE; out->i = 0;
                 return;
