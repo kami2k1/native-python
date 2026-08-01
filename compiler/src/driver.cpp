@@ -119,7 +119,12 @@ static void collect_import_names(Stmt* s, std::vector<std::string>& out) {
         out.push_back(s->name);
         for (auto& extra : s->body) collect_import_names(extra.get(), out);
         return;
-    case StmtKind::FromImport: out.push_back(s->name); return;
+    case StmtKind::FromImport:
+        if (!s->name.empty()) out.push_back(s->name);
+        // `from . import a, b` — the imported names are sibling modules.
+        if (s->relative && s->name.empty())
+            for (auto& [n, alias] : s->import_names) out.push_back(n);
+        return;
     default: break;
     }
     for (auto& c : s->body) collect_import_names(c.get(), out);
@@ -211,6 +216,7 @@ std::string build(const BuildOptions& opts) {
     std::string src = read_file(opts.input);
 
     Module mod = parse(lex(src));
+    mod.source_path = fs::absolute(opts.input).string();
     bundle_local_modules(mod, opts.input);
     analyze(mod);
     if (opts.emit_ast) {

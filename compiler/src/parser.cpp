@@ -478,6 +478,12 @@ struct Parser {
             advance();
             return e;
         }
+        case Tok::ELLIPSIS: {
+            // Ellipsis literal: modeled as None (used in stubs / annotations).
+            auto e = mk(ExprKind::NoneLit);
+            advance();
+            return e;
+        }
         case Tok::NAME: {
             auto e = mk(ExprKind::Name);
             e->sval = t.text;
@@ -793,11 +799,35 @@ struct Parser {
     StmtPtr parse_from_import() {
         int line = advance().line;
         auto s = mks(StmtKind::FromImport, line);
-        if (check(Tok::DOT))
-            throw CompileError(line, "relative imports (from . import x) are not supported");
-        s->name = parse_dotted_name();
+        // Relative import: one or more leading dots (from . / from .mod / from ..pkg).
+        int dots = 0;
+        while (check(Tok::DOT) || check(Tok::ELLIPSIS)) {
+            dots += check(Tok::ELLIPSIS) ? 3 : 1;
+            advance();
+        }
+        if (dots > 0) s->relative = true;
+        if (check(Tok::NAME)) s->name = parse_dotted_name();
+        // else: `from . import x` — imported names are sibling modules.
         expect(Tok::KW_IMPORT, "'import'");
-        if (check(Tok::STAR)) err("'from X import *' is not supported");
+        if (check(Tok::STAR)) {
+            // `from X import *`: we can't enumerate names for a native/unknown
+            // module, but for a bundled local module every top-level name is
+            // already a global, so a star import is a harmless no-op there.
+            advance();
+            s->star = true;
+            return s;
+        }
+        if (match(Tok::LPAREN)) { // parenthesized import list (may span lines)
+            do {
+                if (check(Tok::RPAREN)) break;
+                std::string n = expect(Tok::NAME, "name").text;
+                std::string a = n;
+                if (match(Tok::KW_AS)) a = expect(Tok::NAME, "alias").text;
+                s->import_names.emplace_back(n, a);
+            } while (match(Tok::COMMA));
+            expect(Tok::RPAREN, "')'");
+            return s;
+        }
         do {
             std::string n = expect(Tok::NAME, "name").text;
             std::string a = n;

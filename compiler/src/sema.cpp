@@ -333,6 +333,21 @@ struct Sema {
 
     void register_from_import(Stmt* s) {
         const std::string& modname = s->name;
+        // `from . import mod1, mod2` — each imported name is a sibling module.
+        if (s->relative && modname.empty()) {
+            for (auto& [n, alias] : s->import_names) {
+                if (mod.user_modules.count(n)) user_imports[alias] = n;
+                else if (try_depth == 0 && !noop_module(n))
+                    err(s->line, "cannot find local module '" + n +
+                                     ".py' for 'from . import " + n + "'");
+            }
+            return;
+        }
+        if (s->star) {
+            // `from X import *`: only meaningful for a bundled local module,
+            // where its globals are already visible. Silently accept.
+            return;
+        }
         if (noop_module(modname)) return; // names are annotation-only
         if (mod.user_modules.count(modname)) {
             // Bundled local module: its top-level names are already globals in
@@ -560,6 +575,11 @@ struct Sema {
             e->sval = "__main__";
             return;
         }
+        if (n == "__file__") {
+            e->kind = ExprKind::StrLit;
+            e->sval = mod.source_path.empty() ? "<string>" : mod.source_path;
+            return;
+        }
         if (imports.count(n) || user_imports.count(n))
             err(e->line, "module '" + n + "' can only be used as '" + n + ".<name>'");
         auto fi2 = from_imports.find(n);
@@ -751,6 +771,12 @@ struct Sema {
 
     // requests.get(url, timeout=..) / requests.post(url, json=.., data=.., timeout=..)
     bool rewrite_module_kwargs(Expr* e, const std::string& mod, const std::string& fn) {
+        if (mod == "doctest" && fn == "testmod") {
+            // no-op function: accept and discard any kwargs (verbose=, ...)
+            e->kwargs.clear();
+            e->args.clear();
+            return true;
+        }
         if (mod == "requests" && fn == "get") {
             ExprPtr timeout;
             for (auto& [kw, v] : e->kwargs) {

@@ -105,6 +105,8 @@ struct Stmt {
     int64_t global_idx = -1;          // FuncDef/ClassDef global slot
     int func_index = -1;              // FuncDef index into module function table
     int raise_mode = 0;
+    bool relative = false; // FromImport: leading-dot relative import
+    bool star = false;     // FromImport: `from X import *`
     std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
     bool is_closure = false;          // FuncDef compiled with a %captures param
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
@@ -120,6 +122,7 @@ struct Module {
     // driver ("import utils" → utils.py compiled in). Their top-level code is
     // spliced before the main body; sema maps "utils.x" to plain "x".
     std::set<std::string> user_modules;
+    std::string source_path; // input file path (for __file__)
 };
 
 // S-expression dump for tests/debugging.
