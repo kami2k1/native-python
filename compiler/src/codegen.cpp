@@ -812,8 +812,15 @@ struct FnGen {
                 }
                 temp_top = s2;
             }
-            emit("call void @kami_call_star(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(c) +
-                 ", ptr " + slot_ptr(pos) + ", ptr " + slot_ptr(kw) + ")");
+            if (e->sval.empty()) {
+                emit("call void @kami_call_star(ptr " + slot_ptr(t) + ", ptr " +
+                     slot_ptr(c) + ", ptr " + slot_ptr(pos) + ", ptr " + slot_ptr(kw) +
+                     ")");
+            } else { // obj.m(*a, **k)
+                emit("call void @kami_method_star(ptr " + slot_ptr(t) + ", ptr " +
+                     slot_ptr(c) + ", ptr " + str_const(e->sval) + ", ptr " +
+                     slot_ptr(pos) + ", ptr " + slot_ptr(kw) + ")");
+            }
             temp_top = save;
             return t;
         }
@@ -1221,6 +1228,9 @@ struct FnGen {
                 break;
             }
             int v = gen_expr(s->e1.get());
+            if (s->free_hint) // old container is provably dead: recycle it
+                emit("call void @kami_free_hint(ptr " + slot_ptr((int)s->target_idx) +
+                     ")");
             assign_var(s->target_res, s->target_idx, v, s->e1->sty);
             break;
         }
@@ -1984,7 +1994,9 @@ declare void @kami_call_value(ptr, ptr, ptr, i64)
 declare void @kami_method(ptr, ptr, ptr, ptr, i64)
 declare void @kami_builtin(i64, ptr, ptr, i64)
 declare void @kami_call_star(ptr, ptr, ptr, ptr)
+declare void @kami_method_star(ptr, ptr, ptr, ptr, ptr)
 declare void @kami_str_iadd(ptr, ptr)
+declare void @kami_free_hint(ptr)
 declare void @kami_pyext_import(ptr, ptr)
 declare void @kami_pyext_getattr(ptr, ptr, ptr)
 declare void @kami_map_merge(ptr, ptr)

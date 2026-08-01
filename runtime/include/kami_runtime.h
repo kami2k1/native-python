@@ -102,6 +102,9 @@ void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
                     const KamiValue* kw);
 // dst.update(src) for two dicts (used for `**mapping` at call sites).
 void kami_map_merge(KamiValue* dst, const KamiValue* src);
+// obj.m(*args, **kwargs) — method call with runtime unpacking.
+void kami_method_star(KamiValue* out, KamiValue* obj, const char* name,
+                      const KamiValue* pos, const KamiValue* kw);
 // `s += x` fast path: amortized-O(1) in-place string append (emitted only when
 // the compiler proves the target is never aliased). Falls back to `+`.
 void kami_str_iadd(KamiValue* target, const KamiValue* rhs);
@@ -144,6 +147,10 @@ void kami_run_module(void* module_fn);
 void kami_pyext_import(KamiValue* out, const char* name);
 // getattr(module, name) → global (used for `from _hashlib import ...`).
 void kami_pyext_getattr(KamiValue* out, const KamiValue* module, const char* name);
+
+// Escape-analysis hint: the container held in this slot is provably dead
+// (about to be overwritten, no aliases) — recycle its memory immediately.
+void kami_free_hint(KamiValue* slot);
 
 // --- diagnostics ---
 void kami_panic(const char* msg);

@@ -1292,12 +1292,6 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
-            for (auto& a : e->args)
-                if (a->kind == ExprKind::Starred)
-                    err(e->line, "*args unpacking is not supported in method calls yet");
-            for (auto& [kw, v] : e->kwargs)
-                if (kw.empty())
-                    err(e->line, "**kwargs unpacking is not supported in method calls yet");
             // Bundled local module: "utils.helper(args)" → plain call "helper(args)".
             // Re-resolving as a Call keeps kwargs/default-argument support.
             if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
@@ -1311,6 +1305,33 @@ struct Sema {
                 e->sval.clear();
                 resolve_expr(e);
                 return;
+            }
+            // obj.m(*a, **k): lower to a method CallStar — positionals packed
+            // into a list, keywords into a dict, matched by the runtime.
+            {
+                bool has_star = false, has_dstar = false;
+                for (auto& a : e->args)
+                    if (a->kind == ExprKind::Starred) has_star = true;
+                for (auto& [kw, v] : e->kwargs)
+                    if (kw.empty()) has_dstar = true;
+                if (has_star || has_dstar) {
+                    for (auto& a : e->args) resolve_expr(a.get());
+                    for (auto& [kw, v] : e->kwargs) resolve_expr(v.get());
+                    resolve_expr(e->a.get()); // receiver
+                    for (auto& [kw, v] : e->kwargs) {
+                        ExprPtr key;
+                        if (!kw.empty()) {
+                            key = std::make_unique<Expr>();
+                            key->kind = ExprKind::StrLit;
+                            key->line = e->line;
+                            key->sval = kw;
+                        }
+                        e->pairs.emplace_back(std::move(key), std::move(v));
+                    }
+                    e->kwargs.clear();
+                    e->kind = ExprKind::CallStar; // sval keeps the method name
+                    return;
+                }
             }
             // logging.<level>(...) and logging.basicConfig(...) — special forms.
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
@@ -2001,7 +2022,8 @@ namespace {
 
 struct AliasScan {
     const Module& mod;
-    std::set<int64_t> unsafe; // local slots that may have live aliases
+    std::set<int64_t> unsafe;          // local slots that may have live aliases
+    std::set<int64_t> container_slots; // slots holding fresh lists/dicts/sets
 
     explicit AliasScan(const Module& m) : mod(m) {}
 
@@ -2018,6 +2040,50 @@ struct AliasScan {
     void closure_captures(const Stmt* fn) {
         for (size_t i = 0; i < fn->multi_tkind.size(); i++)
             if (fn->multi_tkind[i] == 1) unsafe.insert(fn->multi_tidx[i]);
+    }
+
+    // Does this expression always produce a FRESH value (a heap object no one
+    // else references, or a primitive)? Locals assigned a non-fresh value may
+    // alias somebody else's buffer and must never be mutated in place:
+    //   s = lst[0]          (shares the element's buffer)
+    //   s = some_global     (shares the global's buffer)
+    //   b = helper(a)       (a user function may return its argument)
+    static bool is_fresh(const Expr* e) {
+        switch (e->kind) {
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::StrLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NoneLit:
+        case ExprKind::ListLit:
+        case ExprKind::SetLit:
+        case ExprKind::MapLit:
+        case ExprKind::ListComp:
+        case ExprKind::SetComp:
+        case ExprKind::MapComp:
+        case ExprKind::Binary: // every binop builds a new value in this runtime
+        case ExprKind::Unary:
+            return true;
+        case ExprKind::BoolOp: // may yield either operand unchanged
+            return is_fresh(e->a.get()) && is_fresh(e->b.get());
+        case ExprKind::IfExp:
+            return is_fresh(e->a.get()) && is_fresh(e->c.get());
+        case ExprKind::Call: {
+            const Expr* callee = e->a.get();
+            if (callee && callee->res == Res::BuiltinFunc) {
+                switch (callee->res_idx) { // builtins that never return an argument
+                case KB_STR: case KB_CHR: case KB_FORMAT: case KB_INPUT:
+                case KB_BIN: case KB_HEX: case KB_OCT: case KB_LEN:
+                case KB_ORD: case KB_INT: case KB_FLOAT: case KB_BOOL:
+                case KB_ABS: case KB_ROUND:
+                    return true;
+                default: return false; // max(a, b) returns an operand, ...
+                }
+            }
+            return false; // user functions may return an argument/global
+        }
+        default: return false; // Name/Index/Slice/Attr/MethodCall/...
+        }
     }
 
     // `retains` = the value produced at this position may be stored beyond
@@ -2093,6 +2159,8 @@ struct AliasScan {
         case ExprKind::MapComp:
             for (auto& cl : e->clauses) {
                 expr(cl.iter.get(), true); // iterated: guard mid-loop mutation
+                for (size_t i = 0; i < cl.tkind.size(); i++)
+                    if (cl.tkind[i] == 1) unsafe.insert(cl.tidx[i]);
                 for (auto& c : cl.conds) expr(c.get(), false);
             }
             expr(e->a.get(), true);
@@ -2120,6 +2188,20 @@ struct AliasScan {
             return;
         case StmtKind::Assign:
             expr(s->e1.get(), true);
+            if (s->target_res == Res::Local) {
+                if (!is_fresh(s->e1.get())) unsafe.insert(s->target_idx);
+                switch (s->e1->kind) { // slots that ever hold a fresh container
+                case ExprKind::ListLit:
+                case ExprKind::SetLit:
+                case ExprKind::MapLit:
+                case ExprKind::ListComp:
+                case ExprKind::SetComp:
+                case ExprKind::MapComp:
+                    container_slots.insert(s->target_idx);
+                    break;
+                default: break;
+                }
+            }
             return;
         case StmtKind::IndexAssign:
             expr(s->e1.get(), false);
@@ -2131,7 +2213,12 @@ struct AliasScan {
             expr(s->e3.get(), true);
             return;
         case StmtKind::MultiAssign:
-            for (auto& t : s->targets) expr(t.get(), false);
+            for (auto& t : s->targets) {
+                expr(t.get(), false);
+                // unpacked values are shared elements of the RHS sequence
+                if (t->kind == ExprKind::Name && t->res == Res::Local)
+                    unsafe.insert(t->res_idx);
+            }
             for (auto& v : s->values) expr(v.get(), true);
             return;
         case StmtKind::If:
@@ -2142,6 +2229,10 @@ struct AliasScan {
             return;
         case StmtKind::For:
             expr(s->e1.get(), true); // iterated: guard mid-loop mutation
+            // loop variables receive shared elements of the sequence
+            if (s->target_res == Res::Local) unsafe.insert(s->target_idx);
+            for (size_t i = 0; i < s->multi_tkind.size(); i++)
+                if (s->multi_tkind[i] == 1) unsafe.insert(s->multi_tidx[i]);
             stmts(s->body);
             stmts(s->orelse);
             return;
@@ -2163,6 +2254,7 @@ struct AliasScan {
             return;
         case StmtKind::With:
             expr(s->e1.get(), true);
+            if (s->target_res == Res::Local) unsafe.insert(s->target_idx);
             stmts(s->body);
             return;
         case StmtKind::Del:
@@ -2185,6 +2277,14 @@ struct AliasScan {
                 v->a->res == Res::Local && v->a->res_idx == s->target_idx &&
                 s->target_idx >= first_nonparam && !unsafe.count(s->target_idx))
                 s->str_iadd = true;
+            // Escape analysis, part II.2: overwriting an unaliased local that
+            // holds a fresh container — the old list/dict/set is provably dead,
+            // so its memory can be handed straight back to the allocator
+            // (kami_free_hint) instead of waiting for a GC cycle.
+            else if (s->target_res == Res::Local && s->target_idx >= first_nonparam &&
+                     !unsafe.count(s->target_idx) &&
+                     container_slots.count(s->target_idx))
+                s->free_hint = true;
             return;
         }
         case StmtKind::If:

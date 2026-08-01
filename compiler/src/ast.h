@@ -143,6 +143,9 @@ struct Stmt {
     // Assign `s = s + x` where sema's alias analysis proved `s` has no live
     // aliases: codegen emits an in-place buffer append (kami_str_iadd).
     bool str_iadd = false;
+    // Assign overwriting an unaliased local holding a fresh container: the
+    // old object is dead — recycle its memory (kami_free_hint).
+    bool free_hint = false;
     uint8_t sty = TY_ANY; // For: static type of the loop variable (typeinf.cpp)
 };
 

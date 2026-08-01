@@ -720,8 +720,8 @@ void kami_map_merge(KamiValue* dst, const KamiValue* src) {
     }
 }
 
-void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
-                 int64_t nargs) {
+static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
+                        int64_t nargs, KamiMap* kwmap) {
     KamiFn user_fn = nullptr;
     KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
@@ -732,6 +732,8 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
         std::unique_lock<std::recursive_mutex> lk(g_lock);
         KamiValue o = *obj;
         std::string m = name;
+        if (kwmap && kwmap->count && o.tag != KT_OBJECT && o.tag != KT_CLASS)
+            panic(m + "() does not accept keyword arguments");
         if (o.tag == KT_PYOBJ) { // bridged CPython object: dispatch through the C-API
             pyobj_method(out, obj, m, argv, nargs);
             return;
@@ -1451,7 +1453,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             int64_t k = 0;
             if (bound) argv1[k++] = obj;
             for (int64_t i = 0; i < nargs && k < 19; i++) argv1[k++] = argv[i];
-            user_nargs = prep_user_argv(fo, argv1, k, nullptr, argv2, packed);
+            user_nargs = prep_user_argv(fo, argv1, k, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
         } else if (o.tag == KT_CLASS) {
@@ -1461,7 +1463,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             if (!mv || mv->tag != KT_FUNC)
                 panic(std::string("class '") + c->name + "' has no method '" + m + "'");
             KamiFuncObj* fo = (KamiFuncObj*)mv->p;
-            user_nargs = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
+            user_nargs = prep_user_argv(fo, argv, nargs, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
         }
@@ -1471,6 +1473,29 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
     }
     // Invoke user method WITHOUT holding the lock.
     user_fn(out, argv2, user_nargs, user_caps);
+}
+
+void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
+                 int64_t nargs) {
+    method_impl(out, obj, name, argv, nargs, nullptr);
+}
+
+// obj.m(*args, **kwargs): expand the packed positional list and forward the
+// keyword dict into the normal method dispatch.
+void kami_method_star(KamiValue* out, KamiValue* obj, const char* name,
+                      const KamiValue* pos, const KamiValue* kw) {
+    if (pos->tag != KT_LIST) panic("argument after * must be an iterable");
+    if (kw->tag != KT_MAP) panic("argument after ** must be a mapping");
+    std::vector<KamiValue> vals;
+    {
+        Lock lk(g_lock);
+        KamiList* l = (KamiList*)pos->p;
+        vals.assign(l->items, l->items + l->len);
+    }
+    PinGuard pinv(vals.data(), (int64_t)vals.size());
+    std::vector<KamiValue*> argv(vals.size());
+    for (size_t i = 0; i < vals.size(); i++) argv[i] = &vals[i];
+    method_impl(out, obj, name, argv.data(), (int64_t)vals.size(), (KamiMap*)kw->p);
 }
 
 } // extern "C"
