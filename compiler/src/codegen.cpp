@@ -62,7 +62,9 @@ struct StrTable {
 
 static bool stmts_have_try(const std::vector<StmtPtr>& body);
 static bool stmt_has_try(const Stmt* s) {
-    if (s->kind == StmtKind::Try) return true;
+    // `with` bodies are outlined exactly like try bodies: a `return` inside
+    // either propagates through the spill slot, so both must reserve it.
+    if (s->kind == StmtKind::Try || s->kind == StmtKind::With) return true;
     if (stmts_have_try(s->body) || stmts_have_try(s->orelse) ||
         stmts_have_try(s->final_body))
         return true;

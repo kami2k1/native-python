@@ -402,10 +402,11 @@ struct Sema {
         for (auto& name : avail) list += (list.empty() ? "" : ", ") + name;
         return "unknown module '" + modname + "'\n" +
                "  available: " + list + "\n" +
-               "  to use a pure-Python package, put its source (" + modname +
-               ".py, or " + modname + "/__init__.py) next to your input file and it "
-               "will be compiled in ('kamipy paths' lists every directory searched, "
-               "including the auto-discovered Python installations);\n"
+               "  kamipy compiles pure-Python stdlib modules directly from the Python "
+               "installations on this machine ('kamipy paths' lists every directory "
+               "searched); this module was either not found there or uses features the "
+               "compiler cannot translate yet — the warnings above say exactly what was "
+               "rejected (re-run with -v for the full import trace);\n"
                "  packages that need a CPython C extension (pyautogui, numpy, PIL, "
                "flask, ...) cannot be compiled ahead of time yet.";
     }

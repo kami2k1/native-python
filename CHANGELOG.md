@@ -4,6 +4,29 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## v0.8.0 — Generators (yield) + concurrent.futures thẳng từ Python env / Generators + concurrent.futures compiled from the system Python source
+
+**Nguyên tắc / principle:** không viết thêm file lib `.py` nào — compiler tự tìm, tự đọc, tự build source thật của CPython trên máy (`kamipy paths`). / No hand-written `.py` shims: the compiler locates, reads and compiles the real CPython sources from the discovered installation.
+
+### Generators — fiber-backed, GC-safe
+- **`yield` / `yield from` / `send()` / `close()` / `next(g[, default])` / `iter()`**: mỗi generator là một *fiber* (Windows fibers / POSIX `ucontext`): thân hàm suspend bằng một context switch, không cần biến đổi state-machine trong codegen — `yield` hoạt động trong loop, `try/finally`, `with`, cả trong outlined try-bodies.
+- Mỗi generator có **FrameStack riêng đăng ký với GC**: frame đang suspend vẫn là GC roots; generator bị bỏ rơi được sweep thu hồi (stack fiber được giải phóng).
+- `for` lặp **lazy** qua generator (`kami_iter_cond/get` kéo từng phần tử); `list/sorted/sum/min/max/any/all/zip/...` drain generator **không giữ runtime lock** (thân generator là user code có thể block).
+- Generator function được cờ `KFN_GENERATOR`: direct call, dynamic call, method call, closure call đều tạo generator object lazily. `g.__next__` đọc như value → bound callable (`itertools.count().__next__`).
+- `itertools.count()` trong pylib giờ là generator vô hạn thật (CPython viết itertools bằng C — không có source .py để dịch).
+
+### concurrent.futures từ source thật / from the real source
+`import concurrent.futures` biên dịch `__init__.py`, `_base.py`, `thread.py` (+ `queue.py`, `heapq.py`) **từ chính bản Python cài trên máy**; `ThreadPoolExecutor`, `submit`, `as_completed`, `wait`, `Executor.map`, exception qua Future đều chạy native (test: `tests/integration/feat_concurrent_futures.py`).
+
+- **Bundler**: relative imports (`from .mod import X`) resolve theo package; PEP 562 lazy `__getattr__` loaders được hoist thành guarded eager imports; **re-exports** của package (`concurrent.futures.Future` → `_base.Future`) được ghi lại; **probe khả-biên-dịch transitive** — package có submodule không dịch được (json.encoder) sẽ fall back ứng viên kế tiếp thay vì vỡ giữa chừng; cycle lành tính trong package được phép.
+- **Ngôn ngữ/sema**: `super().m()` (đơn kế thừa); base class dạng dotted (`class TPE(_base.Executor)`); exception classes (`class E(Exception)`) — instance mang message `"E: msg"`, raise/str như CPython; `a, b = s = expr`; class định nghĩa trong `try/except` ở module level; `hasattr(module, 'x')` fold lúc compile; kwargs trên dynamic receiver → `kami_method_star`; `threading.Thread(target=..., args=...)`.
+- **KT_MISSING**: dynamic call điền default cho keyword-only params đứng sau `*args` ngay trong prologue của callee (`Executor.map(self, fn, *iterables, timeout=None)`).
+- **Native runtime** (C++ — chỉ cho module CPython tự viết bằng C): `collections.namedtuple`/`deque`; `threading.Condition/Event/Semaphore` (block có nhả GIL), `threading.Thread` object (`start/join/is_alive`), `threading._register_atexit` (chạy trước khi join lúc shutdown); `weakref.ref`/`WeakKeyDictionary` (degrade thành strong ref); builtins mới `next iter hasattr getattr id object()`, `min/max(key=, default=)`, `zip(*iterables)`, `set.update(iterable)`, bound methods, identity hash cho thread/object/lock.
+- **Sửa lỗi codegen quan trọng**: `return` bên trong `with` dùng spill slot chưa được cấp (`getelementptr %frame, -1` — UB, LLVM misoptimize → segfault ngẫu nhiên); outlined try/with bodies giờ nhận `%captures` (closure trong try).
+- Thông báo lỗi import không còn khuyên "đặt file .py cạnh input" — chỉ dẫn `kamipy paths` / `-v` để xem trace.
+
+---
+
 ## v0.3.0 — Python 3.12 syntax, native-speed optimizer, self-contained toolchain
 
 ### Phần I — Tương thích cú pháp & CPython C-API
