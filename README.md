@@ -23,7 +23,7 @@ $ ldd app          # no libpython — only libc/libm/libstdc++
 
 ## Build / Cài đặt
 
-Requirements / Yêu cầu: CMake ≥ 3.20, a C++20 compiler, and `clang++` (LLVM ≥ 15) on `PATH` (used as the LLVM backend + linker driver).
+Requirements / Yêu cầu: CMake ≥ 3.20 and a C++20 compiler. With the LLVM + LLD dev libraries installed (`llvm-18-dev liblld-18-dev` — auto-discovered), kamipy embeds the **LLVM TargetMachine backend + LLD linker**: compiled programs are built **without any external toolchain** (no clang/gcc/ld needed on the user machine). Without them, `clang++` on `PATH` is used as a fallback.
 
 **Windows (Visual Studio Community):** xem hướng dẫn chi tiết / see the full guide — [docs/vi/BUILD_WINDOWS.md](docs/vi/BUILD_WINDOWS.md) · [docs/en/BUILD_WINDOWS.md](docs/en/BUILD_WINDOWS.md)
 
@@ -58,7 +58,7 @@ kamipy clean                # xóa .kamipy-cache
 | Strings | **f-strings** (`{x:.2f}`, `{x = }`), triple-quoted docstrings, raw strings, slicing `s[::-1]`, 20+ methods |
 | Operators | số học + so sánh chuỗi hoá (`0 <= i < n`) + logic + **bitwise `& \| ^ ~ << >>`** + `**` + augmented |
 | Control flow | `if/elif/else`, `while`, `for` (đa target unpack), `break/continue`, ternary, inline body |
-| Functions | `def` với **kwargs + default params**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
+| Functions | `def` với **kwargs + default params + `*args`/`**kwargs` + keyword-only params**, call-site unpacking `f(*a, **k)`, recursion, **lambda (kể cả default params/`*args`), nested functions/closures, decorators**, functions as values, `global` |
 | Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post **native**: socket + TLS — WinHTTP/OpenSSL, proxy + redirect + chunked, không gọi process ngoài), **`json`** (loads/dumps) |
@@ -76,15 +76,23 @@ kamipy clean                # xóa .kamipy-cache
 
 **Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary. TCP socket server+client qua thread. Xem `docs`/CHANGELOG.
 
-Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, `*args/**kwargs`, walrus `:=`, `@staticmethod/@property`, relative imports, `nonlocal`, `numpy` và third-party modules khác.
+**Performance / Hiệu năng (v0.3):** type inference + unboxing phát sinh LLVM IR nguyên thủy (`i64`/`double` trên CPU registers), **monomorphization** (`@n_` specializations, kể cả **speculative + runtime guard** cho hàm bị truyền như value), escape/alias analysis cho **in-place string append** (amortized O(1), `KamiString` có `capacity` tăng gấp đôi). Xem `python3 build/run_benchmark.py`.
+
+**CPython C extensions / C-API bridge:** `import _hashlib | _ssl | _sqlite3 | zlib | ...` nạp **libpython3.x thật** lúc runtime (dlopen + stable C-API) và để chính CPython link file `.so`/`.pyd` gốc — không viết lại C++. Mở rộng whitelist bằng `KAMIPY_PYEXT=mod1,mod2`.
+
+Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, walrus `:=`, `@staticmethod/@property`, `nonlocal`, `numpy` và third-party modules khác.
 
 ## How it works / Cách hoạt động
 
 ```
 main.py → Lexer (INDENT/DEDENT) → Parser (recursive descent + Pratt) → AST
-       → Semantic analysis (scopes, name resolution, arity, constant folding)
-       → LLVM IR (.ll) → clang/LLVM -O2 → object code → link with libkamirt.a
-       → native executable (ELF/PE)
+       → Semantic analysis (scopes, name resolution, arity, constant folding,
+         escape/alias analysis)
+       → Type inference + monomorphization (typeinf.cpp: unboxed i64/double,
+         @n_ native specializations, speculative guards)
+       → LLVM IR → embedded llvm::TargetMachine -O2 → object code in memory
+       → embedded lld::elf/coff link with libkamirt.a → native executable (ELF/PE)
+       (fallback: external clang++ when built without the LLVM libraries)
 ```
 
 Chi tiết: [docs/vi/ARCHITECTURE.md](docs/vi/ARCHITECTURE.md) · Details: [docs/en/ARCHITECTURE.md](docs/en/ARCHITECTURE.md)
@@ -92,6 +100,16 @@ Chi tiết: [docs/vi/ARCHITECTURE.md](docs/vi/ARCHITECTURE.md) · Details: [docs
 Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 
 ## Benchmarks (Linux x64, LLVM 18)
+
+`python3 build/run_benchmark.py` — same algorithms in KamiPython, Go 1.24 and CPython 3.11:
+
+| Benchmark | KamiPython | Go 1.24 | CPython 3.11 | vs Go | vs CPython |
+|---|---|---|---|---|---|
+| integer_loop (1e8, mod chain) | **0.53 s** | 0.37 s | 5.46 s | 0.69x | **10.3x** |
+| math (1e8 float ops) | **0.56 s** | 0.58 s | 5.88 s | **1.03x** | **10.5x** |
+| recursion fib(32) | **6.4 ms** | 16.5 ms | 298 ms | **2.57x** | **46.5x** |
+| string_test (1M `+=`) | **44 ms** | 8 ms (strings.Builder) | 44 ms | 0.18x | 1.0x |
+
 
 | Metric | KamiPython | C++ (-O2) | CPython 3.11 | Target |
 |---|---|---|---|---|

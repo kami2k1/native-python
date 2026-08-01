@@ -4,6 +4,32 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## v0.3.0 — Python 3.12 syntax, native-speed optimizer, self-contained toolchain
+
+### Phần I — Tương thích cú pháp & CPython C-API
+- **`*args` / `**kwargs` / keyword-only params**: `def f(a, b=1, *args, c=2, **kw)` đầy đủ; tuple/dict đóng gói nằm ở local slot ngay sau tham số cố định (sema đóng gói cho direct call, `prep_user_argv` đóng gói cho dynamic call). Call-site unpacking `f(*a, **k)` → `kami_call_star` khớp keyword bằng tên tham số lưu trong function object.
+- **Lambda default parameters**: `lambda a, b=10, *rest: ...` — default + star params trong lambda.
+- **CPython C-API bridge** (`runtime/src/pycapi.cpp`): `import _hashlib | _ssl | _sqlite3 | zlib | ...` dlopen **libpython3.x thật** (stable C-API resolve bằng dlsym: `PyTuple_New`, `PyDict_SetItem`, `PyImport_ImportModule`, …), CPython tự nạp & link `.so`/`.pyd` chính chủ. Kiểu `KT_PYOBJ` mới: attr/call/method/str/truthiness bridge trong suốt, GC sweep trả reference. Chuyển đổi hai chiều int/float/bool/str/bytes/list/tuple/dict + retry str→bytes cho API cần buffer. Mở rộng bằng `KAMIPY_PYEXT=`.
+
+### Phần II — 4 hướng tối ưu hoá (tốc độ ngang Go)
+- **Type inference & unboxing** (`compiler/src/typeinf.cpp`): fixed-point trên lattice int/float/bool/str/none/any; locals join theo assignment, params join theo call sites, return propagate qua đệ quy. Codegen phát `add/fadd/icmp/fcmp` i64/double trực tiếp (literal = plain store, copy primitive inline, `//`/`%`/`/` giữ đúng floor/sign/zero-check semantics của Python), range-loop unboxed không còn `kami_range_cond`/`kami_binop` per-iteration.
+- **Escape/alias analysis** (sema): biến local không có alias sống sót ⇒ tối ưu an toàn; primitives không escape sống hoàn toàn trong registers/stack qua unboxing.
+- **Dynamic string capacity**: `KamiStr` thêm `cap` (geometric growth ×2 như `std::string`), hash lazy; `s += x` trên biến đã chứng minh không alias ⇒ `kami_str_iadd` in-place amortized O(1). 1M append: O(n²) → 44 ms.
+- **Monomorphization + speculative guards**: hàm có params/locals/ret primitive và thân trong native subset ⇒ specialization `@n_<alias>(i64/double,…)` chạy thuần thanh ghi; call site match gọi thẳng. Hàm bị escape (truyền như value) ⇒ **speculative signature + runtime tag guard** trong `u_<alias>`: khớp thì vào `@n_`, không khớp rơi về thân boxed generic (đúng ngữ nghĩa mọi trường hợp).
+- **Benchmark** (`benchmarks/run_benchmark.py`, copy vào `build/`): integer_loop 0.69x Go / 10.3x CPython; math 1.03x Go; fib(32) **2.57x nhanh hơn Go** / 46.5x CPython; string_test 1.0x CPython.
+
+### Phần III — Nhúng LLVM/LLD (loại bỏ phụ thuộc clang)
+- `compiler/src/native_backend.cpp`: parse + optimize IR in-process (PassBuilder O0–O3), phát `.o` trực tiếp từ `llvm::TargetMachine`, link bằng `lld::elf::link` (Linux) / `lld::coff::link` (Windows) — tự dò CRT startup files + system lib paths. `kamipy build main.py` chạy trên máy **không có clang/gcc/ld**. `KAMIPY_CXX` ép dùng toolchain ngoài; build không có LLVM dev libs tự fallback.
+- CMake tự dò LLVM/LLD (kể cả đường dẫn versioned của Debian/Ubuntu); CI cài `llvm-18-dev liblld-18-dev`.
+
+### Fixes
+- Khôi phục `netio.cpp`/`http_client.cpp`/`kami_regex.cpp` bị xoá trong khi `ops.cpp` vẫn tham chiếu (main không link được — 48/48 test fail ⇒ xanh trở lại).
+- `PinGuard`: GC root tạm thời an toàn với exception.
+
+Tests: 51 integration + 3 unit suites, tất cả PASS. Benchmarks chạy bằng `python3 build/run_benchmark.py`.
+
+---
+
 ## [v0.6.0] — 2026-08-01 — Tự động tìm Python hệ thống + gắn kết C-ABI (C extensions, ctypes/cffi)
 
 Trước bản này, `import X` chỉ tìm được `X.py` cạnh file input hoặc trong `runtime/pylib/`
