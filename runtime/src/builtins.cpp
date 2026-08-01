@@ -720,36 +720,26 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     case KB_ENUMERATE: {
-        check_arity(nargs, 1, 1, "enumerate");
-        KamiValue* v = argv[0];
-        KamiList* r = list_new(4);
+        check_arity(nargs, 1, 2, "enumerate");
+        int64_t start = nargs == 2 ? arg_int(argv[1], "enumerate") : 0;
+        KamiValue seqv;
+        as_list_pinned(&seqv, argv[0]); // any iterable → list
+        KamiList* l = (KamiList*)seqv.p;
+        KamiList* r = list_new(l->len > 4 ? l->len : 4);
         out->tag = KT_LIST;
         out->p = r;
-        auto push_pair = [&](int64_t i, const KamiValue* item) {
+        for (int64_t i = 0; i < l->len; i++) {
             KamiList* pair = list_new(2);
             pair->items[0].tag = KT_INT;
-            pair->items[0].i = i;
-            pair->items[1] = *item;
+            pair->items[0].i = start + i;
+            pair->items[1] = l->items[i];
             pair->len = 2;
             KamiValue pv;
             pv.tag = KT_LIST;
             pv.p = pair;
             list_push(r, &pv);
-        };
-        if (v->tag == KT_LIST) {
-            KamiList* l = (KamiList*)v->p;
-            for (int64_t i = 0; i < l->len; i++) push_pair(i, &l->items[i]);
-        } else if (v->tag == KT_STR) {
-            KamiStr* s = (KamiStr*)v->p;
-            for (int64_t i = 0; i < s->len; i++) {
-                KamiValue ch;
-                ch.tag = KT_STR;
-                ch.p = str_new(s->data + i, 1);
-                push_pair(i, &ch);
-            }
-        } else {
-            panic("enumerate() expected a list or str");
         }
+        unpin_scratch(&seqv);
         return;
     }
     case KB_ZIP: {
@@ -816,7 +806,24 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     case KB_POW: {
-        check_arity(nargs, 2, 2, "pow");
+        check_arity(nargs, 2, 3, "pow");
+        if (nargs == 3) {
+            // pow(base, exp, mod) — integer modular exponentiation.
+            int64_t base = arg_int(argv[0], "pow");
+            int64_t e = arg_int(argv[1], "pow");
+            int64_t mod = arg_int(argv[2], "pow");
+            if (mod == 0) panic("pow() 3rd argument cannot be 0");
+            if (e < 0) panic("pow() negative exponent with modulus not supported");
+            int64_t result = 1 % mod;
+            int64_t b = ((base % mod) + mod) % mod;
+            while (e > 0) {
+                if (e & 1) result = (int64_t)(((__int128)result * b) % mod);
+                b = (int64_t)(((__int128)b * b) % mod);
+                e >>= 1;
+            }
+            set_int(out, result);
+            return;
+        }
         kami_binop(KOP_POW, out, argv[0], argv[1]);
         return;
     }

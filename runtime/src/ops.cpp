@@ -390,9 +390,24 @@ void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
     KamiValue v = *seq;
     switch (v.tag) {
     case KT_LIST:
-    case KT_STR:
         *out = v;
         return;
+    case KT_STR: {
+        // Materialize into a list of 1-char strings. Callers (for-loops via
+        // kami_iter_cond/get, and as_list_pinned in builtins) all treat the
+        // result as a list, so a bare KT_STR here would be misread as a
+        // KamiList* and crash.
+        KamiStr* s = (KamiStr*)v.p;
+        KamiList* r = list_new(s->len > 0 ? s->len : 1);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < s->len; i++) {
+            KamiValue ch{KT_STR, {0}};
+            ch.p = str_new(s->data + i, 1);
+            r->items[r->len++] = ch;
+        }
+        return;
+    }
     case KT_MAP:
     case KT_SET: {
         KamiMap* m = (KamiMap*)v.p;

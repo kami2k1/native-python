@@ -9,6 +9,42 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 Theo đúng triết lý "dịch cả thư viện, không gọi process ngoài": `requests` được viết lại
 từ tầng socket ngay trong runtime — hết mọi phụ thuộc curl.
 
+### Added — thư viện chuẩn viết bằng Python, bundle khi import (`runtime/pylib/`)
+Đúng tinh thần "dịch cả thư viện, không code ở tầng C++": các module stdlib thuần thuật
+toán được viết bằng **Python thật** trong `runtime/pylib/`, ship cạnh binary `kamipy`, và
+được chính pipeline compile khi chương trình `import`.
+- `itertools`: count, repeat, chain, accumulate, combinations, permutations,
+  combinations_with_replacement, product (a,b / repeat=), pairwise, zip_longest, starmap,
+  islice — bản eager (trả list).
+- `functools`: reduce.
+- File `X.py` cục bộ vẫn ưu tiên hơn stdlib bundle (đúng semantics CPython). Đặt biến môi
+  trường `KAMIPY_PYLIB` để trỏ tới thư mục pylib tùy chỉnh.
+
+### Added — mở rộng stdlib native & phương thức
+- **Sequence repetition**: `[0]*n`, `n*[x]`, `"ab"*n` (cả hai chiều toán hạng).
+- **math**: factorial, gcd, isqrt, hypot, log(x, base), log2/log10, atan/asin/acos/atan2,
+  degrees/radians, trunc, isnan/isinf; hằng `tau`, `nan`.
+- **random**: randrange, choice, shuffle, uniform, sample, choices; `seed()` không tham số.
+- **time**: monotonic, perf_counter.
+- **os**: walk, chdir, getpid, urandom; **os.path**: expanduser, splitext, split, isabs;
+  hằng `os.name/sep/linesep`, `sys.maxsize/platform`, `socket.AF_INET/...`,
+  `string.printable/hexdigits/octdigits`.
+- **str**: casefold, swapcase, index, rfind, ljust/rjust/center, removeprefix/removesuffix,
+  isalnum/isnumeric, **`format()`** (`{}`, `{0}`, format spec `{:.2f}` / `{:05d}`).
+- **list.clear**; **set**: union/intersection/difference/symmetric_difference (+ biến thể
+  `_update`), isdisjoint, issubset/issuperset, copy, pop.
+- **int(x, base)** và `int()/float()` chịu được khoảng trắng đầu/cuối.
+
+### Added — cú pháp
+- **for/while ... else** (chạy `else` khi vòng lặp kết thúc không qua `break`).
+- **Ellipsis `...`** (type stub `tuple[int, ...]`, thân stub `def f(): ...`) — mô hình hoá None.
+- **bytes literal `b"..."`** — nhận như str (runtime str lưu byte bất kỳ).
+- **`__file__`** → đường dẫn tuyệt đối của file input.
+- **Relative imports** `from .mod import x` / `from . import mod` → bundle file `.py` cùng thư mục;
+  **`from X import *`** là no-op cho module bundle.
+- **import list nhiều dòng/ngoặc** `from m import (a, b, c)`.
+- `doctest.testmod(verbose=...)` nhận & bỏ qua kwargs.
+
 ### Added — `requests` native (bỏ hẳn curl)
 - **HTTP client viết lại từ tầng socket trong runtime** (`runtime/src/http_client.cpp`) —
   không sinh process ngoài, đúng triết lý "dịch cả thư viện":
@@ -43,10 +79,12 @@ từ tầng socket ngay trong runtime — hết mọi phụ thuộc curl.
 
 ### Verification (v0.5.1)
 - Integration **PASS toàn bộ** (suite mới: `feat_requests_native` — HTTP server viết bằng
-  KamiPython phục vụ chính client `requests` native; `feat_default_exprs` — byte-identical
-  CPython 3.11).
+  KamiPython phục vụ chính client `requests` native; `feat_default_exprs`, `feat_stdlib2`,
+  `feat_syntax2`, `feat_pylib` — byte-identical CPython 3.11).
 - `requests` native kiểm chứng thật: GET/POST + JSON echo + chunked + redirect qua server
   local; **HTTPS thật tới example.com** (TLS verify, status 200) và qua proxy CONNECT tunnel.
+- Corpus 2.182 file GitHub: build **1059 → ~1190**, chạy **748 → ~900** (đo bằng
+  `tools/corpus_survey.sh`).
 
 ---
 

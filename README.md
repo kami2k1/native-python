@@ -63,8 +63,8 @@ kamipy clean                # xóa .kamipy-cache
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post **native**: socket + TLS — WinHTTP/OpenSSL, proxy + redirect + chunked, không gọi process ngoài), **`json`** (loads/dumps) |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
-| Modules | `math time random threading sys os os.path json logging socket requests re string doctest`; `re` = self-written regex engine (match/search/findall/sub/split, groups); no-op `typing`/`__future__` |
-| Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
+| Modules | native: `math time random threading sys os os.path json logging socket requests re string doctest`; **bundled Python stdlib** (`runtime/pylib/`): `itertools functools`; no-op `typing`/`__future__` |
+| Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`, relative `from .mod import x`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
 | Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
 | Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |
