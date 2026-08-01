@@ -1035,26 +1035,39 @@ struct FnGen {
                        std::string* out_end, std::function<void()> on_normal_exit = {}) {
         bool is_range = iter->kind == ExprKind::Call &&
                         iter->a->res == Res::BuiltinFunc && iter->a->res_idx == KB_RANGE;
-        // fully unboxed counting loop when every bound is statically int
-        bool unboxed = is_range;
-        if (is_range)
-            for (auto& a : iter->args)
-                if (!intlike(a->sty)) unboxed = false;
-        if (unboxed) {
+        // Range loops always run unboxed: bounds whose static type is unknown
+        // get a one-time tag check before the loop (range() would reject
+        // non-integers at runtime anyway), then the induction variable lives
+        // as a raw i64 — no runtime calls per iteration.
+        if (is_range) {
             const auto& args = iter->args;
             int s_i = alloc_temp();
             std::string vstart, vstop, vstep;
             {
                 int save = temp_top;
+                auto checked_load = [&](const Expr* a) {
+                    int slot = gen_expr(a);
+                    if (!intlike(a->sty)) { // dynamic: verify the tag once
+                        std::string tag = r();
+                        emit(tag + " = load i64, ptr " + slot_ptr(slot) + ", align 8");
+                        std::string t1 = r(), t2 = r(), ok = r(), bad = r();
+                        emit(t1 + " = icmp eq i64 " + tag + ", 2");
+                        emit(t2 + " = icmp eq i64 " + tag + ", 1");
+                        emit(ok + " = or i1 " + t1 + ", " + t2);
+                        emit(bad + " = xor i1 " + ok + ", true");
+                        panic_block("range() arguments must be integers", bad);
+                    }
+                    return load_i64(slot);
+                };
                 if (args.size() == 1) {
                     vstart = "0";
-                    vstop = load_i64(gen_expr(args[0].get()));
+                    vstop = checked_load(args[0].get());
                 } else {
-                    vstart = load_i64(gen_expr(args[0].get()));
-                    vstop = load_i64(gen_expr(args[1].get()));
+                    vstart = checked_load(args[0].get());
+                    vstop = checked_load(args[1].get());
                 }
                 if (args.size() == 3) {
-                    vstep = load_i64(gen_expr(args[2].get()));
+                    vstep = checked_load(args[2].get());
                     std::string z = r();
                     emit(z + " = icmp eq i64 " + vstep + ", 0");
                     panic_block("range() step must not be zero", z);
@@ -1098,52 +1111,6 @@ struct FnGen {
             emit("br label %" + Lcond);
             C().terminated = true;
             start_block(Lelse);
-            if (on_normal_exit) on_normal_exit();
-            if (!C().terminated) emit("br label %" + Lend);
-            C().terminated = true;
-            start_block(Lend);
-            return;
-        }
-        if (is_range) {
-            const auto& args = iter->args;
-            int s_start, s_stop, s_step;
-            if (args.size() == 1) {
-                s_start = alloc_temp();
-                emit("call void @kami_make_int(ptr " + slot_ptr(s_start) + ", i64 0)");
-                s_stop = gen_expr(args[0].get());
-            } else {
-                s_start = gen_expr(args[0].get());
-                s_stop = gen_expr(args[1].get());
-            }
-            if (args.size() == 3) {
-                s_step = gen_expr(args[2].get());
-            } else {
-                s_step = alloc_temp();
-                emit("call void @kami_make_int(ptr " + slot_ptr(s_step) + ", i64 1)");
-            }
-            int s_i = alloc_temp();
-            emit("call void @kami_copy(ptr " + slot_ptr(s_i) + ", ptr " + slot_ptr(s_start) +
-                 ")");
-            std::string Lcond = newlabel(), Lbody = newlabel(), Lstep = newlabel(),
-                        Lelse = newlabel(), Lend = newlabel();
-            if (out_step) *out_step = Lstep;
-            if (out_end) *out_end = Lend;
-            start_block(Lcond);
-            std::string c = r();
-            emit(c + " = call i32 @kami_range_cond(ptr " + slot_ptr(s_i) + ", ptr " +
-                 slot_ptr(s_stop) + ", ptr " + slot_ptr(s_step) + ")");
-            std::string b = r();
-            emit(b + " = icmp ne i32 " + c + ", 0");
-            emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lelse);
-            C().terminated = true;
-            start_block(Lbody);
-            body(s_i);
-            start_block(Lstep);
-            emit("call void @kami_binop(i64 " + std::to_string((int)KOP_ADD) + ", ptr " +
-                 slot_ptr(s_i) + ", ptr " + slot_ptr(s_i) + ", ptr " + slot_ptr(s_step) + ")");
-            emit("br label %" + Lcond);
-            C().terminated = true;
-            start_block(Lelse); // normal exit (loop exhausted, not break) → for/else
             if (on_normal_exit) on_normal_exit();
             if (!C().terminated) emit("br label %" + Lend);
             C().terminated = true;
@@ -1299,12 +1266,10 @@ struct FnGen {
         }
         case StmtKind::For: {
             std::string Lstep, Lend;
+            // range loops always produce raw-int elements (see gen_iteration)
             bool int_iter = s->e1->kind == ExprKind::Call &&
                             s->e1->a->res == Res::BuiltinFunc &&
                             s->e1->a->res_idx == KB_RANGE;
-            if (int_iter)
-                for (auto& a : s->e1->args)
-                    if (!intlike(a->sty)) int_iter = false;
             auto body = [&](int elem) {
                 if (s->params.size() == 1) {
                     assign_var(s->target_res, s->target_idx, elem,

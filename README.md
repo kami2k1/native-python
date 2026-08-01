@@ -107,8 +107,8 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 |---|---|---|---|---|---|
 | integer_loop (1e8, mod chain) | **0.53 s** | 0.37 s | 5.46 s | 0.69x | **10.3x** |
 | math (1e8 float ops) | **0.56 s** | 0.58 s | 5.88 s | **1.03x** | **10.5x** |
-| recursion fib(32) | **6.4 ms** | 16.5 ms | 298 ms | **2.57x** | **46.5x** |
-| string_test (1M `+=`) | **44 ms** | 8 ms (strings.Builder) | 44 ms | 0.18x | 1.0x |
+| recursion fib(32) | **6–11 ms** | 12–16 ms | 298 ms | **1.1–2.6x** | **25–46x** |
+| string_test (1M `+=`) | **13–25 ms** | 8 ms (strings.Builder) | 44 ms | ~0.3x | **1.7x** |
 
 
 | Metric | KamiPython | C++ (-O2) | CPython 3.11 | Target |

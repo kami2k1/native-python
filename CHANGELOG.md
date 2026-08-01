@@ -22,6 +22,12 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 - `compiler/src/native_backend.cpp`: parse + optimize IR in-process (PassBuilder O0–O3), phát `.o` trực tiếp từ `llvm::TargetMachine`, link bằng `lld::elf::link` (Linux) / `lld::coff::link` (Windows) — tự dò CRT startup files + system lib paths. `kamipy build main.py` chạy trên máy **không có clang/gcc/ld**. `KAMIPY_CXX` ép dùng toolchain ngoài; build không có LLVM dev libs tự fallback.
 - CMake tự dò LLVM/LLD (kể cả đường dẫn versioned của Debian/Ubuntu); CI cài `llvm-18-dev liblld-18-dev`.
 
+### Follow-up (cùng PR)
+- **Soát lỗi alias quan trọng**: biến nhận giá trị không-fresh (loop var, unpacking, phần tử list, kết quả hàm user, `max()`…) không bao giờ được mutate in-place nữa — trước đó `for s in lst: s += "x"` có thể sửa phần tử list có slack capacity.
+- **II.2 hoàn chỉnh — container recycling**: ghi đè local không-alias đang giữ list/dict/set fresh ⇒ `kami_free_hint` trả header về free-list của allocator (tái dùng tức thì, không tăng áp lực GC; free-list xả sạch mỗi chu kỳ GC để sweep vẫn đúng).
+- **`obj.m(*args, **kwargs)`**: star-unpacking trong method call (bound, unbound, `__init__`), keyword matching qua `prep_user_argv`.
+- **Intern string literals** (theo địa chỉ constant pool — an toàn với iadd vì cap==len) + **range loop luôn unboxed** (tag check một lần trước loop): string_test 44ms → ~13ms.
+
 ### Fixes
 - Khôi phục `netio.cpp`/`http_client.cpp`/`kami_regex.cpp` bị xoá trong khi `ops.cpp` vẫn tham chiếu (main không link được — 48/48 test fail ⇒ xanh trở lại).
 - `PinGuard`: GC root tạm thời an toàn với exception.

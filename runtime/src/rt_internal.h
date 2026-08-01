@@ -146,6 +146,7 @@ struct Lock {
 };
 
 extern std::vector<KamiValue> g_globals;
+extern std::unordered_map<const void*, KamiStr*> g_intern; // interned literals
 extern int64_t g_argc;
 extern char** g_argv;
 extern std::vector<std::pair<KamiValue*, int64_t>> g_pins;

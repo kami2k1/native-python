@@ -194,9 +194,14 @@ void kami_make_float(KamiValue* out, double v) {
 
 void kami_make_str(KamiValue* out, const char* data, int64_t len) {
     Lock lk(g_lock);
-    KamiStr* s = str_new(data, len);
+    // Generated code passes pointers into the constant pool: intern by
+    // address so hot loops don't allocate a fresh object per evaluation.
+    // Safe with kami_str_iadd: interned strings have cap == len, so the
+    // first append always takes the copy-and-grow path.
+    KamiStr*& cached = g_intern[data];
+    if (!cached) cached = str_new(data, len);
     out->tag = KT_STR;
-    out->p = s;
+    out->p = cached;
 }
 
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n) {

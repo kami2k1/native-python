@@ -35,6 +35,11 @@ static uint64_t g_gc_runs = 0;
 // are unreachable, so the sweep reclaims them normally).
 static std::unordered_map<uint64_t, std::vector<ObjHeader*>> g_recycle;
 
+// Interned string literals (kami_make_str is only called with pointers to
+// the module's constant pool, so the data pointer is a stable identity).
+// Values are GC roots: the map is marked during collection.
+std::unordered_map<const void*, KamiStr*> g_intern;
+
 // ---- thread-local frame registration ----
 namespace {
 struct TlsReg {
@@ -123,6 +128,11 @@ void gc_collect() {
     // mark
     std::vector<ObjHeader*> stack;
     for (auto& v : g_globals) mark_value(&v, stack);
+    for (auto& kv : g_intern)
+        if (!kv.second->h.mark) {
+            kv.second->h.mark = 1;
+            stack.push_back(&kv.second->h);
+        }
     for (auto& pin : g_pins)
         for (int64_t i = 0; i < pin.second; i++) mark_value(&pin.first[i], stack);
     for (FrameStack* fs : g_frame_stacks)
