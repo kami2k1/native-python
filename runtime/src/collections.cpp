@@ -93,82 +93,108 @@ bool value_eq(const KamiValue* a, const KamiValue* b) {
 KamiMap* map_new() {
     KamiMap* m = (KamiMap*)gc_alloc(sizeof(KamiMap), KT_MAP);
     m->count = 0;
-    m->cap = 0;
+    m->nentries = 0;
+    m->ecap = 0;
     m->entries = nullptr;
+    m->index = nullptr;
+    m->icap = 0;
     return m;
 }
 
-static void map_grow(KamiMap* m) {
-    int64_t ncap = m->cap ? m->cap * 2 : 8;
-    MapEntry* ne = (MapEntry*)calloc((size_t)ncap, sizeof(MapEntry));
-    if (!ne) panic("out of memory");
-    for (int64_t i = 0; i < m->cap; i++) {
+static void index_rebuild(KamiMap* m, int64_t icap) {
+    free(m->index);
+    m->index = (int64_t*)calloc((size_t)icap, sizeof(int64_t));
+    if (!m->index) panic("out of memory");
+    m->icap = icap;
+    for (int64_t i = 0; i < m->nentries; i++) {
         if (!m->entries[i].used) continue;
-        uint64_t j = m->entries[i].hash & (uint64_t)(ncap - 1);
-        while (ne[j].used) j = (j + 1) & (uint64_t)(ncap - 1);
-        ne[j] = m->entries[i];
+        uint64_t j = m->entries[i].hash & (uint64_t)(icap - 1);
+        while (m->index[j] != 0) j = (j + 1) & (uint64_t)(icap - 1);
+        m->index[j] = i + 1;
     }
-    free(m->entries);
-    m->entries = ne;
-    m->cap = ncap;
-    gc_track_extra((uint64_t)ncap * sizeof(MapEntry));
+}
+
+// Compact away tombstones, preserving insertion order (does not touch index).
+static void map_compact(KamiMap* m) {
+    int64_t w = 0;
+    for (int64_t i = 0; i < m->nentries; i++)
+        if (m->entries[i].used) m->entries[w++] = m->entries[i];
+    m->nentries = w;
 }
 
 void map_set(KamiMap* m, const KamiValue* k, const KamiValue* v) {
-    if (m->cap == 0 || m->count * 4 >= m->cap * 3) map_grow(m);
     uint64_t h = value_hash(k);
-    uint64_t j = h & (uint64_t)(m->cap - 1);
-    while (m->entries[j].used) {
-        if (m->entries[j].hash == h && value_eq(&m->entries[j].key, k)) {
-            m->entries[j].val = *v;
+    if (m->icap == 0) index_rebuild(m, 8);
+    // lookup
+    uint64_t j = h & (uint64_t)(m->icap - 1);
+    while (m->index[j] != 0) {
+        int64_t ei = m->index[j] - 1;
+        if (m->entries[ei].used && m->entries[ei].hash == h &&
+            value_eq(&m->entries[ei].key, k)) {
+            m->entries[ei].val = *v;
             return;
         }
-        j = (j + 1) & (uint64_t)(m->cap - 1);
+        j = (j + 1) & (uint64_t)(m->icap - 1);
     }
-    m->entries[j].used = true;
-    m->entries[j].hash = h;
-    m->entries[j].key = *k;
-    m->entries[j].val = *v;
+    // insert new entry (append)
+    if (m->nentries == m->ecap) {
+        int64_t ncap = m->ecap ? m->ecap * 2 : 8;
+        MapEntry* ne = (MapEntry*)calloc((size_t)ncap, sizeof(MapEntry));
+        if (!ne) panic("out of memory");
+        if (m->entries) memcpy(ne, m->entries, (size_t)m->nentries * sizeof(MapEntry));
+        free(m->entries);
+        m->entries = ne;
+        m->ecap = ncap;
+        gc_track_extra((uint64_t)ncap * sizeof(MapEntry));
+    }
+    int64_t ei = m->nentries++;
+    m->entries[ei].hash = h;
+    m->entries[ei].used = true;
+    m->entries[ei].key = *k;
+    m->entries[ei].val = *v;
     m->count++;
+    // keep the index load factor healthy; rebuild (dropping tombstones) grows
+    // the table and re-inserts every live entry, so no manual slot write needed.
+    if (m->nentries * 4 >= m->icap * 3) {
+        int64_t target = m->icap;
+        while (m->count * 4 >= target * 3) target *= 2;
+        map_compact(m);
+        index_rebuild(m, target);
+        return;
+    }
+    m->index[j] = ei + 1;
 }
 
-bool map_del(KamiMap* m, const KamiValue* k) {
-    if (m->cap == 0) return false;
+bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out) {
+    if (m->icap == 0) return false;
     uint64_t h = value_hash(k);
-    uint64_t j = h & (uint64_t)(m->cap - 1);
-    while (m->entries[j].used) {
-        if (m->entries[j].hash == h && value_eq(&m->entries[j].key, k)) {
-            // rebuild without this entry (open addressing, no tombstones)
-            MapEntry* old = m->entries;
-            int64_t cap = m->cap;
-            m->entries = (MapEntry*)calloc((size_t)cap, sizeof(MapEntry));
-            if (!m->entries) panic("out of memory");
-            m->count = 0;
-            for (int64_t i = 0; i < cap; i++) {
-                if (!old[i].used || i == (int64_t)j) continue;
-                uint64_t p = old[i].hash & (uint64_t)(cap - 1);
-                while (m->entries[p].used) p = (p + 1) & (uint64_t)(cap - 1);
-                m->entries[p] = old[i];
-                m->count++;
-            }
-            free(old);
+    uint64_t j = h & (uint64_t)(m->icap - 1);
+    while (m->index[j] != 0) {
+        int64_t ei = m->index[j] - 1;
+        if (m->entries[ei].used && m->entries[ei].hash == h &&
+            value_eq(&m->entries[ei].key, k)) {
+            *out = m->entries[ei].val;
             return true;
         }
-        j = (j + 1) & (uint64_t)(m->cap - 1);
+        j = (j + 1) & (uint64_t)(m->icap - 1);
     }
     return false;
 }
 
-bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out) {
-    if (m->cap == 0) return false;
+bool map_del(KamiMap* m, const KamiValue* k) {
+    if (m->icap == 0) return false;
     uint64_t h = value_hash(k);
-    uint64_t j = h & (uint64_t)(m->cap - 1);
-    while (m->entries[j].used) {
-        if (m->entries[j].hash == h && value_eq(&m->entries[j].key, k)) {
-            *out = m->entries[j].val;
+    uint64_t j = h & (uint64_t)(m->icap - 1);
+    while (m->index[j] != 0) {
+        int64_t ei = m->index[j] - 1;
+        if (m->entries[ei].used && m->entries[ei].hash == h &&
+            value_eq(&m->entries[ei].key, k)) {
+            m->entries[ei].used = false;
+            m->count--;
+            index_rebuild(m, m->icap); // drop the slot; keep order
             return true;
         }
-        j = (j + 1) & (uint64_t)(m->cap - 1);
+        j = (j + 1) & (uint64_t)(m->icap - 1);
     }
     return false;
 }

@@ -67,7 +67,7 @@ std::string value_str(const KamiValue* v) {
         KamiMap* m = (KamiMap*)v->p;
         std::string out = "{";
         bool first = true;
-        for (int64_t i = 0; i < m->cap; i++) {
+        for (int64_t i = 0; i < m->nentries; i++) {
             if (!m->entries[i].used) continue;
             if (!first) out += ", ";
             first = false;
@@ -82,7 +82,7 @@ std::string value_str(const KamiValue* v) {
         if (m->count == 0) return "set()";
         std::string out = "{";
         bool first = true;
-        for (int64_t i = 0; i < m->cap; i++) {
+        for (int64_t i = 0; i < m->nentries; i++) {
             if (!m->entries[i].used) continue;
             if (!first) out += ", ";
             first = false;

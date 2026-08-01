@@ -59,17 +59,17 @@ kamipy clean                # xóa .kamipy-cache
 | Operators | số học + so sánh chuỗi hoá (`0 <= i < n`) + logic + **bitwise `& \| ^ ~ << >>`** + `**` + augmented |
 | Control flow | `if/elif/else`, `while`, `for` (đa target unpack), `break/continue`, ternary, inline body |
 | Functions | `def` với **kwargs + default params**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
-| Sugar | list comprehension + genexp, **lambda**, **decorators** `@dec`, tuple assignment/swap/unpack, `x = y = 0`, slices, `;`, annotations (ignored) |
+| Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post **native**: socket + TLS — WinHTTP/OpenSSL, proxy + redirect + chunked, không gọi process ngoài), **`json`** (loads/dumps) |
-| Collections | + **`set`** (`{1,2}`, `&\|^-`, add/remove), **`del`**, first-class builtins (`sorted(xs, key=len)`) |
+| Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
 | Modules | `math time random threading sys os os.path json logging socket requests re string doctest`; `re` = self-written regex engine (match/search/findall/sub/split, groups); no-op `typing`/`__future__` |
 | Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
 | Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
 | Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |
 
-**Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1015 build (47%), 748 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
+**Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1059 build (49%), 784 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
 **Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary. TCP socket server+client qua thread. Xem `docs`/CHANGELOG.
 
@@ -123,6 +123,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Lexer / Parser / Sema / Codegen / Linker driver | ✅ implemented + tested |
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
-| Tests | ✅ 2 unit suites + 33 integration programs (threading, GC stress, neural-net XOR, real-world projects, exceptions/classes/f-strings, files/sets, stdlib, sockets, closures/lambda/decorators, regex) |
+| Tests | ✅ 2 unit suites + 37 integration programs (threading, GC stress, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, closures/lambda/decorators, regex, comprehensions, dict-order, unpacking) |
 | CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
 | Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |

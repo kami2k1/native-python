@@ -76,7 +76,7 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
     case KT_MAP:
     case KT_SET: {
         KamiMap* m = (KamiMap*)h;
-        for (int64_t i = 0; i < m->cap; i++) {
+        for (int64_t i = 0; i < m->nentries; i++) {
             if (m->entries[i].used) {
                 mark_value(&m->entries[i].key, stack);
                 mark_value(&m->entries[i].val, stack);
@@ -140,7 +140,12 @@ void gc_collect() {
             switch (h->type) {
             case KT_LIST: free(((KamiList*)h)->items); break;
             case KT_MAP:
-            case KT_SET: free(((KamiMap*)h)->entries); break;
+            case KT_SET: {
+                KamiMap* mm = (KamiMap*)h;
+                free(mm->entries);
+                free(mm->index);
+                break;
+            }
             case KT_FILE: {
                 KamiFile* f = (KamiFile*)h;
                 if (!f->closed && f->fp) fclose((FILE*)f->fp);

@@ -317,22 +317,35 @@ struct Parser {
             throw CompileError(call->line, "too many arguments (max 16)");
     }
 
+    // Parse one or more 'for ... in ... [if ...]' clauses into `clauses`.
+    void parse_comp_clauses(std::vector<CompClause>& clauses) {
+        while (check(Tok::KW_FOR)) {
+            advance();
+            CompClause cl;
+            // targets: NAME [, NAME]*  or  ( NAME [, NAME]* )
+            bool paren = match(Tok::LPAREN);
+            cl.targets.push_back(expect(Tok::NAME, "comprehension target").text);
+            while (match(Tok::COMMA)) {
+                if (paren && check(Tok::RPAREN)) break;
+                cl.targets.push_back(expect(Tok::NAME, "comprehension target").text);
+            }
+            if (paren) expect(Tok::RPAREN, "')'");
+            expect(Tok::KW_IN, "'in'");
+            cl.iter = parse_or();
+            while (check(Tok::KW_IF)) {
+                advance();
+                cl.conds.push_back(parse_or());
+            }
+            clauses.push_back(std::move(cl));
+        }
+    }
+
     ExprPtr parse_comprehension_tail(ExprPtr element) {
-        int line = advance().line; // 'for'
         auto e = std::make_unique<Expr>();
         e->kind = ExprKind::ListComp;
-        e->line = line;
+        e->line = peek().line;
         e->a = std::move(element);
-        e->params.push_back(expect(Tok::NAME, "comprehension target").text);
-        while (match(Tok::COMMA))
-            e->params.push_back(expect(Tok::NAME, "comprehension target").text);
-        expect(Tok::KW_IN, "'in'");
-        e->b = parse_or();
-        if (check(Tok::KW_IF)) {
-            advance();
-            e->c = parse_or();
-        }
-        if (check(Tok::KW_FOR)) err("nested comprehensions are not supported");
+        parse_comp_clauses(e->clauses);
         return e;
     }
 
@@ -414,6 +427,18 @@ struct Parser {
             }
         }
         return e;
+    }
+
+    ExprPtr parse_starred_or_expr() {
+        if (check(Tok::STAR)) {
+            int line = advance().line;
+            auto e = std::make_unique<Expr>();
+            e->kind = ExprKind::Starred;
+            e->line = line;
+            e->a = parse_expr();
+            return e;
+        }
+        return parse_expr();
     }
 
     ExprPtr parse_atom() {
@@ -513,8 +538,10 @@ struct Parser {
                 advance();
                 return e;
             }
-            ExprPtr first = parse_expr();
+            ExprPtr first = parse_starred_or_expr();
             if (check(Tok::KW_FOR)) {
+                if (first->kind == ExprKind::Starred)
+                    err("cannot use * in a comprehension element");
                 ExprPtr comp = parse_comprehension_tail(std::move(first));
                 expect(Tok::RBRACKET, "']'");
                 return comp;
@@ -522,7 +549,7 @@ struct Parser {
             e->args.push_back(std::move(first));
             while (match(Tok::COMMA)) {
                 if (check(Tok::RBRACKET)) break;
-                e->args.push_back(parse_expr());
+                e->args.push_back(parse_starred_or_expr());
             }
             expect(Tok::RBRACKET, "']'");
             return e;
@@ -537,13 +564,21 @@ struct Parser {
                 return e;
             }
             ExprPtr first = parse_expr();
-            if (check(Tok::COLON)) { // dict
+            if (check(Tok::COLON)) { // dict or dict-comprehension
+                advance();
+                ExprPtr v = parse_expr();
+                if (check(Tok::KW_FOR)) {
+                    auto e = std::make_unique<Expr>();
+                    e->kind = ExprKind::MapComp;
+                    e->line = line;
+                    e->pairs.emplace_back(std::move(first), std::move(v));
+                    parse_comp_clauses(e->clauses);
+                    expect(Tok::RBRACE, "'}'");
+                    return e;
+                }
                 auto e = std::make_unique<Expr>();
                 e->kind = ExprKind::MapLit;
                 e->line = line;
-                advance();
-                ExprPtr v = parse_expr();
-                if (check(Tok::KW_FOR)) err("dict comprehensions are not supported");
                 e->pairs.emplace_back(std::move(first), std::move(v));
                 while (match(Tok::COMMA)) {
                     if (check(Tok::RBRACE)) break;
@@ -554,11 +589,18 @@ struct Parser {
                 expect(Tok::RBRACE, "'}'");
                 return e;
             }
-            // set literal
+            if (check(Tok::KW_FOR)) { // set comprehension
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::SetComp;
+                e->line = line;
+                e->a = std::move(first);
+                parse_comp_clauses(e->clauses);
+                expect(Tok::RBRACE, "'}'");
+                return e;
+            }
             auto e = std::make_unique<Expr>();
             e->kind = ExprKind::SetLit;
             e->line = line;
-            if (check(Tok::KW_FOR)) err("set comprehensions are not supported");
             e->args.push_back(std::move(first));
             while (match(Tok::COMMA)) {
                 if (check(Tok::RBRACE)) break;
@@ -874,6 +916,16 @@ struct Parser {
         return s;
     }
 
+    void skip_type_params() {
+        if (!check(Tok::LBRACKET)) return;
+        int depth = 0;
+        do {
+            if (check(Tok::LBRACKET)) depth++;
+            else if (check(Tok::RBRACKET)) depth--;
+            advance();
+        } while (depth > 0 && !check(Tok::END));
+    }
+
     StmtPtr parse_decorated() {
         std::vector<ExprPtr> decos;
         while (check(Tok::AT)) {
@@ -893,6 +945,7 @@ struct Parser {
         int line = advance().line;
         auto s = mks(StmtKind::FuncDef, line);
         s->name = expect(Tok::NAME, "function name").text;
+        skip_type_params(); // PEP 695: def f[T](...)
         expect(Tok::LPAREN, "'('");
         bool seen_default = false;
         if (!check(Tok::RPAREN)) {
@@ -935,12 +988,25 @@ struct Parser {
             throw CompileError(line, "nested classes are not supported");
         auto s = mks(StmtKind::ClassDef, line);
         s->name = expect(Tok::NAME, "class name").text;
+        skip_type_params(); // PEP 695: class C[T]:
         if (match(Tok::LPAREN)) {
+            // Bases may be arbitrary expressions (e.g. unittest.TestCase, tk.Tk).
+            // We only model inheritance from a class defined in this file; any
+            // other base is parsed and ignored (class created with no base).
             if (!check(Tok::RPAREN)) {
-                std::string base = expect(Tok::NAME, "base class name").text;
-                if (base != "object") s->alias = base; // alias = base class name
-                if (check(Tok::COMMA))
-                    throw CompileError(line, "multiple inheritance is not supported");
+                bool first = true;
+                do {
+                    if (check(Tok::RPAREN)) break;
+                    if (check(Tok::NAME) && peek(1).kind == Tok::ASSIGN) { // metaclass= etc.
+                        advance(); advance();
+                        parse_expr();
+                        continue;
+                    }
+                    ExprPtr base = parse_expr();
+                    if (first && base->kind == ExprKind::Name && base->sval != "object")
+                        s->alias = base->sval;
+                    first = false;
+                } while (match(Tok::COMMA));
             }
             expect(Tok::RPAREN, "')'");
         }
@@ -1104,6 +1170,17 @@ struct Parser {
     }
 
     StmtPtr make_assign(ExprPtr target, ExprPtr value, int line) {
+        if (target->kind == ExprKind::ListLit) {
+            auto s = mks(StmtKind::MultiAssign, line);
+            for (auto& t : target->args) {
+                if (t->kind != ExprKind::Name && t->kind != ExprKind::Index &&
+                    t->kind != ExprKind::Attr)
+                    throw CompileError(line, "unsupported unpacking target");
+                s->targets.push_back(std::move(t));
+            }
+            s->values.push_back(std::move(value));
+            return s;
+        }
         if (target->kind == ExprKind::Name) {
             auto s = mks(StmtKind::Assign, line);
             s->name = target->sval;
@@ -1234,13 +1311,26 @@ std::string dump_expr(const Expr* e) {
         return s + ") " + dump_expr(e->a.get()) + ")";
     }
     case ExprKind::Closure: return "(closure " + std::to_string(e->res_idx) + ")";
-    case ExprKind::ListComp: {
-        std::string s = "(comp " + dump_expr(e->a.get()) + " for";
-        for (auto& p : e->params) s += " " + p;
-        s += " in " + dump_expr(e->b.get());
-        if (e->c) s += " if " + dump_expr(e->c.get());
+    case ExprKind::ListComp:
+    case ExprKind::SetComp:
+    case ExprKind::MapComp: {
+        std::string tag = e->kind == ExprKind::ListComp   ? "listcomp"
+                          : e->kind == ExprKind::SetComp ? "setcomp"
+                                                         : "mapcomp";
+        std::string s = "(" + tag + " ";
+        if (e->kind == ExprKind::MapComp)
+            s += dump_expr(e->pairs[0].first.get()) + ":" + dump_expr(e->pairs[0].second.get());
+        else
+            s += dump_expr(e->a.get());
+        for (auto& cl : e->clauses) {
+            s += " for";
+            for (auto& t : cl.targets) s += " " + t;
+            s += " in " + dump_expr(cl.iter.get());
+            for (auto& c : cl.conds) s += " if " + dump_expr(c.get());
+        }
         return s + ")";
     }
+    case ExprKind::Starred: return "(* " + dump_expr(e->a.get()) + ")";
     }
     return "?";
 }
