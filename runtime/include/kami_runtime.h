@@ -61,7 +61,8 @@ void kami_globals_init(int64_t n);
 void kami_global_get(KamiValue* out, int64_t idx);
 void kami_global_set(int64_t idx, const KamiValue* v);
 void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity,
-                           int64_t arity, const char* name);
+                           int64_t arity, const char* name, int64_t kwonly,
+                           int64_t flags, const char* param_names);
 void kami_frame_push(KamiValue* slots, int64_t n); // zeroes slots, registers as roots
 void kami_frame_pop(void);
 
@@ -78,7 +79,8 @@ void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name
 // Build a closure: copies ncap captured values (given as an array of slot
 // pointers) into the function object. out must be a rooted slot.
 void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
-                       const char* name, KamiValue** capture_slots, int64_t ncap);
+                       const char* name, KamiValue** capture_slots, int64_t ncap,
+                       int64_t kwonly, int64_t flags, const char* param_names);
 void kami_make_set(KamiValue* out);
 void kami_set_add(KamiValue* set, const KamiValue* v);
 
@@ -93,6 +95,12 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
                  int64_t nargs);
 void kami_builtin(int64_t id, KamiValue* out, KamiValue** argv, int64_t nargs);
+// Call with runtime argument unpacking: f(*args, **kwargs). `pos` is a LIST of
+// positional arguments, `kw` a MAP of keyword arguments (may be empty).
+void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
+                    const KamiValue* kw);
+// dst.update(src) for two dicts (used for `**mapping` at call sites).
+void kami_map_merge(KamiValue* dst, const KamiValue* src);
 
 // --- loop helpers ---
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);
@@ -109,7 +117,8 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
 // --- classes / attributes ---
 void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx);
 void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
-                           int64_t min_arity, int64_t arity);
+                           int64_t min_arity, int64_t arity, int64_t kwonly,
+                           int64_t flags, const char* param_names);
 void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
 void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val);
 

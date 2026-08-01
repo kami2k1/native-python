@@ -38,13 +38,20 @@ void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx) 
 }
 
 void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
-                           int64_t min_arity, int64_t arity) {
+                           int64_t min_arity, int64_t arity, int64_t kwonly,
+                           int64_t flags, const char* param_names) {
     Lock lk(g_lock);
     KamiClassObj* c = (KamiClassObj*)g_globals[(size_t)cls_gidx].p;
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
     f->min_arity = min_arity;
     f->arity = arity;
+    f->builtin_id = -1;
+    f->captures = nullptr;
+    f->ncaptures = 0;
+    f->kwonly = kwonly;
+    f->flags = flags;
+    f->param_names = param_names;
     f->name = name;
     KamiValue v;
     v.tag = KT_FUNC;

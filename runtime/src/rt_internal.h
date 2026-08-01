@@ -53,15 +53,21 @@ struct KamiMap {
     int64_t icap;
 };
 
+// KamiFuncObj::flags
+enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2 };
+
 struct KamiFuncObj {
     ObjHeader h;
     void* fn;          // KamiFn (null when builtin_id >= 0)
     int64_t min_arity;
-    int64_t arity;     // max
+    int64_t arity;     // number of fixed parameters (incl. keyword-only)
     int64_t builtin_id; // >= 0 => call via kami_builtin
     const char* name;
     KamiValue* captures; // heap array, null when not a closure
     int64_t ncaptures;
+    int64_t kwonly;          // index where keyword-only params begin (== arity if none)
+    int64_t flags;           // KFN_VARARG / KFN_KWARG
+    const char* param_names; // comma-joined fixed parameter names (may be "")
 };
 
 struct ThreadData {
@@ -158,6 +164,32 @@ bool map_del(KamiMap* m, const KamiValue* k);                     // lock held
 uint64_t value_hash(const KamiValue* v);
 bool value_eq(const KamiValue* a, const KamiValue* b);
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
+
+// Rearranges a dynamic call's arguments into the layout the callee's prologue
+// expects (fixed params, then packed *args tuple / **kwargs dict). Lock must
+// be held. `packed` must be a caller-pinned 2-slot array (zeroed). Returns the
+// final argument count written to argv2 (capacity >= fo->arity + 2).
+int64_t prep_user_argv(KamiFuncObj* fo, KamiValue** argv, int64_t nargs, KamiMap* kwmap,
+                       KamiValue** argv2, KamiValue* packed);
+
+// RAII temporary GC root (exception-safe, unlike raw g_pins pushes).
+struct PinGuard {
+    KamiValue* vals;
+    PinGuard(KamiValue* v, int64_t n) : vals(v) {
+        Lock lk(g_lock);
+        g_pins.push_back({v, n});
+    }
+    ~PinGuard() {
+        Lock lk(g_lock);
+        for (size_t i = g_pins.size(); i-- > 0;)
+            if (g_pins[i].first == vals) {
+                g_pins.erase(g_pins.begin() + (long)i);
+                break;
+            }
+    }
+    PinGuard(const PinGuard&) = delete;
+    PinGuard& operator=(const PinGuard&) = delete;
+};
 
 std::string format_float(double d);
 std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs);

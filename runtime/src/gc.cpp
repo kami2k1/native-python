@@ -255,7 +255,8 @@ void kami_global_set(int64_t idx, const KamiValue* v) {
 }
 
 void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t arity,
-                           const char* name) {
+                           const char* name, int64_t kwonly, int64_t flags,
+                           const char* param_names) {
     Lock lk(g_lock);
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
@@ -265,6 +266,9 @@ void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t 
     f->name = name;
     f->captures = nullptr;
     f->ncaptures = 0;
+    f->kwonly = kwonly;
+    f->flags = flags;
+    f->param_names = param_names;
     g_globals[(size_t)idx].tag = KT_FUNC;
     g_globals[(size_t)idx].p = f;
 }

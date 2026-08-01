@@ -23,6 +23,9 @@ enum class ExprKind {
     SetComp,    // element a + clauses
     MapComp,    // pairs[0] = (key,val) + clauses
     CCall,      // direct C-ABI call: sval = symbol, csig = signature, args = params
+    CallStar,   // call with *args/**kwargs at the call site: a = callee,
+                // args = positional (may contain Starred), pairs = keyword
+                // entries ((StrLit name, value) or (null, **expr))
 };
 
 struct Expr;
@@ -55,8 +58,12 @@ struct Expr {
     std::vector<ExprPtr> args; // Call args / ListLit items / Slice parts
     std::vector<std::pair<std::string, ExprPtr>> kwargs; // Call keyword args
     std::vector<std::pair<ExprPtr, ExprPtr>> pairs;      // MapLit
-    std::vector<std::string> params; // ListComp target names
+    std::vector<std::string> params; // ListComp target names / Lambda params
     std::vector<CompClause> clauses; // ListComp/SetComp/MapComp
+    // Lambda only: *args/**kwargs names ("" if absent), keyword-only start
+    // index (-1 = none) and default values (aligned to the params tail).
+    std::string vararg, kwarg;
+    int kwonly = -1;
 
     // sema annotations
     Res res = Res::Unresolved;
@@ -93,6 +100,12 @@ struct Stmt {
     std::string alias;  // import ... as alias / ClassDef base name
     std::vector<std::string> params;            // FuncDef params / For multi-targets / Global names
     std::vector<ExprPtr> defaults;              // FuncDef default values (aligned to params tail)
+    // FuncDef: `*args` / `**kwargs` parameter names ("" when absent) and the
+    // index in `params` where keyword-only parameters begin (-1 = none).
+    // The vararg tuple and kwargs dict occupy local slots params.size() and
+    // params.size()+1 (when present), directly after the fixed parameters.
+    std::string vararg, kwarg;
+    int kwonly = -1;
     std::vector<std::pair<std::string, std::string>> import_names; // FromImport (name, alias)
     std::vector<StmtPtr> body, orelse, final_body; // blocks; Try: body/orelse(else)/finally
     std::vector<ExceptClause> handlers;            // Try

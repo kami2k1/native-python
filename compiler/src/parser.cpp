@@ -297,8 +297,20 @@ struct Parser {
         if (!check(Tok::RPAREN)) {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
-                if (check(Tok::STAR) || check(Tok::POW))
-                    err("*args/**kwargs are not supported");
+                if (check(Tok::STAR)) { // f(*iterable)
+                    int line = advance().line;
+                    auto st = std::make_unique<Expr>();
+                    st->kind = ExprKind::Starred;
+                    st->line = line;
+                    st->a = parse_expr();
+                    call->args.push_back(std::move(st));
+                    continue;
+                }
+                if (check(Tok::POW)) { // f(**mapping)
+                    advance();
+                    call->kwargs.emplace_back("", parse_expr()); // "" = **expr
+                    continue;
+                }
                 if (check(Tok::NAME) && peek(1).kind == Tok::ASSIGN) {
                     std::string kw = advance().text;
                     advance(); // '='
@@ -498,7 +510,29 @@ struct Parser {
             if (!check(Tok::COLON)) {
                 do {
                     if (check(Tok::COLON)) break;
+                    if (check(Tok::POW)) { // **kwargs
+                        advance();
+                        e->kwarg = expect(Tok::NAME, "parameter name after '**'").text;
+                        continue;
+                    }
+                    if (check(Tok::STAR)) { // *args or bare '*'
+                        advance();
+                        if (check(Tok::NAME)) e->vararg = advance().text;
+                        e->kwonly = (int)e->params.size();
+                        continue;
+                    }
                     e->params.push_back(expect(Tok::NAME, "lambda parameter").text);
+                    if (match(Tok::ASSIGN)) {
+                        // Default value: `lambda a, b=val: expr`. The default
+                        // expression must not consume the parameter-list ','
+                        // or the body ':' — parse_ternary stops at both.
+                        e->args.push_back(parse_ternary());
+                    } else if (!e->args.empty() && e->kwonly < 0) {
+                        throw CompileError(peek().line,
+                                           "non-default parameter after default parameter");
+                    } else if (e->kwonly >= 0 && !e->args.empty()) {
+                        e->args.push_back(nullptr); // required keyword-only hole
+                    }
                 } while (match(Tok::COMMA));
             }
             expect(Tok::COLON, "':' in lambda");
@@ -999,8 +1033,28 @@ struct Parser {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
                 if (check(Tok::SLASH)) { advance(); continue; } // positional-only marker
-                if (check(Tok::STAR) || check(Tok::POW))
-                    throw CompileError(peek().line, "*args/**kwargs are not supported");
+                if (check(Tok::POW)) { // **kwargs (must be last)
+                    advance();
+                    s->kwarg = expect(Tok::NAME, "parameter name after '**'").text;
+                    if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    continue;
+                }
+                if (check(Tok::STAR)) { // *args or bare '*' (keyword-only marker)
+                    advance();
+                    if (!s->vararg.empty() || s->kwonly >= 0)
+                        throw CompileError(peek().line, "duplicate '*' in parameter list");
+                    if (check(Tok::NAME)) {
+                        s->vararg = advance().text;
+                        if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    }
+                    s->kwonly = (int)s->params.size();
+                    // keyword-only parameters may follow without defaults even
+                    // after earlier defaulted parameters:
+                    seen_default = false;
+                    continue;
+                }
+                if (!s->kwarg.empty())
+                    throw CompileError(peek().line, "parameter after **" + s->kwarg);
                 s->params.push_back(expect(Tok::NAME, "parameter name").text);
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
@@ -1009,6 +1063,11 @@ struct Parser {
                     // codegen evaluates it in the function prologue when the
                     // caller omits the argument.
                     s->defaults.push_back(parse_expr());
+                } else if (s->kwonly >= 0) {
+                    // Keyword-only parameter without a default: keep
+                    // `defaults` aligned to the params tail with an explicit
+                    // "required" hole (only needed once defaults exist).
+                    if (!s->defaults.empty()) s->defaults.push_back(nullptr);
                 } else if (seen_default) {
                     throw CompileError(peek().line,
                                        "non-default parameter after default parameter");
@@ -1378,6 +1437,14 @@ std::string dump_expr(const Expr* e) {
         return s + ")";
     }
     case ExprKind::Starred: return "(* " + dump_expr(e->a.get()) + ")";
+    case ExprKind::CallStar: {
+        std::string s = "(call* " + dump_expr(e->a.get());
+        for (auto& a : e->args) s += " " + dump_expr(a.get());
+        for (auto& p : e->pairs)
+            s += " " + (p.first ? dump_expr(p.first.get()) + "=" : std::string("**")) +
+                 dump_expr(p.second.get());
+        return s + ")";
+    }
     case ExprKind::CCall: {
         std::string s = "(ccall " + e->sval + ":" + e->csig;
         for (auto& a : e->args) s += " " + dump_expr(a.get());

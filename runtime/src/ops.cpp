@@ -278,6 +278,102 @@ static int64_t norm_index(int64_t i, int64_t len, const char* what) {
 
 using namespace kami;
 
+namespace kami {
+
+// Rearranges a dynamic call's arguments into the layout the callee's prologue
+// expects. Fast path: plain function, plain call. Slow path: pack extra
+// positionals into a *args tuple / keywords into a **kwargs dict (allocated
+// into `packed`, which the caller must keep pinned across the invocation).
+int64_t prep_user_argv(KamiFuncObj* fo, KamiValue** argv, int64_t nargs, KamiMap* kwmap,
+                       KamiValue** argv2, KamiValue* packed) {
+    const bool hv = (fo->flags & KFN_VARARG) != 0, hk = (fo->flags & KFN_KWARG) != 0;
+    const int64_t P = fo->arity;
+    const std::string what = fo->name ? fo->name : "<function>";
+    if (!hv && !hk && (!kwmap || kwmap->count == 0)) {
+        if (nargs < fo->min_arity || nargs > P)
+            panic(what + "() takes " + std::to_string(P) + " argument(s) but " +
+                  std::to_string(nargs) + " were given");
+        for (int64_t i = 0; i < nargs; i++) argv2[i] = argv[i];
+        return nargs;
+    }
+    // fixed-parameter table
+    std::vector<KamiValue*> fixed((size_t)P, nullptr);
+    int64_t kwonly = fo->kwonly > P ? P : fo->kwonly;
+    int64_t npos = nargs < kwonly ? nargs : kwonly;
+    if (nargs > kwonly && !hv)
+        panic(what + "() takes " + std::to_string(kwonly) + " positional argument(s) but " +
+              std::to_string(nargs) + " were given");
+    for (int64_t i = 0; i < npos; i++) fixed[(size_t)i] = argv[i];
+    // keyword matching against the recorded parameter names
+    std::vector<std::string> names;
+    if (kwmap && kwmap->count > 0) {
+        std::string all = fo->param_names ? fo->param_names : "";
+        size_t start = 0;
+        while (start <= all.size() && !all.empty()) {
+            size_t c = all.find(',', start);
+            names.push_back(all.substr(start, c == std::string::npos ? c : c - start));
+            if (c == std::string::npos) break;
+            start = c + 1;
+        }
+    }
+    KamiMap* kwleft = nullptr;
+    if (kwmap && kwmap->count > 0) {
+        for (int64_t ei = 0; ei < kwmap->nentries; ei++) {
+            MapEntry& en = kwmap->entries[ei];
+            if (!en.used) continue;
+            if (en.key.tag != KT_STR) panic(what + "(): keyword names must be strings");
+            std::string kw(((KamiStr*)en.key.p)->data, (size_t)((KamiStr*)en.key.p)->len);
+            int64_t found = -1;
+            for (size_t i = 0; i < names.size(); i++)
+                if (names[i] == kw) { found = (int64_t)i; break; }
+            if (found >= 0) {
+                if (fixed[(size_t)found])
+                    panic(what + "() got multiple values for argument '" + kw + "'");
+                fixed[(size_t)found] = &en.val;
+            } else if (hk) {
+                if (!kwleft) {
+                    kwleft = map_new();
+                    packed[1].tag = KT_MAP;
+                    packed[1].p = kwleft; // pinned by the caller
+                }
+                map_set(kwleft, &en.key, &en.val);
+            } else {
+                panic(what + "() got an unexpected keyword argument '" + kw + "'");
+            }
+        }
+    }
+    int64_t nextra = nargs - npos; // extra positionals → *args tuple
+    bool pass_tuple = false, pass_dict = kwleft && kwleft->count > 0;
+    if (hv && (nextra > 0 || pass_dict)) pass_tuple = true;
+    // trailing holes may stay unfilled only when nothing packed follows them
+    int64_t pass_n = P;
+    if (!pass_tuple && !pass_dict) {
+        while (pass_n > 0 && !fixed[(size_t)pass_n - 1]) pass_n--;
+    }
+    for (int64_t i = 0; i < pass_n; i++)
+        if (!fixed[(size_t)i])
+            panic(what + "(): argument " + std::to_string(i + 1) +
+                  " is missing (defaults before supplied arguments cannot be filled in "
+                  "dynamic calls)");
+    if (pass_n < fo->min_arity)
+        panic(what + "() takes at least " + std::to_string(fo->min_arity) +
+              " argument(s) but " + std::to_string(pass_n) + " were given");
+    for (int64_t i = 0; i < pass_n; i++) argv2[i] = fixed[(size_t)i];
+    int64_t n2 = pass_n;
+    if (pass_tuple) {
+        KamiList* l = list_new(nextra > 0 ? nextra : 1);
+        packed[0].tag = KT_LIST;
+        packed[0].p = l; // pinned by the caller
+        for (int64_t i = 0; i < nextra; i++) list_push(l, argv[npos + i]);
+        argv2[n2++] = &packed[0];
+    }
+    if (pass_dict) argv2[n2++] = &packed[1];
+    return n2;
+}
+
+
+} // namespace kami
+
 extern "C" {
 
 void kami_binop(int64_t op, KamiValue* out, const KamiValue* a, const KamiValue* b) {
@@ -482,6 +578,10 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
     KamiValue* f_caps = nullptr;
     KamiValue* init_caps = nullptr;
     int64_t builtin_id = -1;
+    int64_t n2 = 0;
+    KamiValue* argv2[19];
+    KamiValue packed[2] = {{KT_NONE, {0}}, {KT_NONE, {0}}};
+    PinGuard pin(packed, 2);
     {
         Lock lk(g_lock);
         if (fn->tag == KT_CLASS) {
@@ -493,9 +593,10 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             out->p = inst; // rooted caller slot
             if (KamiValue* m = class_lookup(c, "__init__")) {
                 KamiFuncObj* fo = (KamiFuncObj*)m->p;
-                if (nargs + 1 < fo->min_arity || nargs + 1 > fo->arity)
-                    panic(std::string(c->name) + "() takes " + std::to_string(fo->arity - 1) +
-                          " argument(s) but " + std::to_string(nargs) + " were given");
+                KamiValue* argv1[19];
+                argv1[0] = out; // self
+                for (int64_t i = 0; i < nargs && i < 18; i++) argv1[i + 1] = argv[i];
+                n2 = prep_user_argv(fo, argv1, nargs + 1, nullptr, argv2, packed);
                 init = (KamiFn)fo->fn;
                 init_caps = fo->captures;
             } else if (nargs != 0) {
@@ -508,9 +609,7 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             if (fo->builtin_id >= 0) {
                 builtin_id = fo->builtin_id;
             } else {
-                if (nargs < fo->min_arity || nargs > fo->arity)
-                    panic(std::string(fo->name) + "() takes " + std::to_string(fo->arity) +
-                          " argument(s) but " + std::to_string(nargs) + " were given");
+                n2 = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
                 f = (KamiFn)fo->fn;
                 f_caps = fo->captures;
             }
@@ -522,14 +621,100 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
         return;
     }
     if (init) {
-        KamiValue* argv2[17];
-        argv2[0] = out; // self
-        for (int64_t i = 0; i < nargs; i++) argv2[i + 1] = argv[i];
         KamiValue dummy;
-        init(&dummy, argv2, nargs + 1, init_caps);
+        init(&dummy, argv2, n2, init_caps);
         return;
     }
-    if (f) f(out, argv, nargs, f_caps);
+    if (f) f(out, argv2, n2, f_caps);
+}
+
+void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
+                    const KamiValue* kw) {
+    if (pos->tag != KT_LIST) panic("argument after * must be an iterable");
+    if (kw->tag != KT_MAP) panic("argument after ** must be a mapping");
+    // Copy the positional values into pinned storage: the source list is a
+    // caller-visible object that user code (another thread) could mutate.
+    std::vector<KamiValue> vals;
+    {
+        Lock lk(g_lock);
+        KamiList* l = (KamiList*)pos->p;
+        vals.assign(l->items, l->items + l->len);
+    }
+    PinGuard pinv(vals.data(), (int64_t)vals.size());
+    std::vector<KamiValue*> argv(vals.size());
+    for (size_t i = 0; i < vals.size(); i++) argv[i] = &vals[i];
+    int64_t nargs = (int64_t)vals.size();
+    KamiMap* kwmap = (KamiMap*)kw->p;
+
+    KamiFn f = nullptr;
+    KamiFn init = nullptr;
+    KamiValue* f_caps = nullptr;
+    KamiValue* init_caps = nullptr;
+    int64_t builtin_id = -1;
+    int64_t n2 = 0;
+    std::vector<KamiValue*> argv2(vals.size() + 3);
+    KamiValue packed[2] = {{KT_NONE, {0}}, {KT_NONE, {0}}};
+    PinGuard pin(packed, 2);
+    {
+        Lock lk(g_lock);
+        if (fn->tag == KT_CLASS) {
+            KamiClassObj* c = (KamiClassObj*)fn->p;
+            KamiInstance* inst = (KamiInstance*)gc_alloc(sizeof(KamiInstance), KT_OBJECT);
+            inst->cls = c;
+            inst->fields = new std::unordered_map<std::string, KamiValue>();
+            out->tag = KT_OBJECT;
+            out->p = inst;
+            if (KamiValue* m = class_lookup(c, "__init__")) {
+                KamiFuncObj* fo = (KamiFuncObj*)m->p;
+                std::vector<KamiValue*> argv1(vals.size() + 1);
+                argv1[0] = out; // self
+                for (size_t i = 0; i < vals.size(); i++) argv1[i + 1] = argv[i];
+                n2 = prep_user_argv(fo, argv1.data(), nargs + 1, kwmap, argv2.data(), packed);
+                init = (KamiFn)fo->fn;
+                init_caps = fo->captures;
+            } else if (nargs != 0 || kwmap->count != 0) {
+                panic(std::string(c->name) + "() takes no arguments");
+            }
+        } else {
+            if (fn->tag != KT_FUNC)
+                panic(std::string("'") + type_name(fn->tag) + "' object is not callable");
+            KamiFuncObj* fo = (KamiFuncObj*)fn->p;
+            if (fo->builtin_id >= 0) {
+                if (kwmap->count != 0)
+                    panic(std::string(fo->name ? fo->name : "<builtin>") +
+                          "() does not accept keyword arguments through **kwargs");
+                if (nargs > 16) panic("too many arguments in *args call to a builtin");
+                builtin_id = fo->builtin_id;
+            } else {
+                n2 = prep_user_argv(fo, argv.data(), nargs, kwmap, argv2.data(), packed);
+                f = (KamiFn)fo->fn;
+                f_caps = fo->captures;
+            }
+        }
+    }
+    if (builtin_id >= 0) {
+        kami_builtin(builtin_id, out, argv.data(), nargs);
+        return;
+    }
+    if (init) {
+        KamiValue dummy;
+        init(&dummy, argv2.data(), n2, init_caps);
+        return;
+    }
+    if (f) f(out, argv2.data(), n2, f_caps);
+}
+
+void kami_map_merge(KamiValue* dst, const KamiValue* src) {
+    Lock lk(g_lock);
+    if (dst->tag != KT_MAP || src->tag != KT_MAP)
+        panic("argument after ** must be a mapping");
+    KamiMap* d = (KamiMap*)dst->p;
+    KamiMap* s = (KamiMap*)src->p;
+    for (int64_t i = 0; i < s->nentries; i++) {
+        MapEntry& en = s->entries[i];
+        if (!en.used) continue;
+        map_set(d, &en.key, &en.val);
+    }
 }
 
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
@@ -537,7 +722,9 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
     KamiFn user_fn = nullptr;
     KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
-    KamiValue* argv2[17];
+    KamiValue* argv2[19];
+    KamiValue packed[2] = {{KT_NONE, {0}}, {KT_NONE, {0}}};
+    PinGuard pin(packed, 2);
     {
         std::unique_lock<std::recursive_mutex> lk(g_lock);
         KamiValue o = *obj;
@@ -1253,16 +1440,13 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             if (mv->tag != KT_FUNC)
                 panic(std::string("'") + in->cls->name + "." + m + "' is not callable");
             KamiFuncObj* fo = (KamiFuncObj*)mv->p;
-            int64_t want = bound ? nargs + 1 : nargs;
-            if (want < fo->min_arity || want > fo->arity)
-                panic(m + "() takes " + std::to_string(fo->arity - (bound ? 1 : 0)) +
-                      " argument(s) but " + std::to_string(nargs) + " were given");
+            KamiValue* argv1[19];
+            int64_t k = 0;
+            if (bound) argv1[k++] = obj;
+            for (int64_t i = 0; i < nargs && k < 19; i++) argv1[k++] = argv[i];
+            user_nargs = prep_user_argv(fo, argv1, k, nullptr, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
-            int64_t k = 0;
-            if (bound) argv2[k++] = obj;
-            for (int64_t i = 0; i < nargs; i++) argv2[k++] = argv[i];
-            user_nargs = k;
         } else if (o.tag == KT_CLASS) {
             // unbound call: ClassName.method(self, args...)
             KamiClassObj* c = (KamiClassObj*)o.p;
@@ -1270,13 +1454,9 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             if (!mv || mv->tag != KT_FUNC)
                 panic(std::string("class '") + c->name + "' has no method '" + m + "'");
             KamiFuncObj* fo = (KamiFuncObj*)mv->p;
-            if (nargs < fo->min_arity || nargs > fo->arity)
-                panic(m + "() takes " + std::to_string(fo->arity) + " argument(s) but " +
-                      std::to_string(nargs) + " were given");
+            user_nargs = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
-            for (int64_t i = 0; i < nargs; i++) argv2[i] = argv[i];
-            user_nargs = nargs;
         }
         if (!user_fn)
             panic(std::string("'") + type_name(o.tag) + "' object has no method '" + m + "'(" +

@@ -649,16 +649,31 @@ struct Sema {
     }
 
     // Rewrites call kwargs/defaults into plain positional args when the callee
-    // signature is known (user function or class constructor).
+    // signature is known (user function or class constructor). Extra
+    // positional arguments are packed into a *args tuple and unmatched keyword
+    // arguments into a **kwargs dict when the callee declares them; the packed
+    // values are passed as ordinary trailing arguments (slots params.size()
+    // and params.size()+1).
     void apply_signature(Expr* e, Stmt* def, bool skip_self) {
         size_t nparams = def->params.size() - (skip_self ? 1 : 0);
         size_t ndefaults = def->defaults.size();
         size_t first_param = skip_self ? 1 : 0;
+        bool hv = !def->vararg.empty(), hk = !def->kwarg.empty();
+        // Keyword-only parameters cannot be filled positionally.
+        size_t npos = nparams;
+        if (def->kwonly >= 0) npos = (size_t)def->kwonly - first_param;
         std::vector<ExprPtr> final_args(nparams);
-        if (e->args.size() > nparams)
-            err(e->line, def->name + "() takes " + std::to_string(nparams) +
-                             " argument(s) but " + std::to_string(e->args.size()) +
-                             " were given");
+        std::vector<ExprPtr> extra_pos;
+        std::vector<std::pair<ExprPtr, ExprPtr>> extra_kw;
+        if (e->args.size() > npos) {
+            if (!hv)
+                err(e->line, def->name + "() takes " + std::to_string(npos) +
+                                 " argument(s) but " + std::to_string(e->args.size()) +
+                                 " were given");
+            for (size_t i = npos; i < e->args.size(); i++)
+                extra_pos.push_back(std::move(e->args[i]));
+            e->args.resize(npos);
+        }
         for (size_t i = 0; i < e->args.size(); i++) final_args[i] = std::move(e->args[i]);
         for (auto& [kw, val] : e->kwargs) {
             bool found = false;
@@ -671,21 +686,35 @@ struct Sema {
                     break;
                 }
             }
-            if (!found)
-                err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
+            if (found) continue;
+            if (hk) {
+                auto k = std::make_unique<Expr>();
+                k->kind = ExprKind::StrLit;
+                k->line = e->line;
+                k->sval = kw;
+                extra_kw.emplace_back(std::move(k), std::move(val));
+                continue;
+            }
+            err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
         }
         e->kwargs.clear();
         // Trailing holes that have defaults are NOT passed: the callee's
         // prologue evaluates the default expression in its own (definition)
         // scope — this is what makes non-literal defaults like
-        // `thread_type=ThreadType.USER` work correctly.
+        // `thread_type=ThreadType.USER` work correctly. When packed *args /
+        // **kwargs values must be passed after the fixed parameters, no holes
+        // may remain, so every skipped default has to be a clonable literal.
+        bool pass_packed = !extra_pos.empty() || !extra_kw.empty();
         size_t pass_n = nparams;
-        while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams)
-            pass_n--;
+        if (!pass_packed) {
+            while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams &&
+                   def->defaults[pass_n - 1 + ndefaults - nparams] != nullptr)
+                pass_n--;
+        }
         for (size_t i = 0; i < pass_n; i++) {
             if (final_args[i]) continue;
             size_t di = i + ndefaults;
-            if (di >= nparams) { // default exists (defaults align to the tail)
+            if (di >= nparams && def->defaults[di - nparams] != nullptr) {
                 const Expr* d = def->defaults[di - nparams].get();
                 if (!is_literal_default(d))
                     err(e->line, def->name + "(): parameter '" +
@@ -700,6 +729,22 @@ struct Sema {
             }
         }
         final_args.resize(pass_n);
+        if (pass_packed) {
+            if (hv) { // *args tuple (always passed when anything packed follows)
+                auto lst = std::make_unique<Expr>();
+                lst->kind = ExprKind::ListLit;
+                lst->line = e->line;
+                lst->args = std::move(extra_pos);
+                final_args.push_back(std::move(lst));
+            }
+            if (!extra_kw.empty()) { // **kwargs dict
+                auto mp = std::make_unique<Expr>();
+                mp->kind = ExprKind::MapLit;
+                mp->line = e->line;
+                mp->pairs = std::move(extra_kw);
+                final_args.push_back(std::move(mp));
+            }
+        }
         e->args = std::move(final_args);
     }
 
@@ -1083,6 +1128,36 @@ struct Sema {
             return;
         }
         case ExprKind::Call: {
+            // Call-site unpacking `f(*a, **k)`: the argument shape is only
+            // known at runtime, so lower to CallStar — the callee is evaluated
+            // as a value, positionals are packed into a list (Starred items
+            // extend it) and keywords into a dict, and kami_call_star matches
+            // them against the callee's signature at runtime.
+            {
+                bool has_star = false, has_dstar = false;
+                for (auto& a : e->args)
+                    if (a->kind == ExprKind::Starred) has_star = true;
+                for (auto& [kw, v] : e->kwargs)
+                    if (kw.empty()) has_dstar = true;
+                if (has_star || has_dstar) {
+                    for (auto& a : e->args) resolve_expr(a.get());
+                    for (auto& [kw, v] : e->kwargs) resolve_expr(v.get());
+                    resolve_expr(e->a.get());
+                    for (auto& [kw, v] : e->kwargs) {
+                        ExprPtr key;
+                        if (!kw.empty()) {
+                            key = std::make_unique<Expr>();
+                            key->kind = ExprKind::StrLit;
+                            key->line = e->line;
+                            key->sval = kw;
+                        }
+                        e->pairs.emplace_back(std::move(key), std::move(v));
+                    }
+                    e->kwargs.clear();
+                    e->kind = ExprKind::CallStar;
+                    return;
+                }
+            }
             // isinstance(x, int) / isinstance(x, (int, float)): type names are
             // rewritten to string literals before normal name resolution.
             if (e->a->kind == ExprKind::Name && e->a->sval == "isinstance" &&
@@ -1174,6 +1249,12 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
+            for (auto& a : e->args)
+                if (a->kind == ExprKind::Starred)
+                    err(e->line, "*args unpacking is not supported in method calls yet");
+            for (auto& [kw, v] : e->kwargs)
+                if (kw.empty())
+                    err(e->line, "**kwargs unpacking is not supported in method calls yet");
             // Bundled local module: "utils.helper(args)" → plain call "helper(args)".
             // Re-resolving as a Call keeps kwargs/default-argument support.
             if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
@@ -1774,7 +1855,9 @@ struct Sema {
 
     void resolve_function(Stmt* s, bool as_closure) {
         // defaults are evaluated in the DEFINING (enclosing) scope
-        for (auto& d : s->defaults) resolve_expr(d.get());
+        // (null entries are "required keyword-only" holes — see parser)
+        for (auto& d : s->defaults)
+            if (d) resolve_expr(d.get());
         // push current frame
         Frame f;
         f.def = cur_func;
@@ -1796,6 +1879,15 @@ struct Sema {
             if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
             if (global_decls.count(p)) err(s->line, "parameter '" + p + "' declared global");
             local_slot(p);
+        }
+        // *args tuple and **kwargs dict live in the slots directly after the
+        // fixed parameters (params.size() and params.size()+1).
+        for (const std::string* extra : {&s->vararg, &s->kwarg}) {
+            if (extra->empty()) continue;
+            if (locals.count(*extra)) err(s->line, "duplicate parameter '" + *extra + "'");
+            if (global_decls.count(*extra))
+                err(s->line, "parameter '" + *extra + "' declared global");
+            local_slot(*extra);
         }
         collect_assigned(s->body, false);
         resolve_stmts(s->body);
@@ -1827,6 +1919,11 @@ struct Sema {
         fn->line = lam->line;
         fn->name = "<lambda>";
         fn->params = lam->params;
+        fn->vararg = lam->vararg;
+        fn->kwarg = lam->kwarg;
+        fn->kwonly = lam->kwonly;
+        for (auto& d : lam->args) fn->defaults.push_back(std::move(d));
+        lam->args.clear();
         fn->alias = "lambda_" + std::to_string(synth_counter++);
         auto ret = std::make_unique<Stmt>();
         ret->kind = StmtKind::Return;
