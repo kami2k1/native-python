@@ -28,6 +28,12 @@ std::string escape_ir_string(const std::string& s) {
     return out;
 }
 
+// Largest number of positional arguments a function accepts. A `*args`
+// catch-all swallows everything up to the runtime's argument-buffer limit.
+size_t max_arity(const Stmt* f) {
+    return f->vararg ? 16 : f->params.size();
+}
+
 std::string fmt_double(double d) {
     uint64_t bits;
     memcpy(&bits, &d, 8);
@@ -112,19 +118,28 @@ struct FnGen {
         return t;
     }
 
-    // Reserve a frame slot that will not be reused when temp_top is reset.
+    // Reserve a frame slot that survives temp_top resets (used by `with` to keep
+    // the context manager alive across the outlined body).
+    //
+    // These slots live above the temp window, but `max_temps` is only final once
+    // the whole function has been generated — so the index cannot be computed
+    // here. Emitting a placeholder that finish() patches keeps persistent slots
+    // and temporaries from ever aliasing. (They did before, which is why
+    // `with` inside a loop used to lose its context manager and never run
+    // __exit__.)
+    static const int PERSISTENT_BASE = 1 << 20;
     int persistent_top = 0;
-    int alloc_slot_persistent() {
-        // grow temps_base region by pinning above current max; simplest: use a
-        // dedicated counter beyond the temp window.
-        int t = temps_base + max_temps + persistent_top;
-        persistent_top++;
-        return t;
+    int alloc_slot_persistent() { return PERSISTENT_BASE + persistent_top++; }
+
+    std::string slot_index(int slot) const {
+        if (slot >= PERSISTENT_BASE)
+            return "@@PSLOT" + std::to_string(slot - PERSISTENT_BASE) + "@@";
+        return std::to_string(slot);
     }
 
     std::string slot_ptr(int slot) {
         std::string p = r();
-        emit(p + " = getelementptr inbounds %kv, ptr %frame, i64 " + std::to_string(slot));
+        emit(p + " = getelementptr inbounds %kv, ptr %frame, i64 " + slot_index(slot));
         return p;
     }
 
@@ -478,9 +493,9 @@ struct FnGen {
         for (size_t i = 0; i < fn->multi_tkind.size(); i++)
             caps.push_back(capture_source_slot(fn->multi_tkind[i], fn->multi_tidx[i]));
         fill_argbuf(caps);
-        size_t fmin = fn->params.size() - fn->defaults.size();
+        size_t fmin = fn->params.size() - fn->defaults.size() - (fn->vararg ? 1 : 0);
         emit("call void @kami_make_closure(ptr " + slot_ptr(result) + ", ptr @u_" + fn->alias +
-             ", i64 " + std::to_string(fmin) + ", i64 " + std::to_string(fn->params.size()) +
+             ", i64 " + std::to_string(fmin) + ", i64 " + std::to_string(max_arity(fn)) +
              ", ptr " + str_const(fn->name) + ", ptr %argbuf, i64 " +
              std::to_string(caps.size()) + ")");
         temp_top = save;
@@ -1179,6 +1194,7 @@ struct FnGen {
     void gen_prologue(const Stmt* f) {
         size_t nparams = f->params.size();
         size_t ndefaults = f->defaults.size();
+        if (f->vararg) nparams--; // handled below, after the fixed parameters
         for (size_t i = 0; i < nparams; i++) {
             bool has_default = i + ndefaults >= nparams;
             if (!has_default) {
@@ -1219,6 +1235,23 @@ struct FnGen {
             }
             start_block(Ln);
         }
+        if (f->vararg)
+            emit("call void @kami_pack_varargs(ptr " + slot_ptr((int)nparams) +
+                 ", ptr %argv, i64 %nargs, i64 " + std::to_string(nparams) + ")");
+    }
+
+    // Replaces every @@PSLOTn@@ placeholder with the real frame index, now that
+    // the temp window has its final size.
+    void patch_pslots(std::string& ir) const {
+        for (int k = 0; k < persistent_top; k++) {
+            std::string needle = "@@PSLOT" + std::to_string(k) + "@@";
+            std::string repl = std::to_string(temps_base + max_temps + k);
+            size_t p = 0;
+            while ((p = ir.find(needle, p)) != std::string::npos) {
+                ir.replace(p, needle.size(), repl);
+                p += repl.size();
+            }
+        }
     }
 
     // ---- whole function ----
@@ -1249,6 +1282,8 @@ struct FnGen {
             extras.replace(p, needle.size(), repl);
             p += repl.size();
         }
+        patch_pslots(extras);
+        patch_pslots(out);
         return extras + out;
     }
 };
@@ -1270,6 +1305,7 @@ declare void @kami_make_int(ptr, i64)
 declare void @kami_make_float(ptr, double)
 declare void @kami_make_str(ptr, ptr, i64)
 declare void @kami_make_list(ptr, ptr, i64)
+declare void @kami_pack_varargs(ptr, ptr, i64, i64)
 declare void @kami_make_map(ptr)
 declare void @kami_make_builtin_func(ptr, i64, ptr)
 declare void @kami_make_closure(ptr, ptr, i64, i64, ptr, ptr, i64)
@@ -1338,10 +1374,10 @@ std::string codegen(const Module& m, const std::string& source_name) {
     for (const Stmt* f : m.functions) {
         if (f->global_idx < 0) continue; // methods have no global binding
         int si = strtab.intern(f->name);
-        size_t fmin = f->params.size() - f->defaults.size();
+        size_t fmin = f->params.size() - f->defaults.size() - (f->vararg ? 1 : 0);
         main_fn += "  call void @kami_global_make_func(i64 " + std::to_string(f->global_idx) +
                    ", ptr @u_" + f->alias + ", i64 " + std::to_string(fmin) + ", i64 " +
-                   std::to_string(f->params.size()) + ", ptr " + strtab.ref(si) + ")\n";
+                   std::to_string(max_arity(f)) + ", ptr " + strtab.ref(si) + ")\n";
     }
     for (const Stmt* c : m.classes) {
         int si = strtab.intern(c->name);
@@ -1357,11 +1393,11 @@ std::string codegen(const Module& m, const std::string& source_name) {
             if (msp->kind != StmtKind::FuncDef) continue;
             const Stmt* mth = msp.get();
             int mi = strtab.intern(mth->name);
-            size_t mmin = mth->params.size() - mth->defaults.size();
+            size_t mmin = mth->params.size() - mth->defaults.size() - (mth->vararg ? 1 : 0);
             main_fn += "  call void @kami_class_add_method(i64 " +
                        std::to_string(c->global_idx) + ", ptr " + strtab.ref(mi) + ", ptr @u_" +
                        mth->alias + ", i64 " + std::to_string(mmin) + ", i64 " +
-                       std::to_string(mth->params.size()) + ")\n";
+                       std::to_string(max_arity(mth)) + ")\n";
         }
     }
     main_fn += "  call void @kami_run_module(ptr @kamipy_module)\n";

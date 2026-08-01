@@ -99,6 +99,67 @@ KamiPython/
 - `kamipy` — compiler CLI (link LLVM).
 - `libkamirt.a` / `kamirt.lib` — runtime library, **không** phụ thuộc LLVM, được static link vào executable sinh ra.
 
+
+---
+
+## 3a. Thư viện chuẩn nằm ở đâu ("chỉ dịch — không tự viết")
+
+Trình biên dịch có nhiệm vụ **dịch** Python, **không** viết lại thư viện chuẩn bằng C++.
+Nguyên tắc đó chia cây source thành hai nửa rõ ràng:
+
+```
+runtime/pylib/*.py     thư viện chuẩn, viết bằng Python thật, được chính pipeline
+                       biên dịch giống như code người dùng
+                         re.py        engine regex backtracking (parser + VM)
+                         json.py      encoder / decoder
+                         logging.py   logger, level, format %(...)s
+                         requests.py  HTTP/1.1 trên socket
+                         itertools.py functools.py
+
+runtime/src/*.cpp      chỉ giữ những gì Python không tự nói về mình được
+                         value.cpp collections.cpp ops.cpp objects.cpp  value model
+                         gc.cpp                                        mark & sweep GC
+                         builtins.cpp                                  dispatch builtin
+                         oslayer.cpp   binding C-ABI: file, thư mục, env, process
+                         netsock.cpp   binding C-ABI: socket + TLS của OS
+```
+
+### Quy trình resolve import
+
+`import re` khiến driver đi tìm file nguồn, theo đúng thứ tự này:
+
+1. `re.py` (hoặc `re/__init__.py`) cạnh file input — module cục bộ luôn thắng, giống CPython;
+2. `pylib/re.py` cạnh binary `kamipy` (đổi đường dẫn tìm kiếm bằng `$KAMIPY_PYLIB`);
+3. bảng module built-in trong sema — các module binding C-ABI (`math`, `os`, `socket`, ...).
+
+File nguồn tìm được sẽ được lex + parse, import của chính nó được resolve trước, rồi các câu
+lệnh top-level của nó được ghép vào **trước** chương trình. Kết quả: một AST, một lượt `sema`,
+một LLVM module, một file thực thi — runtime **không** có cơ chế import nào cả.
+
+### Name mangling
+
+Vì câu lệnh của module bundle được ghép thẳng vào chương trình, tên top-level của nó sẽ dùng
+chung namespace toàn cục với code người dùng. `logging.py` định nghĩa `error`, `info`, `root`;
+một chương trình viết `error = str(e)` sẽ ghi đè thư viện. Nên mỗi binding top-level của module
+trong `pylib/` được đổi tên theo module:
+
+| Nguồn | Symbol |
+|---|---|
+| `re.search` | `std_re_search` |
+| `re.Pattern` | `std_re_Pattern` |
+| `logging.info` | `std_logging_info` |
+| `Match.group` (method) | `group` — **không** đổi, method dispatch theo tên |
+
+Sema map `mod.attr` và `from mod import x as y` về đúng symbol đã mangle. File `.py` cục bộ
+cạnh chương trình vẫn giữ namespace phẳng, nhờ vậy `from utils import helper` chạy như cũ.
+
+### TLS
+
+`requests` cần TLS, và TLS là dịch vụ do hệ điều hành cung cấp. `socket.wrap_tls(host)` giao
+socket đã connect cho TLS stack của nền tảng — OpenSSL trên POSIX, SChannel trên Windows — và
+mọi `send`/`recv` sau đó đều được mã hoá. Đây đúng là vai trò của module `ssl` trong CPython:
+một binding mỏng, còn logic giao thức nằm phía trên bằng Python.
+
 ---
 
 ## 4. Thiết kế Compiler Frontend

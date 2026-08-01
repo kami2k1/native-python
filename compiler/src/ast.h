@@ -1,6 +1,7 @@
 #pragma once
 #include "token.h"
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -109,6 +110,9 @@ struct Stmt {
     bool star = false;     // FromImport: `from X import *`
     std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
     bool is_closure = false;          // FuncDef compiled with a %captures param
+    // FuncDef: the last entry of `params` is a `*args` catch-all that the
+    // prologue packs into a list from the surplus positional arguments.
+    bool vararg = false;
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
 };
 
@@ -122,6 +126,14 @@ struct Module {
     // driver ("import utils" → utils.py compiled in). Their top-level code is
     // spliced before the main body; sema maps "utils.x" to plain "x".
     std::set<std::string> user_modules;
+    // Symbol prefix applied to a bundled module's top-level names. Modules
+    // shipped in pylib/ are mangled ("re" → std_re_search) so that a stdlib
+    // helper can never be clobbered by a user global of the same name; local
+    // .py files next to the program keep the flat namespace.
+    std::map<std::string, std::string> module_prefix;
+    // Names of the Python stdlib modules the driver found in pylib/ — used to
+    // print a useful list when an import cannot be resolved.
+    std::set<std::string> stdlib_available;
     std::string source_path; // input file path (for __file__)
 };
 

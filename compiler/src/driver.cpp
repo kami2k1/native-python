@@ -151,19 +151,151 @@ static bool is_main_guard(const Stmt* s) {
     return (is_name_dunder(l) && is_main_str(r)) || (is_name_dunder(r) && is_main_str(l));
 }
 
+// ---- stdlib symbol mangling -------------------------------------------------
+// A bundled module's statements are spliced into the program, so its top-level
+// names land in the same global namespace as the user's. For modules shipped in
+// pylib/ that is unacceptable — `logging.py` defines `error`, `info`, `root`;
+// any program that happens to assign to `error` would silently overwrite the
+// library. So every top-level binding of a pylib module is renamed with a
+// module prefix ("re" → std_re_Pattern, std_re_search, ...), and sema maps
+// `re.search` back onto the mangled symbol.
+
+static void collect_bindings(const std::vector<StmtPtr>& body, std::set<std::string>& out) {
+    for (const auto& sp : body) {
+        Stmt* s = sp.get();
+        switch (s->kind) {
+        case StmtKind::FuncDef:
+        case StmtKind::ClassDef: out.insert(s->name); break;
+        case StmtKind::Assign:
+            if (!s->name.empty()) out.insert(s->name);
+            break;
+        case StmtKind::MultiAssign:
+            for (auto& t : s->targets)
+                if (t->kind == ExprKind::Name) out.insert(t->sval);
+            break;
+        case StmtKind::For:
+            for (auto& p : s->params) out.insert(p);
+            break;
+        default: break;
+        }
+        // Module-level control flow can bind names too (`if X: A = 1`).
+        if (s->kind == StmtKind::If || s->kind == StmtKind::While ||
+            s->kind == StmtKind::For || s->kind == StmtKind::Try ||
+            s->kind == StmtKind::With) {
+            collect_bindings(s->body, out);
+            collect_bindings(s->orelse, out);
+            collect_bindings(s->final_body, out);
+            for (auto& h : s->handlers) collect_bindings(h.body, out);
+        }
+    }
+}
+
+struct Mangler {
+    const std::set<std::string>& names;
+    const std::string& prefix;
+
+    void rename(std::string& n) const {
+        if (names.count(n)) n = prefix + n;
+    }
+
+    void expr(Expr* e) const {
+        if (!e) return;
+        // Attribute and method names are *not* renamed: `m.group()` must keep
+        // calling `group`. Only plain identifiers are module-level bindings.
+        if (e->kind == ExprKind::Name) rename(e->sval);
+        for (auto& p : e->params) rename(p);
+        expr(e->a.get());
+        expr(e->b.get());
+        expr(e->c.get());
+        for (auto& a : e->args) expr(a.get());
+        for (auto& [k, v] : e->kwargs) expr(v.get());
+        for (auto& [k, v] : e->pairs) {
+            expr(k.get());
+            expr(v.get());
+        }
+        for (auto& c : e->clauses) {
+            for (auto& t : c.targets) rename(t);
+            expr(c.iter.get());
+            for (auto& cond : c.conds) expr(cond.get());
+        }
+    }
+
+    void stmts(std::vector<StmtPtr>& body, bool in_class = false) const {
+        for (auto& sp : body) stmt(sp.get(), in_class);
+    }
+
+    void stmt(Stmt* s, bool in_class = false) const {
+        if (!s) return;
+        switch (s->kind) {
+        case StmtKind::Import:
+        case StmtKind::FromImport: return; // module paths are not identifiers
+        case StmtKind::FuncDef:
+            // A method keeps its own name — `m.group()` is dispatched by name at
+            // runtime. Only module-level functions are mangled.
+            if (!in_class) rename(s->name);
+            break;
+        case StmtKind::ClassDef:
+            rename(s->name);
+            rename(s->alias); // base class
+            break;
+        case StmtKind::Assign:
+        case StmtKind::For:
+        case StmtKind::Global: rename(s->name); break;
+        default: break;
+        }
+        if (s->kind == StmtKind::For || s->kind == StmtKind::Global ||
+            s->kind == StmtKind::FuncDef)
+            for (auto& p : s->params) rename(p);
+        expr(s->e1.get());
+        expr(s->e2.get());
+        expr(s->e3.get());
+        for (auto& d : s->defaults) expr(d.get());
+        for (auto& d : s->decorators) expr(d.get());
+        for (auto& t : s->targets) expr(t.get());
+        for (auto& v : s->values) expr(v.get());
+        stmts(s->body, s->kind == StmtKind::ClassDef);
+        stmts(s->orelse);
+        stmts(s->final_body);
+        for (auto& h : s->handlers) {
+            rename(h.as_name);
+            stmts(h.body);
+        }
+    }
+};
+
+static void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix) {
+    std::set<std::string> names;
+    collect_bindings(body, names);
+    // `__name__`, `__file__` and friends are provided by the compiler.
+    for (auto it = names.begin(); it != names.end();) {
+        if (it->size() > 4 && it->compare(0, 2, "__") == 0) it = names.erase(it);
+        else ++it;
+    }
+    if (names.empty()) return;
+    Mangler m{names, prefix};
+    m.stmts(body);
+}
+
 namespace {
 struct Bundler {
     fs::path base_dir;
     std::set<std::string> loading; // cycle guard
     std::set<std::string> loaded;
+    std::map<std::string, std::string> prefixes; // module → symbol prefix
     std::vector<StmtPtr> prelude;
 
-    // "pkg.mod" → base_dir/pkg/mod.py
+    // "pkg.mod" → base_dir/pkg/mod.py, falling back to a package directory
+    // (base_dir/pkg/mod/__init__.py) the way Python's import system does.
     fs::path module_path(const std::string& name) const {
         std::string rel = name;
         for (char& ch : rel)
             if (ch == '.') ch = '/';
-        return base_dir / (rel + ".py");
+        std::error_code ec;
+        fs::path flat = base_dir / (rel + ".py");
+        if (fs::exists(flat, ec)) return flat;
+        fs::path pkg = base_dir / rel / "__init__.py";
+        if (fs::exists(pkg, ec)) return pkg;
+        return flat;
     }
 
     // Bundled standard-library modules are shipped as *real Python* in a
@@ -176,6 +308,8 @@ struct Bundler {
         for (const fs::path& dir : stdlib_dirs) {
             fs::path cand = dir / (name + ".py");
             if (fs::exists(cand, ec)) return cand;
+            fs::path pkg = dir / name / "__init__.py";
+            if (fs::exists(pkg, ec)) return pkg;
         }
         return {};
     }
@@ -214,6 +348,13 @@ struct Bundler {
                                      ": error: " + e.what());
         }
         process(sub.body); // dependencies of the dependency come first
+        if (!local) { // shipped stdlib: keep its symbols out of the user's way
+            std::string prefix = "std_" + name + "_";
+            for (char& ch : prefix)
+                if (ch == '.') ch = '_';
+            mangle_module(sub.body, prefix);
+            prefixes[name] = prefix;
+        }
         for (auto& sp : sub.body) {
             if (is_main_guard(sp.get())) continue; // not the main program
             prelude.push_back(std::move(sp));
@@ -235,6 +376,16 @@ static void bundle_local_modules(Module& mod, const fs::path& input, const std::
                      bindir / ".." / "runtime" / "pylib",
                      bindir.parent_path() / "runtime" / "pylib"};
     if (const char* env = getenv("KAMIPY_PYLIB")) b.stdlib_dirs.insert(b.stdlib_dirs.begin(), env);
+    // Record what pylib/ has to offer so sema can name it in error messages.
+    {
+        std::error_code ec;
+        for (const fs::path& dir : b.stdlib_dirs) {
+            if (!fs::is_directory(dir, ec)) continue;
+            for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+                if (it->path().extension() == ".py")
+                    mod.stdlib_available.insert(it->path().stem().string());
+        }
+    }
     b.process(mod.body);
     if (b.loaded.empty()) return;
     std::vector<StmtPtr> merged;
@@ -243,6 +394,7 @@ static void bundle_local_modules(Module& mod, const fs::path& input, const std::
     for (auto& sp : mod.body) merged.push_back(std::move(sp));
     mod.body = std::move(merged);
     mod.user_modules = std::move(b.loaded);
+    mod.module_prefix = std::move(b.prefixes);
 }
 
 std::string build(const BuildOptions& opts) {

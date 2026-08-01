@@ -28,25 +28,24 @@ add_library(kamirt STATIC
     runtime/src/collections.cpp
     runtime/src/ops.cpp
     runtime/src/objects.cpp
-    runtime/src/netio.cpp
-    runtime/src/http_client.cpp
-    runtime/src/kami_regex.cpp
+    runtime/src/oslayer.cpp
+    runtime/src/netsock.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
 if(WIN32)
-    # winhttp: native HTTP/HTTPS client for `requests` (TLS via SChannel)
-    target_link_libraries(kamirt PUBLIC ws2_32 winhttp)
+    # secur32/crypt32: SChannel, the OS TLS stack behind socket.wrap_tls()
+    target_link_libraries(kamirt PUBLIC ws2_32 secur32 crypt32)
 else()
-    # OpenSSL (optional): TLS for https:// in the native `requests` client.
-    # Plain http:// works without it.
+    # OpenSSL (optional): the TLS provider behind socket.wrap_tls(). Plain
+    # http:// works without it; https:// then raises SSLError.
     find_package(OpenSSL QUIET)
     if(OpenSSL_FOUND)
         target_compile_definitions(kamirt PRIVATE KAMI_HAVE_OPENSSL)
         target_link_libraries(kamirt PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     else()
-        message(STATUS "OpenSSL not found — requests will support http:// only")
+        message(STATUS "OpenSSL not found — https:// will raise SSLError at runtime")
     endif()
 endif()
 target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
@@ -75,11 +74,15 @@ add_dependencies(kamipy kamirt)
 # Ship the pure-Python standard library (itertools, functools, ...) next to the
 # kamipy binary so the driver can bundle it on import. The library is Python —
 # compiled by the same pipeline, never reimplemented in C++.
-add_custom_command(TARGET kamipy POST_BUILD
+# A separate ALL target (rather than a POST_BUILD step on kamipy) so that
+# editing a .py file is enough to refresh the shipped copy.
+add_custom_target(kamipy_pylib ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/runtime/pylib
             $<TARGET_FILE_DIR:kamipy>/pylib
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/runtime/pylib
     COMMENT "Copying Python stdlib (pylib/) next to kamipy")
+add_dependencies(kamipy_pylib kamipy)
 
 # ---- tests ----
 enable_testing()

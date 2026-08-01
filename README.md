@@ -54,26 +54,43 @@ kamipy clean                # xóa .kamipy-cache
 |---|---|
 | Types | `int` (64-bit), `float`, `str`, `bool`, `None`, `list`, `dict`, tuples (≈list), function values, **classes/objects** |
 | Exceptions | **`try/except/else/finally`, `raise`, `assert`** — mọi runtime error bắt được |
-| Classes | `class C(Base):`, `__init__`, methods, `self.x`, class attrs, single inheritance, `isinstance` |
-| Strings | **f-strings** (`{x:.2f}`, `{x = }`), triple-quoted docstrings, raw strings, slicing `s[::-1]`, 20+ methods |
+| Classes | `class C(Base):`, `__init__`, methods, `self.x`, class attrs, single inheritance, `isinstance`, **`__str__`/`__repr__`/`__enter__`/`__exit__`** |
+| Strings | **f-strings** (`{x:.2f}`, `{x = }`), **implicit concatenation** (`f"{a}" "tail"`), **`%` formatting** (`"%s=%d" % (a, b)`), triple-quoted docstrings, raw strings, slicing `s[::-1]`, 25+ methods |
 | Operators | số học + so sánh chuỗi hoá (`0 <= i < n`) + logic + **bitwise `& \| ^ ~ << >>`** + `**` + augmented |
 | Control flow | `if/elif/else`, `while`, `for` (đa target unpack), `break/continue`, ternary, inline body |
-| Functions | `def` với **kwargs + default params**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
+| Functions | `def` với **kwargs + default params + `*args`**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
 | Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
-| I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post **native**: socket + TLS — WinHTTP/OpenSSL, proxy + redirect + chunked, không gọi process ngoài), **`json`** (loads/dumps) |
+| I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client, **`wrap_tls()`** → OpenSSL/SChannel, `settimeout`), **`requests`** (pure-Python HTTP/1.1: params/data/json/headers/auth, redirects, chunked, `Response.json()/raise_for_status()`, `Session`), **`json`**, **`re`**, **`logging`** — tất cả là Python trong `runtime/pylib/` |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
-| Modules | native: `math time random threading sys os os.path json logging socket requests re string doctest`; **bundled Python stdlib** (`runtime/pylib/`): `itertools functools`; no-op `typing`/`__future__` |
+| Modules | C-ABI bindings: `math time random threading sys os os.path socket string doctest`; **Python stdlib compiled from source** (`runtime/pylib/`): `re json logging requests itertools functools`; no-op `typing`/`__future__` |
 | Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`, relative `from .mod import x`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
-| Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
+| Threading | Real OS threads with GIL-style lock (elided when single-threaded); **`threading.Lock`/`RLock`** = native mutexes usable with `with`; socket accept/recv and lock waits release the GIL |
 | Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |
 
 **Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1059 build (49%), 784 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
 **Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary. TCP socket server+client qua thread. Xem `docs`/CHANGELOG.
 
-Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, `*args/**kwargs`, walrus `:=`, `@staticmethod/@property`, relative imports, `nonlocal`, `numpy` và third-party modules khác.
+Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, `**kwargs`, walrus `:=`, `@staticmethod/@property`, `nonlocal`, exception subclasses (`class E(Exception)`), và third-party package cần C extension của CPython (`numpy`, `pyautogui`, `PIL`, `flask`).
+
+### "Translate, don't rewrite" / "Chỉ dịch — không tự viết"
+
+The compiler's job is to *translate* Python, not to reimplement the standard library in C++.
+So anything with algorithmic content lives in `runtime/pylib/` as **real Python**, and the same
+`lex → parse → sema → codegen` pipeline turns it into machine code:
+
+```
+runtime/pylib/re.py         a backtracking regex VM   (replaced 411 lines of C++)
+runtime/pylib/json.py       encoder + decoder         (replaced ~240 lines of C++)
+runtime/pylib/logging.py    handlers + formatting     (replaced ~60 lines of C++)
+runtime/pylib/requests.py   HTTP/1.1 over a socket    (replaced 562 lines of C++)
+```
+
+The C++ runtime keeps only what Python cannot express about itself: the value model, the GC,
+and C-ABI bindings down to the OS (`runtime/src/oslayer.cpp` for files/processes,
+`runtime/src/netsock.cpp` for sockets and the platform TLS stack).
 
 ## How it works / Cách hoạt động
 

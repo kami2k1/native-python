@@ -1,0 +1,35 @@
+abc
+HDR
+count: 7
+tail line.
+x7y one two
+True 2
+[0, []] [1, [1]] [3, [1, 'b', None]]
+[1, []] [1, [2, 3]]
+ a a-1-True
+literal x=5
+a/b
+42 03.14 ff FF 100
+ab    |    cd|
+key -> 9
+literal % sign
+single arg
+"a\nb\t'q'" 12 [1, 'x', None]
+True True False
+Point(1, 2)
+Point(1, 2) Point(1, 2)
+<kami> <kami> Named('kami')
+in fstring: Point(1, 2)
+True False False
+True
+True
+True
+True False
+1 4 -1 4
+2 5
+hi hi hi
+['l1', 'l2', 'l3']
+['k', '=', 'v=w'] ['k=v', '=', 'w']
+['a,b', '', '']
+1 1 {'k': 1}
+['a', 'b']

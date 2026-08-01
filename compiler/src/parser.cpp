@@ -988,8 +988,23 @@ struct Parser {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
                 if (check(Tok::SLASH)) { advance(); continue; } // positional-only marker
-                if (check(Tok::STAR) || check(Tok::POW))
-                    throw CompileError(peek().line, "*args/**kwargs are not supported");
+                if (check(Tok::POW))
+                    throw CompileError(peek().line, "**kwargs are not supported");
+                if (check(Tok::STAR)) {
+                    // `*args`: a catch-all for surplus positional arguments. A
+                    // bare `*` (keyword-only marker) has no runtime meaning here
+                    // because keywords are resolved at compile time.
+                    int sline = advance().line;
+                    if (check(Tok::COMMA) || check(Tok::RPAREN)) continue;
+                    if (s->vararg) throw CompileError(sline, "duplicate *args parameter");
+                    s->params.push_back(expect(Tok::NAME, "parameter name").text);
+                    s->vararg = true;
+                    if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    continue;
+                }
+                if (s->vararg)
+                    throw CompileError(peek().line,
+                                       "keyword-only parameters after *args are not supported");
                 s->params.push_back(expect(Tok::NAME, "parameter name").text);
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
@@ -1006,6 +1021,8 @@ struct Parser {
         }
         expect(Tok::RPAREN, "')'");
         if (s->params.size() > 16) throw CompileError(line, "too many parameters (max 16)");
+        if (s->vararg && !s->defaults.empty())
+            throw CompileError(line, "default values combined with *args are not supported");
         if (match(Tok::ARROW)) parse_expr(); // return annotation: ignored
         expect(Tok::COLON, "':'");
         func_depth++;
