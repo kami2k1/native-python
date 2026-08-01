@@ -99,7 +99,7 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 
 | Metric | KamiPython | C++ (-O2) | CPython 3.11 | Target |
 |---|---|---|---|---|
-| hello binary size | **199 KB** (v0.5: 306 KB) | 16 KB | n/a (needs ~30 MB install) | < 5 MB ✅ |
+| hello binary size | **225 KB** (v0.5.1: 365 KB) | 16 KB | n/a (needs ~30 MB install) | < 5 MB ✅ |
 | hello startup | **1.9 ms** | 1.8 ms | 12.6 ms | — |
 | hello max RSS | **3.6 MB** | 3.6 MB | 7.5 MB | < 20 MB ✅ |
 | fib(27) | **42 ms** | — | 44 ms | — |

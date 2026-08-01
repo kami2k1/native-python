@@ -489,22 +489,23 @@ The v0.1 implementation (see `CHANGELOG.md`, v0.1.0) intentionally deviates from
 
 ## 16. v0.6.0: "translate, don't rewrite" (as-built)
 
-v0.3–v0.5 grew a C++ implementation of the standard library inside the runtime:
+v0.3–v0.5.1 grew a C++ implementation of the standard library inside the runtime:
 `runtime/src/netio.cpp` held a JSON parser, a logging formatter, `os`/`os.path`
 wrappers over `std::filesystem`, a socket object model and an HTTP client that
 shelled out to `curl`; `runtime/src/kami_regex.cpp` held a hand-written regex
-engine. Both files are gone.
+engine; `runtime/src/http_client.cpp` replaced the `curl` call with 562 lines of
+WinHTTP/OpenSSL. All three files are gone.
 
 | | before (v0.5) | after (v0.6) |
 |---|---|---|
-| stdlib implementation | ~1 500 lines of C++ in the runtime | ~1 800 lines of Python in `stdlib/` |
+| stdlib implementation | ~2 100 lines of C++ in the runtime | ~2 100 lines of Python in `stdlib/` |
 | `re` | hand-written C++ engine | `stdlib/re.py`, backtracking with an explicit continuation chain |
-| `requests` | `fork` + `curl` subprocess | `stdlib/requests.py` speaking HTTP/1.1 over `stdlib/socket.py` |
+| `requests` | `curl` subprocess (v0.3–v0.5), then 562 lines of C++ over WinHTTP/OpenSSL (v0.5.1) | `stdlib/requests.py` speaking HTTP/1.1 over `stdlib/socket.py` |
 | `socket` | `KT_SOCKET` heap type + C++ methods | Python class over an integer fd |
 | `json`, `logging`, `os`, `os.path`, `string` | C++ builtin ids | Python modules |
 | module namespaces | flat splice (`utils.f` → `f`) | renamed namespace (`re.match` → `re__match`) |
 | runtime tags | `KT_SOCKET` | removed |
-| hello-world binary | 306 KB | 199 KB |
+| hello-world binary | 365 KB | 225 KB |
 
 Consequences worth knowing:
 
@@ -521,8 +522,8 @@ Consequences worth knowing:
   more rooting bugs: `set("string")` handed an unrooted slot to `kami_iter_prep`
   (which allocates one object per character), and `as_list_pinned()` registered
   its pin *after* materializing the list.
-- **Regex is slower.** `re.findall(r"\d+", ...)` over 400 KB of text takes ~0.9 s
-  versus ~0.06 s for the deleted C++ engine — the honest price of running the
+- **Regex is slower.** `re.findall(r"\d+", ...)` over an 8 KB string, 50 times, takes
+  ~0.69 s versus ~0.04 s for the deleted C++ engine — the honest price of running the
   same algorithm the same way CPython does. Native compilation still puts it in
   the same league as CPython's C engine for small inputs, and the matcher has a
   single-character fast path plus a first-atom scan filter.

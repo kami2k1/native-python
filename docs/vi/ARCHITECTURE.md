@@ -487,21 +487,22 @@ Bản triển khai v0.1 (xem `CHANGELOG.md` mục v0.1.0) có các khác biệt 
 
 ## 16. v0.6.0: "chỉ dịch, không tự viết" (as-built)
 
-v0.3–v0.5 đã dựng một bản stdlib bằng C++ ngay trong runtime: `runtime/src/netio.cpp`
+v0.3–v0.5.1 đã dựng một bản stdlib bằng C++ ngay trong runtime: `runtime/src/netio.cpp`
 chứa JSON parser, formatter cho logging, wrapper `os`/`os.path` trên `std::filesystem`,
 model socket và một HTTP client gọi `curl`; `runtime/src/kami_regex.cpp` chứa regex
-engine tự viết. Cả hai file đã bị xoá.
+engine tự viết; `runtime/src/http_client.cpp` thay lời gọi `curl` bằng 562 dòng
+WinHTTP/OpenSSL. Cả ba file đã bị xoá.
 
 | | trước (v0.5) | sau (v0.6) |
 |---|---|---|
-| stdlib | ~1.500 dòng C++ trong runtime | ~1.800 dòng Python trong `stdlib/` |
+| stdlib | ~2.100 dòng C++ trong runtime | ~2.100 dòng Python trong `stdlib/` |
 | `re` | engine C++ tự viết | `stdlib/re.py`, backtracking bằng chuỗi continuation tường minh |
-| `requests` | `fork` + subprocess `curl` | `stdlib/requests.py` nói HTTP/1.1 qua `stdlib/socket.py` |
+| `requests` | subprocess `curl` (v0.3–v0.5), rồi 562 dòng C++ trên WinHTTP/OpenSSL (v0.5.1) | `stdlib/requests.py` nói HTTP/1.1 qua `stdlib/socket.py` |
 | `socket` | heap type `KT_SOCKET` + method C++ | class Python trên một fd integer |
 | `json`, `logging`, `os`, `os.path`, `string` | builtin id trong C++ | module Python |
 | namespace module | splice phẳng (`utils.f` → `f`) | namespace đổi tên (`re.match` → `re__match`) |
 | tag runtime | `KT_SOCKET` | đã bỏ |
-| binary hello-world | 306 KB | 199 KB |
+| binary hello-world | 365 KB | 225 KB |
 
 Những hệ quả cần biết:
 
@@ -516,8 +517,8 @@ Những hệ quả cần biết:
   trong CI. Cũng nhờ công tắc đó mà tìm ra hai bug rooting nữa: `set("chuỗi")` truyền một
   slot chưa root hoá cho `kami_iter_prep` (hàm này cấp phát một object mỗi ký tự), và
   `as_list_pinned()` đăng ký pin *sau* khi vật chất hoá list.
-- **Regex chậm hơn.** `re.findall(r"\d+", ...)` trên 400 KB text mất ~0,9 s so với
-  ~0,06 s của engine C++ đã xoá — giá phải trả trung thực khi chạy cùng một thuật toán
+- **Regex chậm hơn.** `re.findall(r"\d+", ...)` trên chuỗi 8 KB, lặp 50 lần, mất ~0,69 s
+  so với ~0,04 s của engine C++ đã xoá — giá phải trả trung thực khi chạy cùng một thuật toán
   theo cùng cách CPython làm. Bản native vẫn ngang tầm engine C của CPython với input
   nhỏ, và matcher có fast-path một ký tự cùng bộ lọc quét theo atom đầu.
 - **`requests` chưa hỗ trợ HTTPS.** Client cũ thừa hưởng TLS từ `curl`; client Python cần

@@ -99,11 +99,11 @@ trong cùng binary, GET/POST JSON/404/lỗi kết nối), `feat_module_ns.py` (n
 Tổng: 42 integration + 2 unit + 1 GC-stress pass, ASan/UBSan clean.
 
 ### Performance / kích thước
-| | v0.5 | v0.6 |
+| | v0.5.1 | v0.6.0 |
 |---|---|---|
-| binary hello-world | 306 KB | **199 KB** (−35%) |
-| `libkamirt.a` | 577 KB | **379 KB** |
-| `re.findall(r"\d+")` trên 400 KB text ×50 | 63 ms (C++) | 873 ms (Python đã dịch; CPython chạy *cùng* engine: 765 ms, engine C của CPython: 20 ms) |
+| binary hello-world | 365 KB | **225 KB** (−38%) |
+| `libkamirt.a` | 692 KB | **424 KB** (−39%) |
+| `re.findall(r"\d+")` trên 8 KB text ×50 | 42 ms (engine C++) | 687 ms (Python đã dịch; CPython chạy *cùng* engine: 765 ms; engine C của CPython: 20 ms) |
 | compile `import re` + 1 dòng | — | 0,55 s |
 
 Regex chậm hơn là giá phải trả trung thực của nguyên tắc "chỉ dịch"; đổi lại là ngữ nghĩa
