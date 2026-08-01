@@ -461,57 +461,6 @@ static KamiSocket* sock_new(int64_t fd) {
     return s;
 }
 
-// ---------------- subprocess capture (for requests via curl) ----------------
-#ifndef _WIN32
-static int capture_process(const std::vector<std::string>& args, std::string& out) {
-    int fds[2];
-    if (pipe(fds) != 0) return -1;
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        dup2(fds[1], 1);
-        ::close(fds[0]);
-        ::close(fds[1]);
-        std::vector<char*> argv;
-        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-        argv.push_back(nullptr);
-        execvp(argv[0], argv.data());
-        _exit(127);
-    }
-    ::close(fds[1]);
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof buf)) > 0) out.append(buf, (size_t)n);
-    ::close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-}
-#else
-static int capture_process(const std::vector<std::string>& args, std::string& out) {
-    std::string cmd;
-    for (auto& a : args) {
-        if (!cmd.empty()) cmd += " ";
-        if (a.find_first_of(" \t\"") != std::string::npos) {
-            cmd += "\"";
-            for (char c : a) {
-                if (c == '"') cmd += "\\\"";
-                else cmd += c;
-            }
-            cmd += "\"";
-        } else {
-            cmd += a;
-        }
-    }
-    FILE* p = _popen(cmd.c_str(), "rb");
-    if (!p) return -1;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-    return _pclose(p);
-}
-#endif
-
 } // namespace kami
 
 using namespace kami;
@@ -703,14 +652,12 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         out->p = s;
         return true;
     }
-    // ---- requests (via curl: supports http + https) ----
+    // ---- requests: native HTTP client (sockets + TLS), no external process ----
     case KB_REQUESTS_GET:
     case KB_REQUESTS_POST: {
         std::string url = arg_str(0, "requests");
-        // -s (no progress) without -S: connection errors surface as a Python
-        // RequestException, not as stray curl noise on stderr.
-        std::vector<std::string> cmd = {"curl", "-s", "-w",
-                                        "\n__KAMI_HTTP_STATUS__:%{http_code}"};
+        std::string method = id == KB_REQUESTS_GET ? "GET" : "POST";
+        std::string body, content_type;
         double timeout = 0;
         if (id == KB_REQUESTS_GET) {
             if (nargs >= 2 && argv[1]->tag != KT_NONE) {
@@ -719,45 +666,28 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
             }
         } else {
             if (nargs >= 2 && argv[1]->tag != KT_NONE) { // data or json payload
-                std::string body;
                 if (argv[1]->tag == KT_STR) {
                     KamiStr* s = (KamiStr*)argv[1]->p;
                     body.assign(s->data, (size_t)s->len);
                 } else {
                     body = json_dumps(argv[1]);
-                    cmd.push_back("-H");
-                    cmd.push_back("Content-Type: application/json");
+                    content_type = "application/json";
                 }
-                cmd.push_back("--data-binary");
-                cmd.push_back(body);
-                cmd.push_back("-X");
-                cmd.push_back("POST");
-            } else {
-                cmd.push_back("-X");
-                cmd.push_back("POST");
             }
             if (nargs >= 3 && argv[2]->tag != KT_NONE) {
                 if (argv[2]->tag == KT_FLOAT) timeout = argv[2]->f;
                 else if (argv[2]->tag == KT_INT) timeout = (double)argv[2]->i;
             }
         }
-        if (timeout > 0) {
-            cmd.push_back("--max-time");
-            char buf[32];
-            snprintf(buf, sizeof buf, "%.3f", timeout);
-            cmd.push_back(buf);
-        }
-        cmd.push_back(url);
-        std::string raw;
+        sock_startup();
+        long code = 0;
+        std::string resp_body, err;
         lk.unlock();
-        int rc = capture_process(cmd, raw);
+        bool ok2 = http_request(method, url, body, content_type, timeout, code,
+                                resp_body, err);
         lk.lock();
-        size_t mark = raw.rfind("\n__KAMI_HTTP_STATUS__:");
-        if (rc != 0 || mark == std::string::npos)
-            panic("RequestException: request to '" + url + "' failed (curl exit " +
-                  std::to_string(rc) + ")");
-        std::string body = raw.substr(0, mark);
-        long code = strtol(raw.c_str() + mark + strlen("\n__KAMI_HTTP_STATUS__:"), nullptr, 10);
+        if (!ok2)
+            panic("RequestException: request to '" + url + "' failed (" + err + ")");
         // build Response object
         KamiClassObj* cls = internal_class("Response");
         KamiInstance* inst = (KamiInstance*)gc_alloc(sizeof(KamiInstance), KT_OBJECT);
@@ -773,7 +703,7 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         v.i = code >= 200 && code < 400;
         (*inst->fields)["ok"] = v;
         v.tag = KT_STR;
-        v.p = str_new(body.data(), (int64_t)body.size());
+        v.p = str_new(resp_body.data(), (int64_t)resp_body.size());
         (*inst->fields)["text"] = v;
         return true;
     }

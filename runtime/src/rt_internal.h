@@ -158,6 +158,12 @@ std::string percent_format(const std::string& fmt, const KamiValue* args, int64_
 void json_loads(KamiValue* out, const std::string& text);          // lock held
 std::string json_dumps(const KamiValue* v);                        // lock held
 KamiClassObj* internal_class(const char* name);                    // lock held
+// Native HTTP/HTTPS client (http_client.cpp) — call WITHOUT the lock held.
+// Returns false and sets `err` on transport failure (like requests raising).
+bool http_request(const std::string& method, const std::string& url,
+                  const std::string& body, const std::string& content_type,
+                  double timeout_sec, long& status_out, std::string& body_out,
+                  std::string& err);
 void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
                    const std::string& m, KamiValue** argv, int64_t nargs);
 std::string value_str(const KamiValue* v);   // human string (print)

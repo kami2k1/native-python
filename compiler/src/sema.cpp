@@ -525,18 +525,46 @@ struct Sema {
                 err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
         }
         e->kwargs.clear();
-        for (size_t i = 0; i < nparams; i++) {
+        // Trailing holes that have defaults are NOT passed: the callee's
+        // prologue evaluates the default expression in its own (definition)
+        // scope — this is what makes non-literal defaults like
+        // `thread_type=ThreadType.USER` work correctly.
+        size_t pass_n = nparams;
+        while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams)
+            pass_n--;
+        for (size_t i = 0; i < pass_n; i++) {
             if (final_args[i]) continue;
             size_t di = i + ndefaults;
             if (di >= nparams) { // default exists (defaults align to the tail)
                 const Expr* d = def->defaults[di - nparams].get();
+                if (!is_literal_default(d))
+                    err(e->line, def->name + "(): parameter '" +
+                                     def->params[first_param + i] +
+                                     "' has a non-literal default and cannot be "
+                                     "skipped when later arguments are given — pass "
+                                     "it explicitly");
                 final_args[i] = clone_literal(d);
             } else {
                 err(e->line, def->name + "() missing required argument '" +
                                  def->params[first_param + i] + "'");
             }
         }
+        final_args.resize(pass_n);
         e->args = std::move(final_args);
+    }
+
+    static bool is_literal_default(const Expr* e) {
+        switch (e->kind) {
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::StrLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NoneLit: return true;
+        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal_default(e->a.get());
+        case ExprKind::ListLit: return e->args.empty();
+        case ExprKind::MapLit: return e->pairs.empty();
+        default: return false;
+        }
     }
 
     static void apply_const(Expr* e, const ModConst& cv) {

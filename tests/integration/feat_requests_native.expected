@@ -1,0 +1,5 @@
+status: 200
+ok: True
+n: 42
+unreachable: exception raised
+requests native ok

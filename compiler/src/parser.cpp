@@ -905,11 +905,10 @@ struct Parser {
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
                     seen_default = true;
-                    ExprPtr d = parse_expr();
-                    if (!is_literal(d.get()))
-                        throw CompileError(d->line,
-                                           "default parameter values must be literals");
-                    s->defaults.push_back(std::move(d));
+                    // Any expression is allowed (e.g. ThreadType.USER, CONST+1):
+                    // codegen evaluates it in the function prologue when the
+                    // caller omits the argument.
+                    s->defaults.push_back(parse_expr());
                 } else if (seen_default) {
                     throw CompileError(peek().line,
                                        "non-default parameter after default parameter");
@@ -929,26 +928,6 @@ struct Parser {
         return s;
     }
 
-    static bool is_literal(const Expr* e) {
-        switch (e->kind) {
-        case ExprKind::IntLit:
-        case ExprKind::FloatLit:
-        case ExprKind::StrLit:
-        case ExprKind::BoolLit:
-        case ExprKind::NoneLit: return true;
-        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal(e->a.get());
-        case ExprKind::ListLit: return e->args.empty();
-        case ExprKind::MapLit: return e->pairs.empty();
-        case ExprKind::Call: // float("inf"), int(0), ...
-            if (e->a->kind != ExprKind::Name || !e->kwargs.empty()) return false;
-            if (e->a->sval != "float" && e->a->sval != "int" && e->a->sval != "str")
-                return false;
-            for (auto& a : e->args)
-                if (!is_literal(a.get())) return false;
-            return true;
-        default: return false;
-        }
-    }
 
     StmtPtr parse_class() {
         int line = advance().line;

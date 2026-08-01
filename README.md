@@ -61,7 +61,7 @@ kamipy clean                # xóa .kamipy-cache
 | Functions | `def` với **kwargs + default params**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
 | Sugar | list comprehension + genexp, **lambda**, **decorators** `@dec`, tuple assignment/swap/unpack, `x = y = 0`, slices, `;`, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
-| I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post via curl, http+https), **`json`** (loads/dumps) |
+| I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client), **`requests`** (get/post **native**: socket + TLS — WinHTTP/OpenSSL, proxy + redirect + chunked, không gọi process ngoài), **`json`** (loads/dumps) |
 | Collections | + **`set`** (`{1,2}`, `&\|^-`, add/remove), **`del`**, first-class builtins (`sorted(xs, key=len)`) |
 | Modules | `math time random threading sys os os.path json logging socket requests re string doctest`; `re` = self-written regex engine (match/search/findall/sub/split, groups); no-op `typing`/`__future__` |
 | Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |

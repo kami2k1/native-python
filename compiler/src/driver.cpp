@@ -15,6 +15,8 @@
 #include <vector>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <process.h>
 #else
 #include <sys/wait.h>
@@ -60,7 +62,13 @@ int run_process(const std::vector<std::string>& args) {
 }
 
 static fs::path self_dir(const std::string& argv0) {
-#ifndef _WIN32
+#ifdef _WIN32
+    // argv[0] is just "kamipy" when launched via PATH — ask the OS for the
+    // real executable location so kamirt.lib is found from any directory.
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return fs::path(buf).parent_path();
+#else
     std::error_code ec;
     fs::path p = fs::read_symlink("/proc/self/exe", ec);
     if (!ec) return p.parent_path();
@@ -234,9 +242,14 @@ std::string build(const BuildOptions& opts) {
 #ifndef _WIN32
     cmd.push_back("-pthread");
     cmd.push_back("-lm");
+#ifdef KAMI_RT_NEEDS_OPENSSL
+    cmd.push_back("-lssl");
+    cmd.push_back("-lcrypto");
+#endif
     cmd.push_back("-Wl,--gc-sections");
 #else
     cmd.push_back("-lws2_32");
+    cmd.push_back("-lwinhttp");
 #endif
     // clang warns about override of module-less IR opt flags; keep output clean:
     cmd.push_back("-Wno-override-module");

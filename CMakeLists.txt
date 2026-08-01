@@ -29,13 +29,25 @@ add_library(kamirt STATIC
     runtime/src/ops.cpp
     runtime/src/objects.cpp
     runtime/src/netio.cpp
+    runtime/src/http_client.cpp
     runtime/src/kami_regex.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
 if(WIN32)
-    target_link_libraries(kamirt PUBLIC ws2_32)
+    # winhttp: native HTTP/HTTPS client for `requests` (TLS via SChannel)
+    target_link_libraries(kamirt PUBLIC ws2_32 winhttp)
+else()
+    # OpenSSL (optional): TLS for https:// in the native `requests` client.
+    # Plain http:// works without it.
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        target_compile_definitions(kamirt PRIVATE KAMI_HAVE_OPENSSL)
+        target_link_libraries(kamirt PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    else()
+        message(STATUS "OpenSSL not found — requests will support http:// only")
+    endif()
 endif()
 target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
 
@@ -48,6 +60,11 @@ add_library(kamipy_core STATIC
     compiler/src/driver.cpp
 )
 target_include_directories(kamipy_core PUBLIC compiler/src runtime/include)
+if(NOT WIN32 AND OpenSSL_FOUND)
+    # The driver must link compiled programs against the same TLS libs the
+    # runtime was built with (see driver.cpp link command).
+    target_compile_definitions(kamipy_core PRIVATE KAMI_RT_NEEDS_OPENSSL)
+endif()
 
 add_executable(kamipy cli/main.cpp)
 target_link_libraries(kamipy PRIVATE kamipy_core)

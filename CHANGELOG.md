@@ -13,6 +13,29 @@ module Python cục bộ**: `import utils` → compiler tự tìm `utils.py` c�
 source và biên dịch chung vào executable — đúng triết lý "import cái gì thì đóng gói
 source cái đó".
 
+### Added — `requests` native (bỏ hẳn curl)
+- **HTTP client viết lại từ tầng socket trong runtime** (`runtime/src/http_client.cpp`) —
+  không sinh process ngoài, đúng triết lý "dịch cả thư viện":
+  - Windows: **WinHTTP** (system API; TLS qua SChannel, proxy hệ thống + redirect tự động).
+  - POSIX: raw TCP socket + **OpenSSL** cho https (tùy chọn lúc build; http thuần không cần),
+    tự xử lý `Transfer-Encoding: chunked`, `Content-Length`, redirect (301/302/303/307/308,
+    tối đa 5 hop, POST→GET như python-requests), timeout (connect + send + recv),
+    proxy qua `http_proxy`/`https_proxy` (CONNECT tunnel cho https).
+- Lỗi mạng chỉ surface qua `RequestException` — không còn rác stderr
+  (`curl: option -w: requires parameter`, `curl: (7) ...`).
+
+### Added — default parameter values là biểu thức bất kỳ
+- `def send(msg, thread_type=ThreadType.USER, retries=BASE + 5)` — không còn lỗi
+  "default parameter values must be literals". Default được codegen **đánh giá trong
+  prologue của hàm** (scope định nghĩa) khi caller bỏ qua tham số; kwargs bỏ qua tham số
+  giữa chỉ được phép khi default là literal (báo lỗi rõ nếu không).
+
+### Fixed — Windows UX
+- **Console UTF-8**: `SetConsoleOutputCP(CP_UTF8)` lúc khởi động runtime — tiếng Việt
+  in ra đúng thay vì `Kß╗₧I CHß║áY...`.
+- **`kamipy` chạy từ thư mục bất kỳ**: dùng `GetModuleFileName` thay vì `argv[0]` để
+  tìm `kamirt.lib` cạnh binary (hết lỗi "cannot find kamirt.lib" khi kamipy nằm trong PATH).
+
 ### Fixed — Windows / MSVC
 - **`error C2177: constant too big`** (`sema.cpp`, `math.inf`): thay literal `1e999` bằng
   `std::numeric_limits<double>::infinity()`. Đây là lỗi chặn toàn bộ build `kamipy_core`
@@ -44,8 +67,13 @@ source cái đó".
   lỗi kết nối chỉ surface qua `RequestException` như CPython.
 
 ### Verification
-- Integration **34/34 PASS** (2 suite mới: `feat_bundle_app` + `feat_bundle_util`;
+- Integration **38/38 PASS** (4 suite mới: `feat_bundle_app` + `feat_bundle_util`,
+  `feat_requests_native` — HTTP server viết bằng KamiPython phục vụ chính client
+  `requests` native, `feat_default_exprs` — byte-identical CPython 3.11;
   mở rộng `feat_guarded_imports` với kwargs-method-call trong try/except).
+- `requests` native kiểm chứng thật: GET/POST + JSON echo + chunked + redirect qua
+  server local; **HTTPS thật tới example.com** (TLS verify, status 200) và qua
+  proxy CONNECT tunnel.
 - Script bug report (auto-click pull request: os + time + logging + requests +
   guarded pyautogui, kwargs, `response.json()`, `result.get()`) **build và chạy đúng**:
   poll API mỗi 1s, log đủ banner, bắt RequestException khi mất mạng.
