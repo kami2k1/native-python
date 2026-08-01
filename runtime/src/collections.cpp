@@ -51,7 +51,7 @@ uint64_t value_hash(const KamiValue* v) {
         x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
         return x;
     }
-    case KT_STR: return ((KamiStr*)v->p)->hash;
+    case KT_STR: return str_hash((KamiStr*)v->p);
     case KT_LIST: { // tuples are represented as lists; hash deep like a tuple
         KamiList* l = (KamiList*)v->p;
         uint64_t h = 0x345678ull ^ (uint64_t)l->len;

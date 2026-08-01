@@ -101,6 +101,9 @@ void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
                     const KamiValue* kw);
 // dst.update(src) for two dicts (used for `**mapping` at call sites).
 void kami_map_merge(KamiValue* dst, const KamiValue* src);
+// `s += x` fast path: amortized-O(1) in-place string append (emitted only when
+// the compiler proves the target is never aliased). Falls back to `+`.
+void kami_str_iadd(KamiValue* target, const KamiValue* rhs);
 
 // --- loop helpers ---
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);

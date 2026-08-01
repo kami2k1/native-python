@@ -25,16 +25,28 @@ const char* type_name(int64_t tag) {
     }
 }
 
-KamiStr* str_new(const char* data, int64_t len) {
-    KamiStr* s = (KamiStr*)gc_alloc(sizeof(KamiStr) + (uint64_t)len, KT_STR);
+KamiStr* str_new_cap(const char* data, int64_t len, int64_t cap) {
+    if (cap < len) cap = len;
+    KamiStr* s = (KamiStr*)gc_alloc(sizeof(KamiStr) + (uint64_t)cap, KT_STR);
     s->len = len;
+    s->cap = cap;
     if (len) memcpy(s->data, data, (size_t)len);
     s->data[len] = '\0';
-    uint64_t h = 1469598103934665603ull; // FNV-1a
-    for (int64_t i = 0; i < len; i++) h = (h ^ (unsigned char)data[i]) * 1099511628211ull;
-    s->hash = h;
+    s->hash = 0; // computed lazily by str_hash()
     return s;
 }
+
+KamiStr* str_new(const char* data, int64_t len) { return str_new_cap(data, len, len); }
+
+uint64_t str_hash(KamiStr* s) {
+    if (s->hash) return s->hash;
+    uint64_t h = 1469598103934665603ull; // FNV-1a
+    for (int64_t i = 0; i < s->len; i++) h = (h ^ (unsigned char)s->data[i]) * 1099511628211ull;
+    if (!h) h = 1; // reserve 0 for "not computed"
+    s->hash = h;
+    return h;
+}
+
 
 std::string format_float(double d) {
     char buf[64];
@@ -113,6 +125,40 @@ std::string value_repr(const KamiValue* v) {
 using namespace kami;
 
 extern "C" {
+
+// In-place string append for `s += x` when sema has proven `s` is never
+// aliased (see mark_string_iadds). Amortized O(1): the buffer doubles when it
+// runs out of capacity, exactly like std::string. Falls back to the generic
+// binop for non-string operands.
+void kami_str_iadd(KamiValue* target, const KamiValue* rhs) {
+    {
+        Lock lk(g_lock);
+        if (target->tag == KT_STR && rhs->tag == KT_STR) {
+            KamiStr* dst = (KamiStr*)target->p;
+            KamiStr* src = (KamiStr*)rhs->p;
+            int64_t need = dst->len + src->len;
+            if (need <= dst->cap) {
+                memcpy(dst->data + dst->len, src->data, (size_t)src->len);
+                dst->len = need;
+                dst->data[need] = '\0';
+                dst->hash = 0; // contents changed: recompute lazily
+                return;
+            }
+            int64_t cap = dst->cap < 8 ? 16 : dst->cap * 2;
+            while (cap < need) cap *= 2;
+            // gc_alloc may collect, but dst/src stay rooted via caller slots
+            // (mark&sweep never moves objects, so the pointers stay valid).
+            KamiStr* grown = str_new_cap(dst->data, dst->len, cap);
+            memcpy(grown->data + dst->len, src->data, (size_t)src->len);
+            grown->len = need;
+            grown->data[need] = '\0';
+            target->p = grown;
+            return;
+        }
+    }
+    kami_binop(KOP_ADD, target, target, rhs);
+}
+
 
 void kami_copy(KamiValue* dst, const KamiValue* src) {
     Lock lk(g_lock);

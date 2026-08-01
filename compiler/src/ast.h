@@ -126,6 +126,9 @@ struct Stmt {
     std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
     bool is_closure = false;          // FuncDef compiled with a %captures param
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
+    // Assign `s = s + x` where sema's alias analysis proved `s` has no live
+    // aliases: codegen emits an in-place buffer append (kami_str_iadd).
+    bool str_iadd = false;
 };
 
 // A C function the compiled program calls directly (from a C extension mapping

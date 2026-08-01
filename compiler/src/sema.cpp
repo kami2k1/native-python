@@ -1941,11 +1941,246 @@ struct Sema {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Escape / alias analysis (per function).
+//
+// A local variable is "append-safe" when no alias of its value can survive to
+// a later point in the function: assignments of the form `s = s + x` may then
+// mutate the string buffer in place (kami_str_iadd) instead of copying the
+// whole string — turning O(n²) build-up loops into amortized O(n).
+//
+// The analysis is flow-insensitive and conservative: a single retaining use
+// (stored somewhere, passed to a call, captured by a closure, iterated while
+// appends exist, ...) disqualifies the variable. Uses that only *read* the
+// value and produce fresh objects (len(s), s[i], s + t, comparisons, print,
+// str()/format() from f-strings, method receivers) are allowed.
+namespace {
+
+struct AliasScan {
+    const Module& mod;
+    std::set<int64_t> unsafe; // local slots that may have live aliases
+
+    explicit AliasScan(const Module& m) : mod(m) {}
+
+    static bool nonretaining_builtin(int64_t id) {
+        return id == KB_PRINT || id == KB_PRINT_EX || id == KB_LEN || id == KB_ORD ||
+               id == KB_STR || id == KB_FORMAT;
+    }
+
+    void mark(const Expr* e) {
+        if (e && e->kind == ExprKind::Name && e->res == Res::Local)
+            unsafe.insert(e->res_idx);
+    }
+
+    void closure_captures(const Stmt* fn) {
+        for (size_t i = 0; i < fn->multi_tkind.size(); i++)
+            if (fn->multi_tkind[i] == 1) unsafe.insert(fn->multi_tidx[i]);
+    }
+
+    // `retains` = the value produced at this position may be stored beyond
+    // the expression itself.
+    void expr(const Expr* e, bool retains) {
+        if (!e) return;
+        switch (e->kind) {
+        case ExprKind::Name:
+            if (retains) mark(e);
+            return;
+        case ExprKind::Binary: // all binops produce fresh values
+        case ExprKind::Unary:
+            expr(e->a.get(), false);
+            expr(e->b.get(), false);
+            return;
+        case ExprKind::BoolOp: // `a or b` may yield either operand unchanged
+            expr(e->a.get(), retains);
+            expr(e->b.get(), retains);
+            return;
+        case ExprKind::IfExp:
+            expr(e->a.get(), retains);
+            expr(e->b.get(), false); // condition
+            expr(e->c.get(), retains);
+            return;
+        case ExprKind::Index:
+        case ExprKind::Slice:
+        case ExprKind::Attr:
+            expr(e->a.get(), false);
+            expr(e->b.get(), false);
+            for (auto& p : e->args) expr(p.get(), false);
+            return;
+        case ExprKind::Call: {
+            const Expr* callee = e->a.get();
+            bool safe_args = callee && callee->res == Res::BuiltinFunc &&
+                             nonretaining_builtin(callee->res_idx);
+            if (callee && callee->res != Res::BuiltinFunc && callee->res != Res::UserFunc)
+                expr(callee, false);
+            for (auto& a : e->args) expr(a.get(), !safe_args);
+            for (auto& kv : e->kwargs) expr(kv.second.get(), true);
+            return;
+        }
+        case ExprKind::CallStar:
+            expr(e->a.get(), false);
+            for (auto& a : e->args) expr(a.get(), true);
+            for (auto& p : e->pairs) {
+                expr(p.first.get(), true);
+                expr(p.second.get(), true);
+            }
+            return;
+        case ExprKind::MethodCall:
+            expr(e->a.get(), false); // receiver: never aliased as a whole
+            for (auto& a : e->args) expr(a.get(), true);
+            for (auto& kv : e->kwargs) expr(kv.second.get(), true);
+            return;
+        case ExprKind::CCall:
+            for (auto& a : e->args) expr(a.get(), true); // C may stash pointers
+            return;
+        case ExprKind::ListLit:
+        case ExprKind::SetLit:
+            for (auto& a : e->args) expr(a.get(), true);
+            return;
+        case ExprKind::MapLit:
+            for (auto& p : e->pairs) {
+                expr(p.first.get(), true);
+                expr(p.second.get(), true);
+            }
+            return;
+        case ExprKind::Starred:
+            expr(e->a.get(), true);
+            return;
+        case ExprKind::ListComp:
+        case ExprKind::SetComp:
+        case ExprKind::MapComp:
+            for (auto& cl : e->clauses) {
+                expr(cl.iter.get(), true); // iterated: guard mid-loop mutation
+                for (auto& c : cl.conds) expr(c.get(), false);
+            }
+            expr(e->a.get(), true);
+            if (!e->pairs.empty()) {
+                expr(e->pairs[0].first.get(), true);
+                expr(e->pairs[0].second.get(), true);
+            }
+            return;
+        case ExprKind::Closure:
+            closure_captures(mod.functions[(size_t)e->res_idx]);
+            return;
+        case ExprKind::Lambda: // resolved away before this pass
+        default: return;
+        }
+    }
+
+    void stmts(const std::vector<StmtPtr>& body) {
+        for (auto& sp : body) stmt(sp.get());
+    }
+
+    void stmt(const Stmt* s) {
+        switch (s->kind) {
+        case StmtKind::ExprStmt:
+            expr(s->e1.get(), false);
+            return;
+        case StmtKind::Assign:
+            expr(s->e1.get(), true);
+            return;
+        case StmtKind::IndexAssign:
+            expr(s->e1.get(), false);
+            expr(s->e2.get(), false);
+            expr(s->e3.get(), true);
+            return;
+        case StmtKind::AttrAssign:
+            expr(s->e1.get(), false);
+            expr(s->e3.get(), true);
+            return;
+        case StmtKind::MultiAssign:
+            for (auto& t : s->targets) expr(t.get(), false);
+            for (auto& v : s->values) expr(v.get(), true);
+            return;
+        case StmtKind::If:
+        case StmtKind::While:
+            expr(s->e1.get(), false);
+            stmts(s->body);
+            stmts(s->orelse);
+            return;
+        case StmtKind::For:
+            expr(s->e1.get(), true); // iterated: guard mid-loop mutation
+            stmts(s->body);
+            stmts(s->orelse);
+            return;
+        case StmtKind::FuncDef: // nested function: captures alias locals
+            closure_captures(s);
+            return;
+        case StmtKind::Return:
+        case StmtKind::Raise:
+            expr(s->e1.get(), false); // function exits: no later appends
+            return;
+        case StmtKind::Try:
+            stmts(s->body);
+            for (auto& h : s->handlers) {
+                if (h.as_kind == 1) unsafe.insert(h.as_idx);
+                stmts(h.body);
+            }
+            stmts(s->orelse);
+            stmts(s->final_body);
+            return;
+        case StmtKind::With:
+            expr(s->e1.get(), true);
+            stmts(s->body);
+            return;
+        case StmtKind::Del:
+            for (auto& t : s->targets) expr(t.get(), false);
+            return;
+        default: return;
+        }
+    }
+
+    // pass 2: flag `v = v + x` assignments whose target has no aliases
+    void flag(std::vector<StmtPtr>& body, int64_t first_nonparam) {
+        for (auto& sp : body) flag_stmt(sp.get(), first_nonparam);
+    }
+    void flag_stmt(Stmt* s, int64_t first_nonparam) {
+        switch (s->kind) {
+        case StmtKind::Assign: {
+            const Expr* v = s->e1.get();
+            if (s->target_res == Res::Local && v && v->kind == ExprKind::Binary &&
+                v->op == KOP_ADD && v->a && v->a->kind == ExprKind::Name &&
+                v->a->res == Res::Local && v->a->res_idx == s->target_idx &&
+                s->target_idx >= first_nonparam && !unsafe.count(s->target_idx))
+                s->str_iadd = true;
+            return;
+        }
+        case StmtKind::If:
+        case StmtKind::While:
+        case StmtKind::For:
+            flag(s->body, first_nonparam);
+            flag(s->orelse, first_nonparam);
+            return;
+        case StmtKind::Try:
+            flag(s->body, first_nonparam);
+            for (auto& h : s->handlers) flag(h.body, first_nonparam);
+            flag(s->orelse, first_nonparam);
+            flag(s->final_body, first_nonparam);
+            return;
+        case StmtKind::With:
+            flag(s->body, first_nonparam);
+            return;
+        default: return;
+        }
+    }
+};
+
+} // namespace
+
+static void mark_string_iadds(const Module& m, Stmt* fn) {
+    AliasScan scan(m);
+    scan.stmts(fn->body);
+    // parameters are caller-owned: never mutate their buffers in place
+    int64_t first_nonparam = (int64_t)fn->params.size() + (fn->vararg.empty() ? 0 : 1) +
+                             (fn->kwarg.empty() ? 0 : 1);
+    scan.flag(fn->body, first_nonparam);
+}
+
 void analyze(Module& m) {
     Sema s(m);
     s.collect_module();
     for (auto& sp : m.body) s.resolve_stmt(sp.get());
     m.nglobals = (int64_t)s.globals.size();
+    for (Stmt* fn : m.functions) mark_string_iadds(m, fn);
 }
 
 bool known_builtin_module(const std::string& name) {

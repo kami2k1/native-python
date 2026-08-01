@@ -22,8 +22,9 @@ struct ObjHeader {
 struct KamiStr {
     ObjHeader h;
     int64_t len;
-    uint64_t hash;
-    char data[1]; // len bytes + NUL
+    int64_t cap;   // buffer capacity (bytes, excluding NUL); >= len
+    uint64_t hash; // FNV-1a, computed lazily (0 = not yet computed)
+    char data[1];  // cap bytes + NUL
 };
 
 struct KamiList {
@@ -155,6 +156,8 @@ void gc_track_extra(uint64_t bytes);
 
 // helpers
 KamiStr* str_new(const char* data, int64_t len);       // lock held
+KamiStr* str_new_cap(const char* data, int64_t len, int64_t cap); // lock held
+uint64_t str_hash(KamiStr* s); // lazy FNV-1a (lock held)
 KamiList* list_new(int64_t cap);                       // lock held
 KamiMap* map_new();                                    // lock held
 void list_push(KamiList* l, const KamiValue* v);       // lock held

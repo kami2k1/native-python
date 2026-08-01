@@ -815,6 +815,14 @@ struct FnGen {
             gen_expr(s->e1.get());
             break;
         case StmtKind::Assign: {
+            if (s->str_iadd) {
+                // `s = s + x` with no live aliases: append into s's buffer in
+                // place (amortized O(1)); falls back to `+` for non-strings.
+                int rhs = gen_expr(s->e1->b.get());
+                emit("call void @kami_str_iadd(ptr " + slot_ptr((int)s->target_idx) +
+                     ", ptr " + slot_ptr(rhs) + ")");
+                break;
+            }
             int v = gen_expr(s->e1.get());
             assign_var(s->target_res, s->target_idx, v);
             break;
@@ -1478,6 +1486,7 @@ declare void @kami_call_value(ptr, ptr, ptr, i64)
 declare void @kami_method(ptr, ptr, ptr, ptr, i64)
 declare void @kami_builtin(i64, ptr, ptr, i64)
 declare void @kami_call_star(ptr, ptr, ptr, ptr)
+declare void @kami_str_iadd(ptr, ptr)
 declare void @kami_map_merge(ptr, ptr)
 declare void @kami_panic(ptr)
 declare i32 @kami_range_cond(ptr, ptr, ptr)
