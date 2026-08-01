@@ -25,6 +25,7 @@ const char* type_name(int64_t tag) {
     case KT_LOCK: return "lock";
     case KT_PYOBJ: return "pyobject";
     case KT_GEN: return "generator";
+    case KT_SYNC: return "sync";
     default: return "?";
     }
 }
@@ -115,8 +116,14 @@ std::string value_str(const KamiValue* v) {
     case KT_THREAD: return "<thread>";
     case KT_GEN: return "<generator object>";
     case KT_CLASS: return std::string("<class '") + ((KamiClassObj*)v->p)->name + "'>";
-    case KT_OBJECT:
-        return std::string("<") + ((KamiInstance*)v->p)->cls->name + " object>";
+    case KT_OBJECT: {
+        KamiInstance* in = (KamiInstance*)v->p;
+        // exception instances stringify as "Name: message" (see kami_call_value)
+        auto it = in->fields->find("__exc_msg__");
+        if (it != in->fields->end() && it->second.tag == KT_STR)
+            return value_str(&it->second);
+        return std::string("<") + in->cls->name + " object>";
+    }
     default: return "<?>";
     }
 }

@@ -154,6 +154,10 @@ struct Stmt {
     // FuncDef: body contains `yield` — calls build a generator object instead
     // of running the body (parser sets it, codegen/runtime consume it).
     bool is_generator = false;
+    // ClassDef: (transitively) derives from a builtin exception. Instances
+    // without __init__ accept any message argument and stringify as
+    // "Name: message" so raise/str work like CPython's Exception.
+    bool is_exception = false;
 };
 
 // A C function the compiled program calls directly (from a C extension mapping
@@ -211,6 +215,10 @@ struct Module {
     // so a stdlib helper can never be clobbered by a user global of the same
     // name; project .py files keep the flat namespace.
     std::map<std::string, std::string> module_prefix;
+    // Package re-exports: "concurrent.futures.Future" → the mangled global it
+    // really refers to ("std_concurrent_futures__base_Future"). Filled by the
+    // bundler from top-level (and hoisted lazy) from-imports of packages.
+    std::map<std::string, std::string> module_exports;
     // Library module names that were importable — used to print a useful list
     // when an import cannot be resolved.
     std::set<std::string> stdlib_available;

@@ -41,6 +41,11 @@ enum KamiTag : int64_t {
     KT_LOCK = 14,  // threading.Lock
     KT_PYOBJ = 15, // CPython object bridged through the embedded C-API layer
     KT_GEN = 16,   // generator (suspended `yield` function, fiber-backed)
+    KT_SYNC = 17,  // threading.Condition / Event / Semaphore
+    // Internal marker, never a live value: a dynamic call passing KT_MISSING
+    // for a defaulted parameter makes the callee prologue evaluate the
+    // default (keyword-only defaults after *args, e.g. Executor.map).
+    KT_MISSING = 98,
 };
 
 enum KamiBinOp : int64_t {
@@ -128,7 +133,10 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
                 const KamiValue* stop, const KamiValue* step);
 
 // --- classes / attributes ---
-void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx);
+// flags: 1 = exception class (instances without __init__ accept a message
+// argument and stringify as "Name: message").
+void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx,
+                            int64_t flags);
 void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
                            int64_t min_arity, int64_t arity, int64_t kwonly,
                            int64_t flags, const char* param_names);
@@ -136,10 +144,11 @@ void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
 void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val);
 
 // --- exceptions ---
-// Runs an outlined try-body (signature: int64_t body(KamiValue* frame)).
+// Runs an outlined try-body (signature: int64_t body(KamiValue* frame,
+// KamiValue* captures)).
 // Returns the body's code (0 normal, 1 return, 2 break, 3 continue) or -1 if
 // a runtime error was caught; the message is then available via kami_last_error.
-int64_t kami_try(void* body_fn, KamiValue* frame);
+int64_t kami_try(void* body_fn, KamiValue* frame, KamiValue* captures);
 void kami_last_error(KamiValue* out);
 void kami_raise(const KamiValue* msg);
 void kami_rethrow(void);

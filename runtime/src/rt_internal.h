@@ -55,7 +55,7 @@ struct KamiMap {
 };
 
 // KamiFuncObj::flags
-enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2, KFN_GENERATOR = 4 };
+enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2, KFN_GENERATOR = 4, KFN_BOUND = 8 };
 
 struct KamiFuncObj {
     ObjHeader h;
@@ -67,13 +67,19 @@ struct KamiFuncObj {
     KamiValue* captures; // heap array, null when not a closure
     int64_t ncaptures;
     int64_t kwonly;          // index where keyword-only params begin (== arity if none)
-    int64_t flags;           // KFN_VARARG / KFN_KWARG
+    int64_t flags;           // KFN_VARARG / KFN_KWARG / KFN_GENERATOR / KFN_BOUND
     const char* param_names; // comma-joined fixed parameter names (may be "")
+    KamiValue self;          // KFN_BOUND: the bound receiver (GC-marked)
 };
 
 struct ThreadData {
     std::thread th;
     bool joined = false;
+    // threading.Thread(target=..., args=...): stored until .start()
+    bool started = false;
+    bool daemon = false;
+    KamiValue target{KT_NONE, {0}}; // GC-marked via the thread object
+    std::vector<KamiValue> args;
 };
 
 struct KamiThreadObj {
@@ -86,6 +92,11 @@ struct KamiClassObj {
     const char* name;                                // static string
     KamiClassObj* parent;                            // may be null
     std::unordered_map<std::string, KamiValue>* members; // methods + class attrs
+    // collections.namedtuple factory classes: field names in declaration
+    // order (instances are constructed positionally and unpack in order).
+    std::vector<std::string>* nt_fields = nullptr;
+    // exception class: __init__-less instantiation takes a message argument
+    bool is_exception = false;
 };
 
 struct KamiInstance {
@@ -122,6 +133,17 @@ struct KamiLock {
     void* mtx;      // std::recursive_timed_mutex*
     bool reentrant;
     int64_t depth;  // for locked()
+};
+
+// threading.Condition / Event / Semaphore: native synchronisation primitives
+// (sync.cpp). One object type, three kinds; the internals live outside the GC
+// heap because blocked threads keep raw pointers into them.
+struct SyncImpl;
+struct KamiSync {
+    ObjHeader h;
+    int64_t kind; // 0 = Condition, 1 = Event, 2 = Semaphore
+    SyncImpl* impl;
+    KamiValue assoc; // Condition: the underlying threading.Lock (GC-marked)
 };
 
 // Runtime error used for Python-level exceptions (try/except).
@@ -256,7 +278,6 @@ std::string pyobj_str(const KamiValue* v);
 int32_t pyobj_truthy(const KamiValue* v);
 
 // Generators (generator.cpp).
-struct KamiFuncObj;
 bool gen_advance(KamiValue* out, KamiGenObj* gen, const KamiValue* sent);
 void gen_create_from_func(KamiValue* out, KamiFuncObj* fo, const KamiValue* fnval,
                           KamiValue** argv, int64_t nargs);
@@ -268,6 +289,19 @@ void gen_drain_to_list(KamiValue* out, KamiValue* gen_val); // list(g), sorted(g
 void gen_mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack,
                        void (*mark)(const KamiValue*, std::vector<ObjHeader*>&));
 void gen_finalize(ObjHeader* h);                      // GC sweep
+
+// Synchronisation primitives + thread objects (sync.cpp).
+void sync_make(KamiValue* out, int64_t kind, KamiValue** argv, int64_t nargs); // ctor
+bool sync_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
+                 const std::string& m, KamiValue** argv, int64_t nargs, KamiMap* kwmap);
+void sync_destroy(KamiSync* s);                       // GC sweep
+void thread_make(KamiValue* out, KamiValue** argv, int64_t nargs); // threading.Thread(...)
+bool thread_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
+                   const std::string& m, KamiValue** argv, int64_t nargs);
+void thread_start(KamiValue* out, KamiThreadObj* to); // t.start()
+void atexit_register(KamiValue** argv, int64_t nargs); // threading._register_atexit
+void atexit_run();                                     // kami_rt_shutdown, before joins
+extern std::vector<KamiValue> g_atexit;               // GC roots (marked in gc.cpp)
 
 [[noreturn]] void panic(const std::string& msg); // throws KamiError
 

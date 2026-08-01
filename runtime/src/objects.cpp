@@ -1,11 +1,14 @@
 // Classes, instances, attributes, and the exception machinery.
 #include "rt_internal.h"
 
+#include "../include/kami_builtins.h"
+
 #include <chrono>
 #include <mutex>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace kami {
 
@@ -51,7 +54,8 @@ using namespace kami;
 
 extern "C" {
 
-void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx) {
+void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx,
+                            int64_t flags) {
     Lock lk(g_lock);
     KamiClassObj* parent = nullptr;
     if (parent_gidx >= 0) {
@@ -63,6 +67,7 @@ void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx) 
     c->name = name;
     c->parent = parent;
     c->members = new std::unordered_map<std::string, KamiValue>();
+    c->is_exception = (flags & 1) != 0;
     g_globals[(size_t)idx].tag = KT_CLASS;
     g_globals[(size_t)idx].p = c;
 }
@@ -96,6 +101,29 @@ void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name) {
         pyobj_attr_get(out, &o, name);
         return;
     }
+    if (o.tag == KT_GEN) {
+        // `g.__next__` read as a value (itertools.count().__next__): a bound
+        // callable that advances the generator.
+        if (strcmp(name, "__next__") == 0 || strcmp(name, "next") == 0) {
+            KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
+            f->fn = nullptr;
+            f->min_arity = 0;
+            f->arity = 0;
+            f->builtin_id = KB_NEXT;
+            f->name = "__next__";
+            f->captures = nullptr;
+            f->ncaptures = 0;
+            f->kwonly = 0;
+            f->flags = KFN_BOUND;
+            f->param_names = "";
+            f->self = o;
+            out->tag = KT_FUNC;
+            out->p = f;
+            return;
+        }
+        panic(std::string("AttributeError: 'generator' object has no attribute '") + name +
+              "'");
+    }
     if (o.tag == KT_OBJECT) {
         KamiInstance* in = (KamiInstance*)o.p;
         auto it = in->fields->find(name);
@@ -104,6 +132,29 @@ void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name) {
             return;
         }
         if (KamiValue* m = class_lookup(in->cls, name)) {
+            // Reading a method as a value produces a BOUND method (CPython
+            // semantics): `n = itertools.count().__next__; n()` must work.
+            if (m->tag == KT_FUNC) {
+                KamiFuncObj* src = (KamiFuncObj*)m->p;
+                if (src->builtin_id < 0 && !(src->flags & KFN_BOUND)) {
+                    KamiValue mv = *m; // gc_alloc below may collect: keep rooted
+                    KamiFuncObj* b = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
+                    ObjHeader hdr = b->h; // keep the GC header gc_alloc set up
+                    *b = *(KamiFuncObj*)mv.p;
+                    b->h = hdr;
+                    if (b->ncaptures > 0) { // captures array is owned per object
+                        b->captures = (KamiValue*)malloc(sizeof(KamiValue) *
+                                                         (size_t)b->ncaptures);
+                        memcpy(b->captures, ((KamiFuncObj*)mv.p)->captures,
+                               sizeof(KamiValue) * (size_t)b->ncaptures);
+                    }
+                    b->flags |= KFN_BOUND;
+                    b->self = o;
+                    out->tag = KT_FUNC;
+                    out->p = b;
+                    return;
+                }
+            }
             *out = *m; // unbound; direct method calls go through kami_method
             return;
         }
@@ -139,6 +190,17 @@ void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val) {
 
 void kami_unpack(KamiValue* out, const KamiValue* seq, int64_t idx, int64_t expect_len) {
     Lock lk(g_lock);
+    if (seq->tag == KT_OBJECT) { // namedtuple instances unpack positionally
+        KamiInstance* in = (KamiInstance*)seq->p;
+        if (in->cls && in->cls->nt_fields) {
+            auto& f = *in->cls->nt_fields;
+            if ((int64_t)f.size() != expect_len)
+                panic("unpack expected " + std::to_string(expect_len) + " values, got " +
+                      std::to_string(f.size()));
+            *out = (*in->fields)[f[(size_t)idx]];
+            return;
+        }
+    }
     if (seq->tag != KT_LIST)
         panic(std::string("cannot unpack '") + type_name(seq->tag) + "' object");
     KamiList* l = (KamiList*)seq->p;
@@ -215,15 +277,15 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
 
 // ---- exceptions ----
 
-int64_t kami_try(void* body_fn, KamiValue* frame) {
-    using BodyFn = int64_t (*)(KamiValue*);
+int64_t kami_try(void* body_fn, KamiValue* frame, KamiValue* captures) {
+    using BodyFn = int64_t (*)(KamiValue*, KamiValue*);
     size_t depth;
     {
         Lock lk(g_lock);
         depth = tls_frames()->frames.size();
     }
     try {
-        return ((BodyFn)body_fn)(frame);
+        return ((BodyFn)body_fn)(frame, captures);
     } catch (KamiError& e) {
         Lock lk(g_lock);
         // Unwinding skipped kami_frame_pop calls of frames inside the body:

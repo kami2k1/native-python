@@ -34,6 +34,7 @@ add_library(kamirt STATIC
     runtime/src/syscalls.cpp
     runtime/src/pycapi.cpp
     runtime/src/generator.cpp
+    runtime/src/sync.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)

@@ -736,7 +736,8 @@ struct Parser {
         }
         // one or more simple statements separated by ';'
         for (;;) {
-            body.push_back(parse_small_stmt());
+            StmtPtr s = parse_small_stmt(&body);
+            body.push_back(std::move(s));
             if (match(Tok::SEMI)) {
                 if (check(Tok::NEWLINE)) { advance(); return; }
                 continue;
@@ -746,7 +747,7 @@ struct Parser {
         }
     }
 
-    StmtPtr parse_small_stmt() {
+    StmtPtr parse_small_stmt(std::vector<StmtPtr>* pre = nullptr) {
         const Token& t = peek();
         switch (t.kind) {
         case Tok::KW_RETURN: {
@@ -837,7 +838,7 @@ struct Parser {
             while (match(Tok::COMMA)) s->params.push_back(expect(Tok::NAME, "name").text);
             return s;
         }
-        default: return parse_simple();
+        default: return parse_simple(pre);
         }
     }
 
@@ -1139,6 +1140,10 @@ struct Parser {
                     ExprPtr base = parse_expr();
                     if (first && base->kind == ExprKind::Name && base->sval != "object")
                         s->alias = base->sval;
+                    // dotted base: `class TPE(_base.Executor)` → "_base.Executor"
+                    if (first && base->kind == ExprKind::Attr &&
+                        base->a->kind == ExprKind::Name)
+                        s->alias = base->a->sval + "." + base->sval;
                     first = false;
                 } while (match(Tok::COMMA));
             }
@@ -1170,9 +1175,24 @@ struct Parser {
                 expect(Tok::ASSIGN, "'='");
                 a->e1 = parse_expr();
                 expect(Tok::NEWLINE, "newline");
+                // `__class_getitem__ = classmethod(types.GenericAlias)` and
+                // friends exist purely for typing (`Future[str]`); annotations
+                // are ignored here, so the machinery behind them is too.
+                if (a->name == "__class_getitem__" || a->name == "__hash__" ||
+                    a->name == "__slots__")
+                    continue;
                 s->body.push_back(std::move(a));
             } else if (check(Tok::AT)) {
                 s->body.push_back(parse_decorated());
+            } else if (check(Tok::NAME) && peek(1).kind == Tok::DOT) {
+                // `submit.__doc__ = Executor.submit.__doc__` — documentation
+                // plumbing on an already-defined method: parse and drop.
+                StmtPtr doc = parse_simple();
+                if (doc->kind != StmtKind::AttrAssign || doc->name.rfind("__", 0) != 0)
+                    throw CompileError(doc->line,
+                                       "only methods and simple attribute assignments are "
+                                       "supported in class bodies");
+                expect(Tok::NEWLINE, "newline");
             } else {
                 throw CompileError(peek().line,
                                    "only methods and simple attribute assignments are "
@@ -1223,8 +1243,10 @@ struct Parser {
         return e;
     }
 
-    // assignment / expression statement (NEWLINE/SEMI left unconsumed)
-    StmtPtr parse_simple() {
+    // assignment / expression statement (NEWLINE/SEMI left unconsumed).
+    // `pre` (when given) receives extra statements produced by desugaring,
+    // emitted BEFORE the returned statement.
+    StmtPtr parse_simple(std::vector<StmtPtr>* pre = nullptr) {
         int line = peek().line;
         if (check(Tok::KW_YIELD)) { // statement-position yield (most common)
             auto s = mks(StmtKind::ExprStmt, line);
@@ -1255,6 +1277,23 @@ struct Parser {
             }
             expect(Tok::ASSIGN, "'='");
             s->values.push_back(parse_expr());
+            // chained middle target:  a, b, c = s = rhs  →  s = rhs; a,b,c = s
+            if (check(Tok::ASSIGN) && pre &&
+                s->values[0]->kind == ExprKind::Name) {
+                std::string mid = s->values[0]->sval;
+                advance(); // '='
+                ExprPtr rhs = parse_rhs_values_as_one(line);
+                auto assign = mks(StmtKind::Assign, line);
+                assign->name = mid;
+                assign->e1 = std::move(rhs);
+                pre->push_back(std::move(assign));
+                s->values[0] = std::make_unique<Expr>();
+                s->values[0]->kind = ExprKind::Name;
+                s->values[0]->line = line;
+                s->values[0]->sval = mid;
+                for (auto& t2 : s->targets) check_target(t2.get());
+                return s;
+            }
             while (match(Tok::COMMA)) {
                 if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
                 s->values.push_back(parse_expr());

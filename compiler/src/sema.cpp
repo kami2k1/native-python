@@ -31,7 +31,7 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"type", {KB_TYPE, 1, 1}},    {"range", {KB_RANGE, 1, 3}},
         {"sum", {KB_SUM, 1, 2}},      {"sorted", {KB_SORTED, 1, 1}},
         {"reversed", {KB_REVERSED, 1, 1}}, {"enumerate", {KB_ENUMERATE, 1, 2}},
-        {"zip", {KB_ZIP, 2, 2}},      {"bool", {KB_BOOL, 1, 1}},
+        {"zip", {KB_ZIP, 1, 16}},     {"bool", {KB_BOOL, 1, 1}},
         {"round", {KB_ROUND, 1, 2}},  {"input", {KB_INPUT, 0, 1}},
         {"pow", {KB_POW, 2, 3}},      {"all", {KB_ALL, 1, 1}},
         {"any", {KB_ANY, 1, 1}},      {"bin", {KB_BIN, 1, 1}},
@@ -44,6 +44,8 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"map", {KB_MAP, 2, 2}}, {"filter", {KB_FILTER, 2, 2}},
         {"repr", {KB_REPR, 1, 1}}, {"callable", {KB_CALLABLE, 1, 1}},
         {"next", {KB_NEXT, 1, 2}}, {"iter", {KB_ITER, 1, 1}},
+        {"hasattr", {KB_HASATTR, 2, 2}}, {"getattr", {KB_GETATTR, 2, 3}},
+        {"id", {KB_ID, 1, 1}}, {"object", {KB_OBJECT, 0, 0}},
     };
     return b;
 }
@@ -84,7 +86,23 @@ modules() {
               {"choices", {KB_RANDOM_CHOICES, 1, 2}}}},
             {"threading",
              {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}},
-              {"Lock", {KB_THREAD_LOCK, 0, 0}}, {"RLock", {KB_THREAD_RLOCK, 0, 0}}}},
+              {"Lock", {KB_THREAD_LOCK, 0, 0}}, {"RLock", {KB_THREAD_RLOCK, 0, 0}},
+              {"Condition", {KB_THREAD_CONDITION, 0, 1}},
+              {"Event", {KB_THREAD_EVENT, 0, 0}},
+              {"Semaphore", {KB_THREAD_SEMAPHORE, 0, 1}},
+              {"BoundedSemaphore", {KB_THREAD_SEMAPHORE, 0, 1}},
+              {"Thread", {KB_THREAD_THREAD, 0, 4}},
+              {"current_thread", {KB_THREAD_CURRENT, 0, 0}},
+              {"_register_atexit", {KB_THREAD_ATEXIT, 1, 9}}}},
+            {"collections",
+             {{"namedtuple", {KB_NAMEDTUPLE, 2, 3}},
+              {"deque", {KB_DEQUE, 0, 1}},
+              {"OrderedDict", {KB_DICT, 0, 0}}}},
+            {"weakref",
+             {{"ref", {KB_WEAKREF_REF, 1, 2}},
+              {"WeakKeyDictionary", {KB_DICT, 0, 0}},
+              {"WeakValueDictionary", {KB_DICT, 0, 0}},
+              {"WeakSet", {KB_SET, 0, 0}}}},
             {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
             {"doctest", {{"testmod", {KB_NOOP, 0, 2}}}},
             {"string", {}},
@@ -95,7 +113,10 @@ modules() {
               {"rmdir", {KB_OS_RMDIR, 1, 1}},   {"rename", {KB_OS_RENAME, 2, 2}},
               {"system", {KB_OS_SYSTEM, 1, 1}}, {"getenv", {KB_OS_GETENV, 1, 2}},
               {"walk", {KB_OS_WALK, 1, 1}},     {"chdir", {KB_OS_CHDIR, 1, 1}},
-              {"getpid", {KB_OS_GETPID, 0, 0}}, {"urandom", {KB_OS_URANDOM, 1, 1}}}},
+              {"getpid", {KB_OS_GETPID, 0, 0}}, {"urandom", {KB_OS_URANDOM, 1, 1}},
+              {"cpu_count", {KB_OS_CPU_COUNT, 0, 0}},
+              {"process_cpu_count", {KB_OS_CPU_COUNT, 0, 0}},
+              {"register_at_fork", {KB_NOOP, 0, 3}}}},
             {"os.path",
              {{"exists", {KB_OSP_EXISTS, 1, 1}}, {"isfile", {KB_OSP_ISFILE, 1, 1}},
               {"isdir", {KB_OSP_ISDIR, 1, 1}},   {"join", {KB_OSP_JOIN, 1, 16}},
@@ -128,7 +149,7 @@ static bool builtin_exception_name(const std::string& n) {
 // Imports that are accepted and ignored (annotation-only / test helpers).
 static bool noop_module(const std::string& name) {
     return name == "typing" || name == "__future__" || name == "abc" ||
-           name == "dataclasses" || name == "collections.abc";
+           name == "dataclasses" || name == "collections.abc" || name == "types";
 }
 
 // CPython C extension modules bridged through the embedded C-API layer
@@ -290,6 +311,7 @@ struct Sema {
 
     int try_depth = 0; // imports inside try/except may fail softly
     Stmt* cur_func = nullptr;
+    const Stmt* cur_class = nullptr; // ClassDef whose methods are being resolved
     std::unordered_map<std::string, int64_t> locals;
     std::set<std::string> global_decls; // 'global x' names in current function
 
@@ -447,6 +469,17 @@ struct Sema {
             // imports work there.
             const std::string& pfx = module_prefix(modname);
             for (auto& [n, alias] : s->import_names) {
+                // `from concurrent.futures import _base` — a sibling MODULE
+                if (mod.user_modules.count(modname + "." + n)) {
+                    user_imports[alias] = modname + "." + n;
+                    continue;
+                }
+                // package re-export recorded by the bundler
+                auto xit = mod.module_exports.find(modname + "." + n);
+                if (xit != mod.module_exports.end()) {
+                    bundled_names[alias] = xit->second;
+                    continue;
+                }
                 if (!pfx.empty()) bundled_names[alias] = pfx + n;
                 else if (alias != n)
                     err(s->line, "'from " + modname + " import " + n + " as " + alias +
@@ -618,6 +651,27 @@ struct Sema {
                 else if (!global_decls.count(s->name)) local_slot(s->name);
                 break; // its body is a separate function scope
             case StmtKind::ClassDef:
+                if (as_globals) {
+                    // `try: from _queue import Empty / except: class Empty(...)`
+                    // — a guarded module-level class definition (CPython stdlib
+                    // fallback idiom). Register it like any top-level class.
+                    if (classes.count(s->name))
+                        err(s->line, "class '" + s->name + "' redefined");
+                    s->global_idx = global_slot(s->name);
+                    mod.classes.push_back(s);
+                    ClassEntry ce;
+                    ce.def = s;
+                    ce.global = s->global_idx;
+                    for (auto& msp : s->body) {
+                        if (msp->kind == StmtKind::FuncDef) {
+                            Stmt* m = msp.get();
+                            register_funcdef(m, s->name + "__" + m->name, false);
+                            ce.methods[m->name] = m;
+                        }
+                    }
+                    classes[s->name] = std::move(ce);
+                    break;
+                }
                 err(s->line, "classes may only be defined at module level");
             default: break;
             }
@@ -974,6 +1028,36 @@ struct Sema {
             e->args.clear();
             return true;
         }
+        if (mod == "os" && fn == "register_at_fork") { // fork hooks: no-op AOT
+            e->kwargs.clear();
+            e->args.clear();
+            return true;
+        }
+        if (mod == "threading" && fn == "Thread") {
+            // Thread(target=, args=, name=, daemon=) → positional
+            // [target, args, name, daemon] for the KB_THREAD_THREAD builtin.
+            ExprPtr target, args, name, daemon;
+            if (!e->args.empty()) return false; // positional form not supported
+            for (auto& [kw, val] : e->kwargs) {
+                if (kw == "target") target = std::move(val);
+                else if (kw == "args") args = std::move(val);
+                else if (kw == "name") name = std::move(val);
+                else if (kw == "daemon") daemon = std::move(val);
+                else if (kw == "kwargs") return false;
+            }
+            e->kwargs.clear();
+            auto none = [&]() {
+                auto n = std::make_unique<Expr>();
+                n->kind = ExprKind::NoneLit;
+                n->line = e->line;
+                return n;
+            };
+            e->args.push_back(target ? std::move(target) : none());
+            e->args.push_back(args ? std::move(args) : none());
+            e->args.push_back(name ? std::move(name) : none());
+            e->args.push_back(daemon ? std::move(daemon) : none());
+            return true;
+        }
         return false;
     }
 
@@ -1067,10 +1151,19 @@ struct Sema {
             return;
         case ExprKind::Attr: {
             // Bundled local module: "utils.CONSTANT" → plain name "CONSTANT"
-            // (bundled modules share the program's global namespace).
-            if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
-                !name_shadowed(e->a->sval)) {
-                std::string attr = module_prefix(user_imports.at(e->a->sval)) + e->sval;
+            // (bundled modules share the program's global namespace). Dotted
+            // packages ("concurrent.futures.FIRST_COMPLETED") flatten too.
+            std::string chain = attr_chain_name(e->a.get());
+            if (!chain.empty() && user_imports.count(chain) &&
+                !name_shadowed(chain_root(chain))) {
+                const std::string& modname = user_imports.at(chain);
+                // package re-export: `concurrent.futures.Future` is really
+                // `concurrent.futures._base.Future` (from-imported by the
+                // package __init__) — the bundler recorded the mapping.
+                auto xit = mod.module_exports.find(modname + "." + e->sval);
+                std::string attr = xit != mod.module_exports.end()
+                                       ? xit->second
+                                       : module_prefix(modname) + e->sval;
                 e->kind = ExprKind::Name;
                 e->sval = attr;
                 e->a.reset();
@@ -1153,6 +1246,27 @@ struct Sema {
                     return;
                 }
             }
+            // hasattr(<native module>, "name") — the answer is known at
+            // compile time (module names are not values in this runtime):
+            // fold to a boolean so `if hasattr(os, 'register_at_fork'):`
+            // guards compile.
+            if (e->a->kind == ExprKind::Name && e->a->sval == "hasattr" &&
+                !name_shadowed("hasattr") && e->args.size() == 2 &&
+                e->args[0]->kind == ExprKind::Name &&
+                imports.count(e->args[0]->sval) &&
+                !name_shadowed(e->args[0]->sval) &&
+                e->args[1]->kind == ExprKind::StrLit) {
+                const std::string& modname = imports.at(e->args[0]->sval);
+                auto mit = modules().find(modname);
+                if (mit != modules().end()) {
+                    bool has = mit->second.count(e->args[1]->sval) != 0;
+                    e->kind = ExprKind::BoolLit;
+                    e->ival = has ? 1 : 0;
+                    e->args.clear();
+                    e->a.reset();
+                    return;
+                }
+            }
             // isinstance(x, int) / isinstance(x, (int, float)): type names are
             // rewritten to string literals before normal name resolution.
             if (e->a->kind == ExprKind::Name && e->a->sval == "isinstance" &&
@@ -1202,7 +1316,8 @@ struct Sema {
                         auto init = c->second.methods.find("__init__");
                         if (init != c->second.methods.end())
                             apply_signature(e, init->second, true);
-                        else if (!e->args.empty() || !e->kwargs.empty())
+                        else if (!c->second.def->is_exception &&
+                                 (!e->args.empty() || !e->kwargs.empty()))
                             err(e->line, n + "() takes no arguments");
                         resolve_args();
                         callee->res = Res::Global;
@@ -1231,6 +1346,8 @@ struct Sema {
                         callee->res_idx = b->second.id;
                         if (n == "print" && !e->kwargs.empty()) resolve_print_kwargs(e);
                         else if (n == "sorted" && !e->kwargs.empty()) resolve_sorted_kwargs(e);
+                        else if ((n == "min" || n == "max") && !e->kwargs.empty())
+                            resolve_minmax_kwargs(e);
                         else if (!e->kwargs.empty())
                             err(e->line, n + "() does not accept keyword arguments");
                         return;
@@ -1245,19 +1362,48 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
-            // Bundled local module: "utils.helper(args)" → plain call "helper(args)".
-            // Re-resolving as a Call keeps kwargs/default-argument support.
-            if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
-                !name_shadowed(e->a->sval)) {
-                auto callee = std::make_unique<Expr>();
-                callee->kind = ExprKind::Name;
-                callee->line = e->line;
-                callee->sval = module_prefix(user_imports.at(e->a->sval)) + e->sval;
-                e->kind = ExprKind::Call;
-                e->a = std::move(callee);
-                e->sval.clear();
+            // `super().m(args)` inside a method → BaseClass.m(self, args)
+            // (single inheritance: the base is known statically).
+            if (e->a->kind == ExprKind::Call && e->a->a &&
+                e->a->a->kind == ExprKind::Name && e->a->a->sval == "super" &&
+                !name_shadowed("super") && cur_class && cur_func &&
+                !cur_func->params.empty()) {
+                if (cur_class->alias.empty())
+                    err(e->line, "super(): class '" + cur_class->name + "' has no base class");
+                auto recv = std::make_unique<Expr>();
+                recv->kind = ExprKind::Name;
+                recv->line = e->line;
+                recv->sval = cur_class->alias;
+                auto selfe = std::make_unique<Expr>();
+                selfe->kind = ExprKind::Name;
+                selfe->line = e->line;
+                selfe->sval = cur_func->params[0];
+                e->a = std::move(recv);
+                e->args.insert(e->args.begin(), std::move(selfe));
                 resolve_expr(e);
                 return;
+            }
+            // Bundled local module: "utils.helper(args)" → plain call "helper(args)".
+            // Re-resolving as a Call keeps kwargs/default-argument support.
+            // Dotted packages ("concurrent.futures.as_completed(...)") flatten too.
+            {
+                std::string chain = attr_chain_name(e->a.get());
+                if (!chain.empty() && user_imports.count(chain) &&
+                    !name_shadowed(chain_root(chain))) {
+                    const std::string& modname = user_imports.at(chain);
+                    auto xit = mod.module_exports.find(modname + "." + e->sval);
+                    auto callee = std::make_unique<Expr>();
+                    callee->kind = ExprKind::Name;
+                    callee->line = e->line;
+                    callee->sval = xit != mod.module_exports.end()
+                                       ? xit->second
+                                       : module_prefix(modname) + e->sval;
+                    e->kind = ExprKind::Call;
+                    e->a = std::move(callee);
+                    e->sval.clear();
+                    resolve_expr(e);
+                    return;
+                }
             }
             // obj.m(*a, **k): lower to a method CallStar — positionals packed
             // into a list, keywords into a dict, matched by the runtime.
@@ -1389,21 +1535,22 @@ struct Sema {
                                          "'");
                     apply_signature(e, mit->second, false);
                 } else {
-                    // Dynamic receiver (e.g. a module that soft-failed to import
-                    // inside try/except, or an arbitrary object). Don't hard-fail
-                    // the whole build: defer to a catchable runtime error so
-                    // guarded code paths still compile.
-                    e->kind = ExprKind::Call;
-                    e->args.clear();
+                    // Dynamic receiver (an object, a sync primitive, ...):
+                    // lower to CallStar — kami_method_star matches the keyword
+                    // dict against the callee signature at runtime, and native
+                    // receivers (Condition.wait(timeout=...), Semaphore.
+                    // acquire(timeout=...)) interpret it themselves. Errors
+                    // stay catchable runtime errors.
+                    for (auto& [kw, v] : e->kwargs) {
+                        auto key = std::make_unique<Expr>();
+                        key->kind = ExprKind::StrLit;
+                        key->line = e->line;
+                        key->sval = kw;
+                        e->pairs.emplace_back(std::move(key), std::move(v));
+                    }
                     e->kwargs.clear();
-                    auto callee = std::make_unique<Expr>();
-                    callee->kind = ExprKind::Name;
-                    callee->line = e->line;
-                    callee->sval = "kwargs-unsupported";
-                    callee->res = Res::BuiltinFunc;
-                    callee->res_idx = KB_KWARGS_UNSUPPORTED;
-                    e->a = std::move(callee);
-                    e->sval.clear();
+                    e->kind = ExprKind::CallStar; // sval keeps the method name
+                    resolve_expr(e->a.get());
                     return;
                 }
             }
@@ -1470,10 +1617,59 @@ struct Sema {
         return (cur_func && locals.count(n) && !global_decls.count(n)) || globals.count(n);
     }
 
+    // "a.b.c" for a pure Name/Attr chain, "" otherwise — used to recognize
+    // dotted module references like `concurrent.futures.as_completed`.
+    static std::string attr_chain_name(const Expr* e) {
+        if (e->kind == ExprKind::Name) return e->sval;
+        if (e->kind == ExprKind::Attr) {
+            std::string base = attr_chain_name(e->a.get());
+            return base.empty() ? "" : base + "." + e->sval;
+        }
+        return "";
+    }
+
+    // First segment of a dotted name (shadowing is decided by the root name).
+    static std::string chain_root(const std::string& dotted) {
+        size_t dot = dotted.find('.');
+        return dot == std::string::npos ? dotted : dotted.substr(0, dot);
+    }
+
     void check_builtin_call(Expr* e, const std::string& n, const BuiltinSig& sig) {
         int total = (int)e->args.size();
         if (total < sig.min_args || total > sig.max_args)
             err(e->line, n + "() got " + std::to_string(total) + " argument(s)");
+    }
+
+    void resolve_minmax_kwargs(Expr* e) {
+        // min/max(iterable, key=?, default=?) →
+        //   KB_MIN_EX/KB_MAX_EX(iterable, key|None, has_default, default)
+        if (e->args.size() != 1)
+            err(e->line, "min()/max() keyword form takes a single iterable");
+        ExprPtr key, dflt;
+        bool has_default = false;
+        for (auto& [kw, val] : e->kwargs) {
+            if (kw == "key") key = std::move(val);
+            else if (kw == "default") {
+                dflt = std::move(val);
+                has_default = true;
+            } else
+                err(e->line, "min()/max() got an unexpected keyword argument '" + kw + "'");
+        }
+        e->kwargs.clear();
+        auto none = [&]() {
+            auto n = std::make_unique<Expr>();
+            n->kind = ExprKind::NoneLit;
+            n->line = e->line;
+            return n;
+        };
+        auto flag = std::make_unique<Expr>();
+        flag->kind = ExprKind::BoolLit;
+        flag->line = e->line;
+        flag->ival = has_default ? 1 : 0;
+        e->args.push_back(key ? std::move(key) : none());
+        e->args.push_back(std::move(flag));
+        e->args.push_back(dflt ? std::move(dflt) : none());
+        e->a->res_idx = e->a->sval == "min" ? KB_MIN_EX : KB_MAX_EX;
     }
 
     // ---- constant folding ----
@@ -1769,7 +1965,27 @@ struct Sema {
             }
             return;
         case StmtKind::ClassDef:
+            // Dotted base (`class TPE(_base.Executor)`): resolve through the
+            // bundled-module prefix so the mangled class name is found.
+            if (!s->alias.empty()) {
+                size_t dot = s->alias.find('.');
+                if (dot != std::string::npos) {
+                    std::string modalias = s->alias.substr(0, dot);
+                    std::string cls = s->alias.substr(dot + 1);
+                    if (user_imports.count(modalias))
+                        s->alias = module_prefix(user_imports.at(modalias)) + cls;
+                    else
+                        s->alias = cls; // best effort (module not bundled)
+                }
+                // exception pedigree: direct builtin-exception base, or an
+                // already-resolved exception class
+                if (builtin_exception_name(s->alias)) s->is_exception = true;
+                else if (classes.count(s->alias) &&
+                         classes.at(s->alias).def->is_exception)
+                    s->is_exception = true;
+            }
             // resolve methods; class attribute assigns resolved as class-attr sets
+            cur_class = s;
             for (auto& msp : s->body) {
                 if (msp->kind == StmtKind::FuncDef) {
                     Stmt* m = msp.get();
@@ -1789,6 +2005,7 @@ struct Sema {
                     resolve_expr(msp->e1.get());
                 }
             }
+            cur_class = nullptr;
             for (auto& d : s->decorators) resolve_expr(d.get());
             if (!s->alias.empty() && !classes.count(s->alias)) {
                 // `class E(Exception)` / `class E(ValueError)`: exceptions are
@@ -1830,6 +2047,42 @@ struct Sema {
                 s->name = ex->sval;
                 s->e1.reset();
                 return;
+            }
+            // raise UserError("msg") where UserError is an __init__-less
+            // exception class (`class UserError(Exception): pass`): Exception
+            // subclasses accept any message, and exceptions are matched by
+            // name at runtime — raise "UserError: msg" directly.
+            if (ex->kind == ExprKind::Call && ex->a->kind == ExprKind::Name &&
+                classes.count(ex->a->sval) && ex->args.size() <= 1 &&
+                ex->kwargs.empty()) {
+                bool has_init = false;
+                std::string cls = ex->a->sval;
+                std::set<std::string> seen;
+                while (classes.count(cls) && seen.insert(cls).second) {
+                    if (classes.at(cls).methods.count("__init__")) {
+                        has_init = true;
+                        break;
+                    }
+                    cls = classes.at(cls).def->alias;
+                }
+                if (!has_init) {
+                    s->raise_mode = 2;
+                    s->name = ex->a->sval;
+                    // library-module classes are mangled: report the source name
+                    for (auto& [modname, prefix] : mod.module_prefix) {
+                        if (s->name.rfind(prefix, 0) == 0) {
+                            s->name = s->name.substr(prefix.size());
+                            break;
+                        }
+                    }
+                    if (!ex->args.empty()) {
+                        s->e1 = std::move(ex->args[0]);
+                        resolve_expr(s->e1.get());
+                    } else {
+                        s->e1.reset();
+                    }
+                    return;
+                }
             }
             resolve_expr(ex);
             return;
