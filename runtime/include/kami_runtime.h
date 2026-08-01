@@ -38,7 +38,8 @@ enum KamiTag : int64_t {
     KT_SET = 11,
     KT_FILE = 12,
     KT_SOCKET = 13,
-    KT_LOCK = 14,
+    KT_LOCK = 14,  // threading.Lock
+    KT_PYOBJ = 15, // CPython object bridged through the embedded C-API layer
 };
 
 enum KamiBinOp : int64_t {
@@ -62,7 +63,8 @@ void kami_globals_init(int64_t n);
 void kami_global_get(KamiValue* out, int64_t idx);
 void kami_global_set(int64_t idx, const KamiValue* v);
 void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity,
-                           int64_t arity, const char* name);
+                           int64_t arity, const char* name, int64_t kwonly,
+                           int64_t flags, const char* param_names);
 void kami_frame_push(KamiValue* slots, int64_t n); // zeroes slots, registers as roots
 void kami_frame_pop(void);
 
@@ -73,6 +75,8 @@ void kami_make_bool(KamiValue* out, int64_t b);
 void kami_make_int(KamiValue* out, int64_t v);
 void kami_make_float(KamiValue* out, double v);
 void kami_make_str(KamiValue* out, const char* data, int64_t len);
+// Pre-interns a constant-pool string literal into a codegen cache cell.
+void kami_intern_str(void** cell, const char* data, int64_t len);
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
 // `*args` prologue: packs argv[first..nargs) into a list stored in *out.
 void kami_pack_varargs(KamiValue* out, KamiValue** argv, int64_t nargs, int64_t first);
@@ -81,7 +85,8 @@ void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name
 // Build a closure: copies ncap captured values (given as an array of slot
 // pointers) into the function object. out must be a rooted slot.
 void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
-                       const char* name, KamiValue** capture_slots, int64_t ncap);
+                       const char* name, KamiValue** capture_slots, int64_t ncap,
+                       int64_t kwonly, int64_t flags, const char* param_names);
 void kami_make_set(KamiValue* out);
 void kami_set_add(KamiValue* set, const KamiValue* v);
 
@@ -96,6 +101,18 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
 void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** argv,
                  int64_t nargs);
 void kami_builtin(int64_t id, KamiValue* out, KamiValue** argv, int64_t nargs);
+// Call with runtime argument unpacking: f(*args, **kwargs). `pos` is a LIST of
+// positional arguments, `kw` a MAP of keyword arguments (may be empty).
+void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
+                    const KamiValue* kw);
+// dst.update(src) for two dicts (used for `**mapping` at call sites).
+void kami_map_merge(KamiValue* dst, const KamiValue* src);
+// obj.m(*args, **kwargs) — method call with runtime unpacking.
+void kami_method_star(KamiValue* out, KamiValue* obj, const char* name,
+                      const KamiValue* pos, const KamiValue* kw);
+// `s += x` fast path: amortized-O(1) in-place string append (emitted only when
+// the compiler proves the target is never aliased). Falls back to `+`.
+void kami_str_iadd(KamiValue* target, const KamiValue* rhs);
 
 // --- loop helpers ---
 int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiValue* step);
@@ -112,7 +129,8 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
 // --- classes / attributes ---
 void kami_global_make_class(int64_t idx, const char* name, int64_t parent_gidx);
 void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
-                           int64_t min_arity, int64_t arity);
+                           int64_t min_arity, int64_t arity, int64_t kwonly,
+                           int64_t flags, const char* param_names);
 void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
 void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val);
 
@@ -126,6 +144,18 @@ void kami_raise(const KamiValue* msg);
 void kami_rethrow(void);
 // Top-level entry: runs the module body, catching runtime errors.
 void kami_run_module(void* module_fn);
+
+// --- CPython C-API bridge (pycapi.cpp) ---
+// Imports a real CPython extension module (.so/.pyd) through the system's
+// libpython and wraps it as a KT_PYOBJ value. Attribute access, calls and
+// method calls on KT_PYOBJ values are bridged automatically.
+void kami_pyext_import(KamiValue* out, const char* name);
+// getattr(module, name) → global (used for `from _hashlib import ...`).
+void kami_pyext_getattr(KamiValue* out, const KamiValue* module, const char* name);
+
+// Escape-analysis hint: the container held in this slot is provably dead
+// (about to be overwritten, no aliases) — recycle its memory immediately.
+void kami_free_hint(KamiValue* slot);
 
 // --- diagnostics ---
 void kami_panic(const char* msg);

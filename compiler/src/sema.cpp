@@ -113,6 +113,33 @@ static bool noop_module(const std::string& name) {
            name == "dataclasses" || name == "collections.abc";
 }
 
+// CPython C extension modules bridged through the embedded C-API layer
+// (pycapi.cpp): the compiled program loads the machine's real libpython at
+// runtime and lets CPython's import machinery link the original .so/.pyd.
+// Extend with KAMIPY_PYEXT=mod1,mod2 at compile time.
+static bool pyext_module(const std::string& name) {
+    static const std::set<std::string> known = {
+        "_hashlib",  "_ssl",       "_sqlite3",     "zlib",     "_bz2",
+        "_lzma",     "_zoneinfo",  "unicodedata",  "pyexpat",  "_elementtree",
+        "_decimal",  "_json",      "_csv",         "_pickle",  "_datetime",
+        "_multiprocessing", "select", "termios",   "readline", "_curses",
+        "_uuid",     "_lsprof",    "audioop",      "_crypt",   "mmap",
+    };
+    if (known.count(name)) return true;
+    if (const char* extra = getenv("KAMIPY_PYEXT")) {
+        std::string s = extra;
+        size_t p = 0;
+        while (p <= s.size()) {
+            size_t c = s.find(',', p);
+            std::string tok = s.substr(p, c == std::string::npos ? c : c - p);
+            if (tok == name) return true;
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+    }
+    return false;
+}
+
 // Modules whose members are C functions rather than Python ones: the C
 // extensions CPython's own library is built on, plus the two FFI front ends.
 static bool ffi_module(const std::string& name) { return is_ffi_module(name); }
@@ -361,6 +388,14 @@ struct Sema {
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
+        if (pyext_module(modname)) {
+            // Bridged CPython extension: the module becomes an ordinary global
+            // holding a KT_PYOBJ; codegen emits the runtime import here.
+            s->pyext = true;
+            s->global_idx = global_slot(s->alias.empty() ? modname : s->alias);
+            for (auto& extra : s->body) register_import(extra.get());
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return; // try: import X / except ImportError: pass
             err(s->line, unknown_module_msg(modname));
@@ -417,6 +452,14 @@ struct Sema {
         if (ffi_module(modname)) {
             // `from ctypes import CDLL` / `from cffi import FFI`
             for (auto& [n, alias] : s->import_names) ffi_names[alias] = modname + "." + n;
+            return;
+        }
+        if (pyext_module(modname)) {
+            // `from _hashlib import openssl_sha256`: each name becomes a
+            // global bound to getattr(module, name) at this point at runtime.
+            s->pyext = true;
+            for (auto& [n, alias] : s->import_names)
+                s->multi_tidx.push_back(global_slot(alias));
             return;
         }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
@@ -673,29 +716,31 @@ struct Sema {
     }
 
     // Rewrites call kwargs/defaults into plain positional args when the callee
-    // signature is known (user function or class constructor).
+    // signature is known (user function or class constructor). Extra
+    // positional arguments are packed into a *args tuple and unmatched keyword
+    // arguments into a **kwargs dict when the callee declares them; the packed
+    // values are passed as ordinary trailing arguments (slots params.size()
+    // and params.size()+1).
     void apply_signature(Expr* e, Stmt* def, bool skip_self) {
         size_t nparams = def->params.size() - (skip_self ? 1 : 0);
         size_t ndefaults = def->defaults.size();
         size_t first_param = skip_self ? 1 : 0;
-        if (def->vararg) {
-            // `def f(a, b, *rest)`: the fixed parameters must all be supplied
-            // positionally; everything after them is handed to the callee as-is
-            // and packed into `rest` by the prologue.
-            size_t nfixed = nparams - 1;
-            if (!e->kwargs.empty())
-                err(e->line, def->name + "() does not accept keyword arguments (it uses *" +
-                                 def->params.back() + ")");
-            if (e->args.size() < nfixed)
-                err(e->line, def->name + "() missing required argument '" +
-                                 def->params[first_param + e->args.size()] + "'");
-            return;
-        }
+        bool hv = !def->vararg.empty(), hk = !def->kwarg.empty();
+        // Keyword-only parameters cannot be filled positionally.
+        size_t npos = nparams;
+        if (def->kwonly >= 0) npos = (size_t)def->kwonly - first_param;
         std::vector<ExprPtr> final_args(nparams);
-        if (e->args.size() > nparams)
-            err(e->line, def->name + "() takes " + std::to_string(nparams) +
-                             " argument(s) but " + std::to_string(e->args.size()) +
-                             " were given");
+        std::vector<ExprPtr> extra_pos;
+        std::vector<std::pair<ExprPtr, ExprPtr>> extra_kw;
+        if (e->args.size() > npos) {
+            if (!hv)
+                err(e->line, def->name + "() takes " + std::to_string(npos) +
+                                 " argument(s) but " + std::to_string(e->args.size()) +
+                                 " were given");
+            for (size_t i = npos; i < e->args.size(); i++)
+                extra_pos.push_back(std::move(e->args[i]));
+            e->args.resize(npos);
+        }
         for (size_t i = 0; i < e->args.size(); i++) final_args[i] = std::move(e->args[i]);
         for (auto& [kw, val] : e->kwargs) {
             bool found = false;
@@ -708,21 +753,35 @@ struct Sema {
                     break;
                 }
             }
-            if (!found)
-                err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
+            if (found) continue;
+            if (hk) {
+                auto k = std::make_unique<Expr>();
+                k->kind = ExprKind::StrLit;
+                k->line = e->line;
+                k->sval = kw;
+                extra_kw.emplace_back(std::move(k), std::move(val));
+                continue;
+            }
+            err(e->line, def->name + "() got an unexpected keyword argument '" + kw + "'");
         }
         e->kwargs.clear();
         // Trailing holes that have defaults are NOT passed: the callee's
         // prologue evaluates the default expression in its own (definition)
         // scope — this is what makes non-literal defaults like
-        // `thread_type=ThreadType.USER` work correctly.
+        // `thread_type=ThreadType.USER` work correctly. When packed *args /
+        // **kwargs values must be passed after the fixed parameters, no holes
+        // may remain, so every skipped default has to be a clonable literal.
+        bool pass_packed = !extra_pos.empty() || !extra_kw.empty();
         size_t pass_n = nparams;
-        while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams)
-            pass_n--;
+        if (!pass_packed) {
+            while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams &&
+                   def->defaults[pass_n - 1 + ndefaults - nparams] != nullptr)
+                pass_n--;
+        }
         for (size_t i = 0; i < pass_n; i++) {
             if (final_args[i]) continue;
             size_t di = i + ndefaults;
-            if (di >= nparams) { // default exists (defaults align to the tail)
+            if (di >= nparams && def->defaults[di - nparams] != nullptr) {
                 const Expr* d = def->defaults[di - nparams].get();
                 if (!is_literal_default(d))
                     err(e->line, def->name + "(): parameter '" +
@@ -737,6 +796,22 @@ struct Sema {
             }
         }
         final_args.resize(pass_n);
+        if (pass_packed) {
+            if (hv) { // *args tuple (always passed when anything packed follows)
+                auto lst = std::make_unique<Expr>();
+                lst->kind = ExprKind::ListLit;
+                lst->line = e->line;
+                lst->args = std::move(extra_pos);
+                final_args.push_back(std::move(lst));
+            }
+            if (!extra_kw.empty()) { // **kwargs dict
+                auto mp = std::make_unique<Expr>();
+                mp->kind = ExprKind::MapLit;
+                mp->line = e->line;
+                mp->pairs = std::move(extra_kw);
+                final_args.push_back(std::move(mp));
+            }
+        }
         e->args = std::move(final_args);
     }
 
@@ -1030,6 +1105,36 @@ struct Sema {
             return;
         }
         case ExprKind::Call: {
+            // Call-site unpacking `f(*a, **k)`: the argument shape is only
+            // known at runtime, so lower to CallStar — the callee is evaluated
+            // as a value, positionals are packed into a list (Starred items
+            // extend it) and keywords into a dict, and kami_call_star matches
+            // them against the callee's signature at runtime.
+            {
+                bool has_star = false, has_dstar = false;
+                for (auto& a : e->args)
+                    if (a->kind == ExprKind::Starred) has_star = true;
+                for (auto& [kw, v] : e->kwargs)
+                    if (kw.empty()) has_dstar = true;
+                if (has_star || has_dstar) {
+                    for (auto& a : e->args) resolve_expr(a.get());
+                    for (auto& [kw, v] : e->kwargs) resolve_expr(v.get());
+                    resolve_expr(e->a.get());
+                    for (auto& [kw, v] : e->kwargs) {
+                        ExprPtr key;
+                        if (!kw.empty()) {
+                            key = std::make_unique<Expr>();
+                            key->kind = ExprKind::StrLit;
+                            key->line = e->line;
+                            key->sval = kw;
+                        }
+                        e->pairs.emplace_back(std::move(key), std::move(v));
+                    }
+                    e->kwargs.clear();
+                    e->kind = ExprKind::CallStar;
+                    return;
+                }
+            }
             // isinstance(x, int) / isinstance(x, (int, float)): type names are
             // rewritten to string literals before normal name resolution.
             if (e->a->kind == ExprKind::Name && e->a->sval == "isinstance" &&
@@ -1135,6 +1240,33 @@ struct Sema {
                 e->sval.clear();
                 resolve_expr(e);
                 return;
+            }
+            // obj.m(*a, **k): lower to a method CallStar — positionals packed
+            // into a list, keywords into a dict, matched by the runtime.
+            {
+                bool has_star = false, has_dstar = false;
+                for (auto& a : e->args)
+                    if (a->kind == ExprKind::Starred) has_star = true;
+                for (auto& [kw, v] : e->kwargs)
+                    if (kw.empty()) has_dstar = true;
+                if (has_star || has_dstar) {
+                    for (auto& a : e->args) resolve_expr(a.get());
+                    for (auto& [kw, v] : e->kwargs) resolve_expr(v.get());
+                    resolve_expr(e->a.get()); // receiver
+                    for (auto& [kw, v] : e->kwargs) {
+                        ExprPtr key;
+                        if (!kw.empty()) {
+                            key = std::make_unique<Expr>();
+                            key->kind = ExprKind::StrLit;
+                            key->line = e->line;
+                            key->sval = kw;
+                        }
+                        e->pairs.emplace_back(std::move(key), std::move(v));
+                    }
+                    e->kwargs.clear();
+                    e->kind = ExprKind::CallStar; // sval keeps the method name
+                    return;
+                }
             }
             // os.path.<fn>(...) — nested-module call: base is Attr(os, "path").
             if (e->a->kind == ExprKind::Attr && e->a->a->kind == ExprKind::Name &&
@@ -1279,7 +1411,7 @@ struct Sema {
             return; // produced by this pass, never fed back into it
         case ExprKind::MapLit:
             for (auto& p : e->pairs) {
-                resolve_expr(p.first.get());
+                if (p.first) resolve_expr(p.first.get()); // null = **unpacking
                 resolve_expr(p.second.get());
             }
             return;
@@ -1717,7 +1849,9 @@ struct Sema {
 
     void resolve_function(Stmt* s, bool as_closure) {
         // defaults are evaluated in the DEFINING (enclosing) scope
-        for (auto& d : s->defaults) resolve_expr(d.get());
+        // (null entries are "required keyword-only" holes — see parser)
+        for (auto& d : s->defaults)
+            if (d) resolve_expr(d.get());
         // push current frame
         Frame f;
         f.def = cur_func;
@@ -1739,6 +1873,15 @@ struct Sema {
             if (locals.count(p)) err(s->line, "duplicate parameter '" + p + "'");
             if (global_decls.count(p)) err(s->line, "parameter '" + p + "' declared global");
             local_slot(p);
+        }
+        // *args tuple and **kwargs dict live in the slots directly after the
+        // fixed parameters (params.size() and params.size()+1).
+        for (const std::string* extra : {&s->vararg, &s->kwarg}) {
+            if (extra->empty()) continue;
+            if (locals.count(*extra)) err(s->line, "duplicate parameter '" + *extra + "'");
+            if (global_decls.count(*extra))
+                err(s->line, "parameter '" + *extra + "' declared global");
+            local_slot(*extra);
         }
         collect_assigned(s->body, false);
         resolve_stmts(s->body);
@@ -1770,6 +1913,11 @@ struct Sema {
         fn->line = lam->line;
         fn->name = "<lambda>";
         fn->params = lam->params;
+        fn->vararg = lam->vararg;
+        fn->kwarg = lam->kwarg;
+        fn->kwonly = lam->kwonly;
+        for (auto& d : lam->args) fn->defaults.push_back(std::move(d));
+        lam->args.clear();
         fn->alias = "lambda_" + std::to_string(synth_counter++);
         auto ret = std::make_unique<Stmt>();
         ret->kind = StmtKind::Return;
@@ -1787,12 +1935,328 @@ struct Sema {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Escape / alias analysis (per function).
+//
+// A local variable is "append-safe" when no alias of its value can survive to
+// a later point in the function: assignments of the form `s = s + x` may then
+// mutate the string buffer in place (kami_str_iadd) instead of copying the
+// whole string — turning O(n²) build-up loops into amortized O(n).
+//
+// The analysis is flow-insensitive and conservative: a single retaining use
+// (stored somewhere, passed to a call, captured by a closure, iterated while
+// appends exist, ...) disqualifies the variable. Uses that only *read* the
+// value and produce fresh objects (len(s), s[i], s + t, comparisons, print,
+// str()/format() from f-strings, method receivers) are allowed.
+namespace {
+
+struct AliasScan {
+    const Module& mod;
+    std::set<int64_t> unsafe;          // local slots that may have live aliases
+    std::set<int64_t> container_slots; // slots holding fresh lists/dicts/sets
+
+    explicit AliasScan(const Module& m) : mod(m) {}
+
+    static bool nonretaining_builtin(int64_t id) {
+        return id == KB_PRINT || id == KB_PRINT_EX || id == KB_LEN || id == KB_ORD ||
+               id == KB_STR || id == KB_FORMAT;
+    }
+
+    void mark(const Expr* e) {
+        if (e && e->kind == ExprKind::Name && e->res == Res::Local)
+            unsafe.insert(e->res_idx);
+    }
+
+    void closure_captures(const Stmt* fn) {
+        for (size_t i = 0; i < fn->multi_tkind.size(); i++)
+            if (fn->multi_tkind[i] == 1) unsafe.insert(fn->multi_tidx[i]);
+    }
+
+    // Does this expression always produce a FRESH value (a heap object no one
+    // else references, or a primitive)? Locals assigned a non-fresh value may
+    // alias somebody else's buffer and must never be mutated in place:
+    //   s = lst[0]          (shares the element's buffer)
+    //   s = some_global     (shares the global's buffer)
+    //   b = helper(a)       (a user function may return its argument)
+    static bool is_fresh(const Expr* e) {
+        switch (e->kind) {
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::StrLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NoneLit:
+        case ExprKind::ListLit:
+        case ExprKind::SetLit:
+        case ExprKind::MapLit:
+        case ExprKind::ListComp:
+        case ExprKind::SetComp:
+        case ExprKind::MapComp:
+        case ExprKind::Binary: // every binop builds a new value in this runtime
+        case ExprKind::Unary:
+            return true;
+        case ExprKind::BoolOp: // may yield either operand unchanged
+            return is_fresh(e->a.get()) && is_fresh(e->b.get());
+        case ExprKind::IfExp:
+            return is_fresh(e->a.get()) && is_fresh(e->c.get());
+        case ExprKind::Call: {
+            const Expr* callee = e->a.get();
+            if (callee && callee->res == Res::BuiltinFunc) {
+                switch (callee->res_idx) { // builtins that never return an argument
+                case KB_STR: case KB_CHR: case KB_FORMAT: case KB_INPUT:
+                case KB_BIN: case KB_HEX: case KB_OCT: case KB_LEN:
+                case KB_ORD: case KB_INT: case KB_FLOAT: case KB_BOOL:
+                case KB_ABS: case KB_ROUND:
+                    return true;
+                default: return false; // max(a, b) returns an operand, ...
+                }
+            }
+            return false; // user functions may return an argument/global
+        }
+        default: return false; // Name/Index/Slice/Attr/MethodCall/...
+        }
+    }
+
+    // `retains` = the value produced at this position may be stored beyond
+    // the expression itself.
+    void expr(const Expr* e, bool retains) {
+        if (!e) return;
+        switch (e->kind) {
+        case ExprKind::Name:
+            if (retains) mark(e);
+            return;
+        case ExprKind::Binary: // all binops produce fresh values
+        case ExprKind::Unary:
+            expr(e->a.get(), false);
+            expr(e->b.get(), false);
+            return;
+        case ExprKind::BoolOp: // `a or b` may yield either operand unchanged
+            expr(e->a.get(), retains);
+            expr(e->b.get(), retains);
+            return;
+        case ExprKind::IfExp:
+            expr(e->a.get(), retains);
+            expr(e->b.get(), false); // condition
+            expr(e->c.get(), retains);
+            return;
+        case ExprKind::Index:
+        case ExprKind::Slice:
+        case ExprKind::Attr:
+            expr(e->a.get(), false);
+            expr(e->b.get(), false);
+            for (auto& p : e->args) expr(p.get(), false);
+            return;
+        case ExprKind::Call: {
+            const Expr* callee = e->a.get();
+            bool safe_args = callee && callee->res == Res::BuiltinFunc &&
+                             nonretaining_builtin(callee->res_idx);
+            if (callee && callee->res != Res::BuiltinFunc && callee->res != Res::UserFunc)
+                expr(callee, false);
+            for (auto& a : e->args) expr(a.get(), !safe_args);
+            for (auto& kv : e->kwargs) expr(kv.second.get(), true);
+            return;
+        }
+        case ExprKind::CallStar:
+            expr(e->a.get(), false);
+            for (auto& a : e->args) expr(a.get(), true);
+            for (auto& p : e->pairs) {
+                expr(p.first.get(), true);
+                expr(p.second.get(), true);
+            }
+            return;
+        case ExprKind::MethodCall:
+            expr(e->a.get(), false); // receiver: never aliased as a whole
+            for (auto& a : e->args) expr(a.get(), true);
+            for (auto& kv : e->kwargs) expr(kv.second.get(), true);
+            return;
+        case ExprKind::CCall:
+            for (auto& a : e->args) expr(a.get(), true); // C may stash pointers
+            return;
+        case ExprKind::ListLit:
+        case ExprKind::SetLit:
+            for (auto& a : e->args) expr(a.get(), true);
+            return;
+        case ExprKind::MapLit:
+            for (auto& p : e->pairs) {
+                expr(p.first.get(), true);
+                expr(p.second.get(), true);
+            }
+            return;
+        case ExprKind::Starred:
+            expr(e->a.get(), true);
+            return;
+        case ExprKind::ListComp:
+        case ExprKind::SetComp:
+        case ExprKind::MapComp:
+            for (auto& cl : e->clauses) {
+                expr(cl.iter.get(), true); // iterated: guard mid-loop mutation
+                for (size_t i = 0; i < cl.tkind.size(); i++)
+                    if (cl.tkind[i] == 1) unsafe.insert(cl.tidx[i]);
+                for (auto& c : cl.conds) expr(c.get(), false);
+            }
+            expr(e->a.get(), true);
+            if (!e->pairs.empty()) {
+                expr(e->pairs[0].first.get(), true);
+                expr(e->pairs[0].second.get(), true);
+            }
+            return;
+        case ExprKind::Closure:
+            closure_captures(mod.functions[(size_t)e->res_idx]);
+            return;
+        case ExprKind::Lambda: // resolved away before this pass
+        default: return;
+        }
+    }
+
+    void stmts(const std::vector<StmtPtr>& body) {
+        for (auto& sp : body) stmt(sp.get());
+    }
+
+    void stmt(const Stmt* s) {
+        switch (s->kind) {
+        case StmtKind::ExprStmt:
+            expr(s->e1.get(), false);
+            return;
+        case StmtKind::Assign:
+            expr(s->e1.get(), true);
+            if (s->target_res == Res::Local) {
+                if (!is_fresh(s->e1.get())) unsafe.insert(s->target_idx);
+                switch (s->e1->kind) { // slots that ever hold a fresh container
+                case ExprKind::ListLit:
+                case ExprKind::SetLit:
+                case ExprKind::MapLit:
+                case ExprKind::ListComp:
+                case ExprKind::SetComp:
+                case ExprKind::MapComp:
+                    container_slots.insert(s->target_idx);
+                    break;
+                default: break;
+                }
+            }
+            return;
+        case StmtKind::IndexAssign:
+            expr(s->e1.get(), false);
+            expr(s->e2.get(), false);
+            expr(s->e3.get(), true);
+            return;
+        case StmtKind::AttrAssign:
+            expr(s->e1.get(), false);
+            expr(s->e3.get(), true);
+            return;
+        case StmtKind::MultiAssign:
+            for (auto& t : s->targets) {
+                expr(t.get(), false);
+                // unpacked values are shared elements of the RHS sequence
+                if (t->kind == ExprKind::Name && t->res == Res::Local)
+                    unsafe.insert(t->res_idx);
+            }
+            for (auto& v : s->values) expr(v.get(), true);
+            return;
+        case StmtKind::If:
+        case StmtKind::While:
+            expr(s->e1.get(), false);
+            stmts(s->body);
+            stmts(s->orelse);
+            return;
+        case StmtKind::For:
+            expr(s->e1.get(), true); // iterated: guard mid-loop mutation
+            // loop variables receive shared elements of the sequence
+            if (s->target_res == Res::Local) unsafe.insert(s->target_idx);
+            for (size_t i = 0; i < s->multi_tkind.size(); i++)
+                if (s->multi_tkind[i] == 1) unsafe.insert(s->multi_tidx[i]);
+            stmts(s->body);
+            stmts(s->orelse);
+            return;
+        case StmtKind::FuncDef: // nested function: captures alias locals
+            closure_captures(s);
+            return;
+        case StmtKind::Return:
+        case StmtKind::Raise:
+            expr(s->e1.get(), false); // function exits: no later appends
+            return;
+        case StmtKind::Try:
+            stmts(s->body);
+            for (auto& h : s->handlers) {
+                if (h.as_kind == 1) unsafe.insert(h.as_idx);
+                stmts(h.body);
+            }
+            stmts(s->orelse);
+            stmts(s->final_body);
+            return;
+        case StmtKind::With:
+            expr(s->e1.get(), true);
+            if (s->target_res == Res::Local) unsafe.insert(s->target_idx);
+            stmts(s->body);
+            return;
+        case StmtKind::Del:
+            for (auto& t : s->targets) expr(t.get(), false);
+            return;
+        default: return;
+        }
+    }
+
+    // pass 2: flag `v = v + x` assignments whose target has no aliases
+    void flag(std::vector<StmtPtr>& body, int64_t first_nonparam) {
+        for (auto& sp : body) flag_stmt(sp.get(), first_nonparam);
+    }
+    void flag_stmt(Stmt* s, int64_t first_nonparam) {
+        switch (s->kind) {
+        case StmtKind::Assign: {
+            const Expr* v = s->e1.get();
+            if (s->target_res == Res::Local && v && v->kind == ExprKind::Binary &&
+                v->op == KOP_ADD && v->a && v->a->kind == ExprKind::Name &&
+                v->a->res == Res::Local && v->a->res_idx == s->target_idx &&
+                s->target_idx >= first_nonparam && !unsafe.count(s->target_idx))
+                s->str_iadd = true;
+            // Escape analysis, part II.2: overwriting an unaliased local that
+            // holds a fresh container — the old list/dict/set is provably dead,
+            // so its memory can be handed straight back to the allocator
+            // (kami_free_hint) instead of waiting for a GC cycle.
+            else if (s->target_res == Res::Local && s->target_idx >= first_nonparam &&
+                     !unsafe.count(s->target_idx) &&
+                     container_slots.count(s->target_idx))
+                s->free_hint = true;
+            return;
+        }
+        case StmtKind::If:
+        case StmtKind::While:
+        case StmtKind::For:
+            flag(s->body, first_nonparam);
+            flag(s->orelse, first_nonparam);
+            return;
+        case StmtKind::Try:
+            flag(s->body, first_nonparam);
+            for (auto& h : s->handlers) flag(h.body, first_nonparam);
+            flag(s->orelse, first_nonparam);
+            flag(s->final_body, first_nonparam);
+            return;
+        case StmtKind::With:
+            flag(s->body, first_nonparam);
+            return;
+        default: return;
+        }
+    }
+};
+
+} // namespace
+
+static void mark_string_iadds(const Module& m, Stmt* fn) {
+    AliasScan scan(m);
+    scan.stmts(fn->body);
+    // parameters are caller-owned: never mutate their buffers in place
+    int64_t first_nonparam = (int64_t)fn->params.size() + (fn->vararg.empty() ? 0 : 1) +
+                             (fn->kwarg.empty() ? 0 : 1);
+    scan.flag(fn->body, first_nonparam);
+}
+
 void analyze(Module& m) {
     Sema s(m);
     s.collect_module();
     for (auto& sp : m.body) s.resolve_stmt(sp.get());
     m.nglobals = (int64_t)s.globals.size();
+    for (Stmt* fn : m.functions) mark_string_iadds(m, fn);
 }
+
+bool pyext_module_name(const std::string& name) { return pyext_module(name); }
 
 bool known_builtin_module(const std::string& name) {
     return noop_module(name) || modules().count(name) != 0;

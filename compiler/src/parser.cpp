@@ -297,8 +297,20 @@ struct Parser {
         if (!check(Tok::RPAREN)) {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
-                if (check(Tok::STAR) || check(Tok::POW))
-                    err("*args/**kwargs are not supported");
+                if (check(Tok::STAR)) { // f(*iterable)
+                    int line = advance().line;
+                    auto st = std::make_unique<Expr>();
+                    st->kind = ExprKind::Starred;
+                    st->line = line;
+                    st->a = parse_expr();
+                    call->args.push_back(std::move(st));
+                    continue;
+                }
+                if (check(Tok::POW)) { // f(**mapping)
+                    advance();
+                    call->kwargs.emplace_back("", parse_expr()); // "" = **expr
+                    continue;
+                }
                 if (check(Tok::NAME) && peek(1).kind == Tok::ASSIGN) {
                     std::string kw = advance().text;
                     advance(); // '='
@@ -498,7 +510,29 @@ struct Parser {
             if (!check(Tok::COLON)) {
                 do {
                     if (check(Tok::COLON)) break;
+                    if (check(Tok::POW)) { // **kwargs
+                        advance();
+                        e->kwarg = expect(Tok::NAME, "parameter name after '**'").text;
+                        continue;
+                    }
+                    if (check(Tok::STAR)) { // *args or bare '*'
+                        advance();
+                        if (check(Tok::NAME)) e->vararg = advance().text;
+                        e->kwonly = (int)e->params.size();
+                        continue;
+                    }
                     e->params.push_back(expect(Tok::NAME, "lambda parameter").text);
+                    if (match(Tok::ASSIGN)) {
+                        // Default value: `lambda a, b=val: expr`. The default
+                        // expression must not consume the parameter-list ','
+                        // or the body ':' — parse_ternary stops at both.
+                        e->args.push_back(parse_ternary());
+                    } else if (!e->args.empty() && e->kwonly < 0) {
+                        throw CompileError(peek().line,
+                                           "non-default parameter after default parameter");
+                    } else if (e->kwonly >= 0 && !e->args.empty()) {
+                        e->args.push_back(nullptr); // required keyword-only hole
+                    }
                 } while (match(Tok::COMMA));
             }
             expect(Tok::COLON, "':' in lambda");
@@ -580,6 +614,25 @@ struct Parser {
                 e->line = line;
                 return e;
             }
+            if (check(Tok::POW)) { // {**base, ...}: dict with unpacking
+                advance();
+                auto e = std::make_unique<Expr>();
+                e->kind = ExprKind::MapLit;
+                e->line = line;
+                e->pairs.emplace_back(nullptr, parse_expr());
+                while (match(Tok::COMMA)) {
+                    if (check(Tok::RBRACE)) break;
+                    if (match(Tok::POW)) {
+                        e->pairs.emplace_back(nullptr, parse_expr());
+                        continue;
+                    }
+                    ExprPtr k2 = parse_expr();
+                    expect(Tok::COLON, "':'");
+                    e->pairs.emplace_back(std::move(k2), parse_expr());
+                }
+                expect(Tok::RBRACE, "'}'");
+                return e;
+            }
             ExprPtr first = parse_expr();
             if (check(Tok::COLON)) { // dict or dict-comprehension
                 advance();
@@ -599,6 +652,10 @@ struct Parser {
                 e->pairs.emplace_back(std::move(first), std::move(v));
                 while (match(Tok::COMMA)) {
                     if (check(Tok::RBRACE)) break;
+                    if (match(Tok::POW)) { // {"a": 1, **other}
+                        e->pairs.emplace_back(nullptr, parse_expr());
+                        continue;
+                    }
                     ExprPtr k2 = parse_expr();
                     expect(Tok::COLON, "':'");
                     e->pairs.emplace_back(std::move(k2), parse_expr());
@@ -999,23 +1056,28 @@ struct Parser {
             do {
                 if (check(Tok::RPAREN)) break; // trailing comma
                 if (check(Tok::SLASH)) { advance(); continue; } // positional-only marker
-                if (check(Tok::POW))
-                    throw CompileError(peek().line, "**kwargs are not supported");
-                if (check(Tok::STAR)) {
-                    // `*args`: a catch-all for surplus positional arguments. A
-                    // bare `*` (keyword-only marker) has no runtime meaning here
-                    // because keywords are resolved at compile time.
-                    int sline = advance().line;
-                    if (check(Tok::COMMA) || check(Tok::RPAREN)) continue;
-                    if (s->vararg) throw CompileError(sline, "duplicate *args parameter");
-                    s->params.push_back(expect(Tok::NAME, "parameter name").text);
-                    s->vararg = true;
+                if (check(Tok::POW)) { // **kwargs (must be last)
+                    advance();
+                    s->kwarg = expect(Tok::NAME, "parameter name after '**'").text;
                     if (match(Tok::COLON)) parse_expr(); // annotation: ignored
                     continue;
                 }
-                if (s->vararg)
-                    throw CompileError(peek().line,
-                                       "keyword-only parameters after *args are not supported");
+                if (check(Tok::STAR)) { // *args or bare '*' (keyword-only marker)
+                    advance();
+                    if (!s->vararg.empty() || s->kwonly >= 0)
+                        throw CompileError(peek().line, "duplicate '*' in parameter list");
+                    if (check(Tok::NAME)) {
+                        s->vararg = advance().text;
+                        if (match(Tok::COLON)) parse_expr(); // annotation: ignored
+                    }
+                    s->kwonly = (int)s->params.size();
+                    // keyword-only parameters may follow without defaults even
+                    // after earlier defaulted parameters:
+                    seen_default = false;
+                    continue;
+                }
+                if (!s->kwarg.empty())
+                    throw CompileError(peek().line, "parameter after **" + s->kwarg);
                 s->params.push_back(expect(Tok::NAME, "parameter name").text);
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
@@ -1024,6 +1086,11 @@ struct Parser {
                     // codegen evaluates it in the function prologue when the
                     // caller omits the argument.
                     s->defaults.push_back(parse_expr());
+                } else if (s->kwonly >= 0) {
+                    // Keyword-only parameter without a default: keep
+                    // `defaults` aligned to the params tail with an explicit
+                    // "required" hole (only needed once defaults exist).
+                    if (!s->defaults.empty()) s->defaults.push_back(nullptr);
                 } else if (seen_default) {
                     throw CompileError(peek().line,
                                        "non-default parameter after default parameter");
@@ -1032,8 +1099,6 @@ struct Parser {
         }
         expect(Tok::RPAREN, "')'");
         if (s->params.size() > 16) throw CompileError(line, "too many parameters (max 16)");
-        if (s->vararg && !s->defaults.empty())
-            throw CompileError(line, "default values combined with *args are not supported");
         if (match(Tok::ARROW)) parse_expr(); // return annotation: ignored
         expect(Tok::COLON, "':'");
         func_depth++;
@@ -1361,7 +1426,8 @@ std::string dump_expr(const Expr* e) {
     case ExprKind::MapLit: {
         std::string s = "(map";
         for (auto& p : e->pairs)
-            s += " (" + dump_expr(p.first.get()) + " " + dump_expr(p.second.get()) + ")";
+            s += " (" + (p.first ? dump_expr(p.first.get()) : std::string("**")) + " " +
+                 dump_expr(p.second.get()) + ")";
         return s + ")";
     }
     case ExprKind::SetLit: {
@@ -1395,6 +1461,14 @@ std::string dump_expr(const Expr* e) {
         return s + ")";
     }
     case ExprKind::Starred: return "(* " + dump_expr(e->a.get()) + ")";
+    case ExprKind::CallStar: {
+        std::string s = "(call* " + dump_expr(e->a.get());
+        for (auto& a : e->args) s += " " + dump_expr(a.get());
+        for (auto& p : e->pairs)
+            s += " " + (p.first ? dump_expr(p.first.get()) + "=" : std::string("**")) +
+                 dump_expr(p.second.get());
+        return s + ")";
+    }
     case ExprKind::CCall: {
         std::string s = "(ccall " + e->sval + ":" + e->csig;
         for (auto& a : e->args) s += " " + dump_expr(a.get());

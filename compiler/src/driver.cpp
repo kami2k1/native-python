@@ -1,6 +1,7 @@
 #include "driver.h"
 
 #include "codegen.h"
+#include "native_backend.h"
 #include "lexer.h"
 #include "modules.h"
 #include "parser.h"
@@ -158,6 +159,7 @@ std::string build(const BuildOptions& opts) {
     mod.source_path = fs::absolute(opts.input).string();
     bundle_imported_modules(mod, import_policy(opts.input, opts.argv0, opts));
     analyze(mod);
+    infer_types(mod);
     if (opts.emit_ast) {
         fputs(dump_module(mod).c_str(), stdout);
         return "";
@@ -170,14 +172,61 @@ std::string build(const BuildOptions& opts) {
 #endif
     fs::path ll = out;
     ll += ".ll";
-    {
+    if (opts.emit_llvm) {
         std::ofstream f(ll, std::ios::binary);
         if (!f) throw std::runtime_error("cannot write " + ll.string());
         f << ir;
     }
 
-    std::string cxx = getenv("KAMIPY_CXX") ? getenv("KAMIPY_CXX") : "clang++";
     std::string rtlib = find_runtime_lib(opts.argv0);
+
+    // ---- embedded backend: TargetMachine + LLD, no external toolchain ----
+    // KAMIPY_CXX forces the external-compiler path (also the fallback when
+    // kamipy was built without the LLVM libraries).
+    if (native_backend_available() && !getenv("KAMIPY_CXX")) {
+        fs::path obj = out;
+        obj += ".o";
+        compile_ir_to_object(ir, obj.string(), opts.opt_level);
+        std::vector<std::string> libs;
+#ifdef KAMI_RT_NEEDS_OPENSSL
+        libs.push_back("ssl");
+        libs.push_back("crypto");
+#endif
+        for (const std::string& lib : mod.link_libs) {
+            if (lib == "m" || lib == "pthread" || lib == "c") continue;
+#ifdef _WIN32
+            if (lib == "ws2_32") continue;
+#endif
+            libs.push_back(lib);
+        }
+        if (opts.verbose)
+            fprintf(stderr, "kamipy: embedded LLVM backend: %s -> %s\n",
+                    obj.string().c_str(), out.string().c_str());
+        try {
+            link_executable({obj.string()}, rtlib, libs, out.string());
+        } catch (...) {
+            std::error_code ec;
+            fs::remove(obj, ec);
+            throw;
+        }
+        std::error_code ec;
+        fs::remove(obj, ec);
+#ifndef _WIN32
+        fs::permissions(out,
+                        fs::perms::owner_exec | fs::perms::group_exec |
+                            fs::perms::others_exec,
+                        fs::perm_options::add, ec);
+#endif
+        return out.string();
+    }
+
+    // ---- external toolchain fallback ----
+    {
+        std::ofstream f(ll, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot write " + ll.string());
+        f << ir;
+    }
+    std::string cxx = getenv("KAMIPY_CXX") ? getenv("KAMIPY_CXX") : "clang++";
     std::vector<std::string> cmd = {cxx,
                                     "-O" + std::to_string(opts.opt_level),
                                     ll.string(),

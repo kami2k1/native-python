@@ -23,7 +23,7 @@ $ ldd app          # no libpython — only libc/libm/libstdc++
 
 ## Build / Cài đặt
 
-Requirements / Yêu cầu: CMake ≥ 3.20, a C++20 compiler, and `clang++` (LLVM ≥ 15) on `PATH` (used as the LLVM backend + linker driver).
+Requirements / Yêu cầu: CMake ≥ 3.20 and a C++20 compiler. With the LLVM + LLD dev libraries installed (`llvm-18-dev liblld-18-dev` — auto-discovered), kamipy embeds the **LLVM TargetMachine backend + LLD linker**: compiled programs are built **without any external toolchain** (no clang/gcc/ld needed on the user machine). Without them, `clang++` on `PATH` is used as a fallback.
 
 **Windows (Visual Studio Community):** xem hướng dẫn chi tiết / see the full guide — [docs/vi/BUILD_WINDOWS.md](docs/vi/BUILD_WINDOWS.md) · [docs/en/BUILD_WINDOWS.md](docs/en/BUILD_WINDOWS.md)
 
@@ -109,6 +109,18 @@ Chi tiết: [docs/vi/ARCHITECTURE.md](docs/vi/ARCHITECTURE.md) · Details: [docs
 Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 
 ## Benchmarks (Linux x64, LLVM 18)
+
+### vs Go / CPython (`python3 build/run_benchmark.py`)
+
+| Benchmark | KamiPython | Go 1.24 | CPython 3.11 | vs Go | vs CPython |
+|---|---|---|---|---|---|
+| integer_loop (1e8, mod chain) | **0.44 s** (= C/clang: 0.43 s) | 0.37 s | 5.5 s | 0.84x | **12.4x** |
+| math (1e8 float ops) | **0.55 s** | 0.58 s | 5.4 s | **1.04x** | **9.8x** |
+| recursion fib(32) | **6.3 ms** | 12.4 ms | 283 ms | **1.97x** | **45x** |
+| string_test (1M `+=`) | **6.0 ms** | 10.4 ms (strings.Builder) | 45 ms | **1.73x** | **7.4x** |
+
+3/4 hạng mục **nhanh hơn Go**; integer_loop đạt đúng tốc độ C (`clang -O2` cùng thuật toán: 0.43 s) —
+phần chênh còn lại là backend Go phát chuỗi lệnh `%`-by-constant khác LLVM trên vi kiến trúc này.
 
 | Metric | KamiPython | C++ (-O2) | CPython 3.11 | Target |
 |---|---|---|---|---|

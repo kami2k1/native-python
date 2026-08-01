@@ -15,6 +15,8 @@
 #include <filesystem>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h> // GetCurrentProcessId, ...
 #include <io.h>
 #include <process.h>
 #else

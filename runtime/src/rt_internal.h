@@ -22,8 +22,9 @@ struct ObjHeader {
 struct KamiStr {
     ObjHeader h;
     int64_t len;
-    uint64_t hash;
-    char data[1]; // len bytes + NUL
+    int64_t cap;   // buffer capacity (bytes, excluding NUL); >= len
+    uint64_t hash; // FNV-1a, computed lazily (0 = not yet computed)
+    char data[1];  // cap bytes + NUL
 };
 
 struct KamiList {
@@ -53,15 +54,21 @@ struct KamiMap {
     int64_t icap;
 };
 
+// KamiFuncObj::flags
+enum : int64_t { KFN_VARARG = 1, KFN_KWARG = 2 };
+
 struct KamiFuncObj {
     ObjHeader h;
     void* fn;          // KamiFn (null when builtin_id >= 0)
     int64_t min_arity;
-    int64_t arity;     // max
+    int64_t arity;     // number of fixed parameters (incl. keyword-only)
     int64_t builtin_id; // >= 0 => call via kami_builtin
     const char* name;
     KamiValue* captures; // heap array, null when not a closure
     int64_t ncaptures;
+    int64_t kwonly;          // index where keyword-only params begin (== arity if none)
+    int64_t flags;           // KFN_VARARG / KFN_KWARG
+    const char* param_names; // comma-joined fixed parameter names (may be "")
 };
 
 struct ThreadData {
@@ -92,6 +99,11 @@ struct KamiFile {
     void* fp; // FILE*
     bool closed;
     bool no_close; // sys.stdout / sys.stderr: .close() must be a no-op
+};
+
+struct KamiPyObj {
+    ObjHeader h;
+    void* obj; // PyObject* (owned reference)
 };
 
 struct KamiSocket {
@@ -146,6 +158,7 @@ struct Lock {
 };
 
 extern std::vector<KamiValue> g_globals;
+extern std::unordered_map<const void*, KamiStr*> g_intern; // interned literals
 extern int64_t g_argc;
 extern char** g_argv;
 extern std::vector<std::pair<KamiValue*, int64_t>> g_pins;
@@ -161,6 +174,8 @@ void gc_track_extra(uint64_t bytes);
 
 // helpers
 KamiStr* str_new(const char* data, int64_t len);       // lock held
+KamiStr* str_new_cap(const char* data, int64_t len, int64_t cap); // lock held
+uint64_t str_hash(KamiStr* s); // lazy FNV-1a (lock held)
 KamiList* list_new(int64_t cap);                       // lock held
 KamiMap* map_new();                                    // lock held
 void list_push(KamiList* l, const KamiValue* v);       // lock held
@@ -170,6 +185,32 @@ bool map_del(KamiMap* m, const KamiValue* k);                     // lock held
 uint64_t value_hash(const KamiValue* v);
 bool value_eq(const KamiValue* a, const KamiValue* b);
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
+
+// Rearranges a dynamic call's arguments into the layout the callee's prologue
+// expects (fixed params, then packed *args tuple / **kwargs dict). Lock must
+// be held. `packed` must be a caller-pinned 2-slot array (zeroed). Returns the
+// final argument count written to argv2 (capacity >= fo->arity + 2).
+int64_t prep_user_argv(KamiFuncObj* fo, KamiValue** argv, int64_t nargs, KamiMap* kwmap,
+                       KamiValue** argv2, KamiValue* packed);
+
+// RAII temporary GC root (exception-safe, unlike raw g_pins pushes).
+struct PinGuard {
+    KamiValue* vals;
+    PinGuard(KamiValue* v, int64_t n) : vals(v) {
+        Lock lk(g_lock);
+        g_pins.push_back({v, n});
+    }
+    ~PinGuard() {
+        Lock lk(g_lock);
+        for (size_t i = g_pins.size(); i-- > 0;)
+            if (g_pins[i].first == vals) {
+                g_pins.erase(g_pins.begin() + (long)i);
+                break;
+            }
+    }
+    PinGuard(const PinGuard&) = delete;
+    PinGuard& operator=(const PinGuard&) = delete;
+};
 
 std::string format_float(double d);
 std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs);
@@ -190,6 +231,16 @@ std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);
 std::string& tls_error();                    // last caught error message (per thread)
+
+// CPython bridge (pycapi.cpp). All take the runtime lock themselves or are
+// called with it held as documented.
+void pyobj_finalize(ObjHeader* h);                                  // GC sweep
+void pyobj_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
+void pyobj_method(KamiValue* out, KamiValue* obj, const std::string& m,
+                  KamiValue** argv, int64_t nargs);
+void pyobj_call(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
+std::string pyobj_str(const KamiValue* v);
+int32_t pyobj_truthy(const KamiValue* v);
 
 [[noreturn]] void panic(const std::string& msg); // throws KamiError
 

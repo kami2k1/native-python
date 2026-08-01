@@ -508,6 +508,28 @@ void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix) {
 
 namespace {
 
+// Like collect_import_names, but ignores imports inside try/except: those are
+// guarded and may legitimately fail at compile time.
+void collect_unguarded_import_names(Stmt* s, std::vector<std::string>& out) {
+    switch (s->kind) {
+    case StmtKind::Import:
+        out.push_back(s->name);
+        for (auto& extra : s->body) collect_unguarded_import_names(extra.get(), out);
+        return;
+    case StmtKind::FromImport:
+        if (!s->name.empty()) out.push_back(s->name);
+        if (s->relative && s->name.empty())
+            for (auto& [n, alias] : s->import_names) out.push_back(n);
+        return;
+    case StmtKind::Try:
+        return; // guarded
+    default: break;
+    }
+    for (auto& c : s->body) collect_unguarded_import_names(c.get(), out);
+    for (auto& c : s->orelse) collect_unguarded_import_names(c.get(), out);
+    for (auto& c : s->final_body) collect_unguarded_import_names(c.get(), out);
+}
+
 void collect_import_names(Stmt* s, std::vector<std::string>& out) {
     switch (s->kind) {
     case StmtKind::Import:
@@ -610,6 +632,18 @@ struct Bundler {
                             found.path.string().c_str(), e.line, e.what());
                 continue;
             }
+            // A library copy is only usable when its own (unguarded) imports
+            // resolve too — CPython packages use relative imports we cannot
+            // bundle (json/__init__.py -> .decoder). Fall back while we can.
+            if (!last && found.origin != ModuleOrigin::Project &&
+                !imports_resolvable(sub)) {
+                if (pol.verbose)
+                    fprintf(stderr,
+                            "kamipy: %s copy of '%s' has unresolvable imports — "
+                            "falling back\n",
+                            origin_name(found.origin), name.c_str());
+                continue;
+            }
             if (pol.verbose)
                 fprintf(stderr, "kamipy: import %s <- %s (%s)\n", name.c_str(),
                         found.path.string().c_str(), origin_name(found.origin));
@@ -631,6 +665,19 @@ struct Bundler {
             return;
         }
         loading.erase(name);
+    }
+
+    // Can every unguarded import of `sub` be satisfied somehow?
+    bool imports_resolvable(Module& sub) {
+        std::vector<std::string> names;
+        for (auto& sp : sub.body) collect_unguarded_import_names(sp.get(), names);
+        for (auto& n : names) {
+            if (mod.user_modules.count(n) || skipped.count(n)) continue;
+            if (pyext_module_name(n)) continue; // CPython C-extension bridge
+            if (!resolve_module(n, pol).empty()) continue;
+            return false;
+        }
+        return true;
     }
 
     std::set<std::string> skipped;

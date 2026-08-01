@@ -24,6 +24,9 @@ enum class ExprKind {
     SetComp,    // element a + clauses
     MapComp,    // pairs[0] = (key,val) + clauses
     CCall,      // direct C-ABI call: sval = symbol, csig = signature, args = params
+    CallStar,   // call with *args/**kwargs at the call site: a = callee,
+                // args = positional (may contain Starred), pairs = keyword
+                // entries ((StrLit name, value) or (null, **expr))
 };
 
 struct Expr;
@@ -38,6 +41,18 @@ struct CompClause {
 
 // Name/Call resolution (filled by sema)
 enum class Res { Unresolved, Local, Global, BuiltinFunc, UserFunc, Capture };
+
+// Static types inferred by the type-inference pass (typeinf.cpp). A small,
+// sound lattice: TY_BOT (no information yet) < concrete type < TY_ANY.
+enum KType : uint8_t {
+    TY_BOT = 0,
+    TY_INT,
+    TY_FLOAT,
+    TY_BOOL,
+    TY_STR,
+    TY_NONE,
+    TY_ANY,
+};
 
 using ExprPtr = std::unique_ptr<Expr>;
 
@@ -56,14 +71,20 @@ struct Expr {
     std::vector<ExprPtr> args; // Call args / ListLit items / Slice parts
     std::vector<std::pair<std::string, ExprPtr>> kwargs; // Call keyword args
     std::vector<std::pair<ExprPtr, ExprPtr>> pairs;      // MapLit
-    std::vector<std::string> params; // ListComp target names
+    std::vector<std::string> params; // ListComp target names / Lambda params
     std::vector<CompClause> clauses; // ListComp/SetComp/MapComp
+    // Lambda only: *args/**kwargs names ("" if absent), keyword-only start
+    // index (-1 = none) and default values (aligned to the params tail).
+    std::string vararg, kwarg;
+    int kwonly = -1;
 
     // sema annotations
     Res res = Res::Unresolved;
     int64_t res_idx = 0;       // local slot / global index / builtin id / func index
     std::vector<int64_t> comp_tidx; // ListComp resolved target slots
     std::vector<int> comp_tkind;    // 1=local 2=global
+    uint8_t sty = TY_ANY;      // static type (typeinf.cpp)
+    bool nonneg = false;       // int expr provably >= 0 (typeinf.cpp)
 };
 
 // ---------------- statements ----------------
@@ -94,6 +115,12 @@ struct Stmt {
     std::string alias;  // import ... as alias / ClassDef base name
     std::vector<std::string> params;            // FuncDef params / For multi-targets / Global names
     std::vector<ExprPtr> defaults;              // FuncDef default values (aligned to params tail)
+    // FuncDef: `*args` / `**kwargs` parameter names ("" when absent) and the
+    // index in `params` where keyword-only parameters begin (-1 = none).
+    // The vararg tuple and kwargs dict occupy local slots params.size() and
+    // params.size()+1 (when present), directly after the fixed parameters.
+    std::string vararg, kwarg;
+    int kwonly = -1;
     std::vector<std::pair<std::string, std::string>> import_names; // FromImport (name, alias)
     std::vector<StmtPtr> body, orelse, final_body; // blocks; Try: body/orelse(else)/finally
     std::vector<ExceptClause> handlers;            // Try
@@ -111,12 +138,17 @@ struct Stmt {
     int raise_mode = 0;
     bool relative = false; // FromImport: leading-dot relative import
     bool star = false;     // FromImport: `from X import *`
+    bool pyext = false;    // Import/FromImport resolved to a CPython extension
     std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
     bool is_closure = false;          // FuncDef compiled with a %captures param
-    // FuncDef: the last entry of `params` is a `*args` catch-all that the
-    // prologue packs into a list from the surplus positional arguments.
-    bool vararg = false;
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
+    // Assign `s = s + x` where sema's alias analysis proved `s` has no live
+    // aliases: codegen emits an in-place buffer append (kami_str_iadd).
+    bool str_iadd = false;
+    // Assign overwriting an unaliased local holding a fresh container: the
+    // old object is dead — recycle its memory (kami_free_hint).
+    bool free_hint = false;
+    uint8_t sty = TY_ANY; // For: static type of the loop variable (typeinf.cpp)
 };
 
 // A C function the compiled program calls directly (from a C extension mapping
@@ -125,6 +157,36 @@ struct NativeDecl {
     std::string symbol;
     std::string csig; // see cext.h: first char = return type, rest = parameters
 };
+
+// Per-function results of the type-inference pass (parallel to
+// Module::functions). Filled by infer_types() in typeinf.cpp.
+struct FuncTypeInfo {
+    std::vector<uint8_t> locals; // static type per local slot (KType)
+    std::vector<uint8_t> params; // join of argument types over all call sites
+    uint8_t ret = TY_BOT;        // join of all return expression types
+    bool escapes = true;         // name used as a value → dynamic calls possible
+    bool native_ok = false;      // monomorphized @n_<alias> specialization emitted
+
+    // Speculative monomorphization for functions whose name escapes (e.g.
+    // passed to a benchmark harness): the body is typed under an assumed
+    // parameter signature (int unless call sites say float); u_<alias> gets a
+    // runtime tag guard that dispatches to @n_<alias> when the actual
+    // arguments match, falling back to the generic boxed body otherwise.
+    bool guarded = false;
+    std::vector<uint8_t> spec_locals, spec_params;
+    uint8_t spec_ret = TY_BOT;
+    // Non-negativity lattice (optimistic true, cleared by any possibly-
+    // negative assignment). Lets codegen emit plain sdiv/srem for // and %
+    // by positive constants — the exact codegen Go gets for its % operator.
+    std::vector<uint8_t> locals_nn, spec_locals_nn;
+};
+
+// Effective (native-callable) view of a function's signature.
+inline bool eff_native(const FuncTypeInfo& f) { return f.native_ok || f.guarded; }
+inline const std::vector<uint8_t>& eff_params(const FuncTypeInfo& f) {
+    return f.guarded ? f.spec_params : f.params;
+}
+inline uint8_t eff_ret(const FuncTypeInfo& f) { return f.guarded ? f.spec_ret : f.ret; }
 
 struct Module {
     std::vector<StmtPtr> body;         // module-level statements
@@ -152,7 +214,23 @@ struct Module {
     // C-ABI bindings discovered while analysing this module.
     std::vector<NativeDecl> natives;   // unique (symbol, signature) pairs
     std::set<std::string> link_libs;   // extra -l<name> flags for the linker
+
+    // Type-inference results (parallel to `functions`); see typeinf.cpp.
+    std::vector<FuncTypeInfo> ftypes;
 };
+
+// Type inference & monomorphization analysis (typeinf.cpp). Runs after
+// analyze(); stamps Expr::sty / Stmt::sty and fills Module::ftypes.
+void infer_types(Module& m);
+
+// Re-stamps a single function body's Expr::sty under the speculative (spec =
+// true) or normal (spec = false) type tables. Codegen uses this to emit the
+// guarded @n_ specialization and then restore the stamps for the boxed body.
+void stamp_function(Module& m, size_t func_index, bool spec);
+
+// libm symbol for a builtin math id usable in native (monomorphized) bodies,
+// or null. Shared between typeinf.cpp and codegen.cpp.
+const char* native_math_symbol(int64_t id, int* arity);
 
 // S-expression dump for tests/debugging.
 std::string dump_expr(const Expr* e);

@@ -23,20 +23,33 @@ const char* type_name(int64_t tag) {
     case KT_FILE: return "file";
     case KT_SOCKET: return "socket";
     case KT_LOCK: return "lock";
+    case KT_PYOBJ: return "pyobject";
     default: return "?";
     }
 }
 
-KamiStr* str_new(const char* data, int64_t len) {
-    KamiStr* s = (KamiStr*)gc_alloc(sizeof(KamiStr) + (uint64_t)len, KT_STR);
+KamiStr* str_new_cap(const char* data, int64_t len, int64_t cap) {
+    if (cap < len) cap = len;
+    KamiStr* s = (KamiStr*)gc_alloc(sizeof(KamiStr) + (uint64_t)cap, KT_STR);
     s->len = len;
+    s->cap = cap;
     if (len) memcpy(s->data, data, (size_t)len);
     s->data[len] = '\0';
-    uint64_t h = 1469598103934665603ull; // FNV-1a
-    for (int64_t i = 0; i < len; i++) h = (h ^ (unsigned char)data[i]) * 1099511628211ull;
-    s->hash = h;
+    s->hash = 0; // computed lazily by str_hash()
     return s;
 }
+
+KamiStr* str_new(const char* data, int64_t len) { return str_new_cap(data, len, len); }
+
+uint64_t str_hash(KamiStr* s) {
+    if (s->hash) return s->hash;
+    uint64_t h = 1469598103934665603ull; // FNV-1a
+    for (int64_t i = 0; i < s->len; i++) h = (h ^ (unsigned char)s->data[i]) * 1099511628211ull;
+    if (!h) h = 1; // reserve 0 for "not computed"
+    s->hash = h;
+    return h;
+}
+
 
 std::string format_float(double d) {
     char buf[64];
@@ -48,6 +61,7 @@ std::string format_float(double d) {
 
 std::string value_str(const KamiValue* v) {
     switch (v->tag) {
+    case KT_PYOBJ: return pyobj_str(v);
     case KT_NONE: return "None";
     case KT_BOOL: return v->i ? "True" : "False";
     case KT_INT: return std::to_string(v->i);
@@ -139,6 +153,40 @@ using namespace kami;
 
 extern "C" {
 
+// In-place string append for `s += x` when sema has proven `s` is never
+// aliased (see mark_string_iadds). Amortized O(1): the buffer doubles when it
+// runs out of capacity, exactly like std::string. Falls back to the generic
+// binop for non-string operands.
+void kami_str_iadd(KamiValue* target, const KamiValue* rhs) {
+    {
+        Lock lk(g_lock);
+        if (target->tag == KT_STR && rhs->tag == KT_STR) {
+            KamiStr* dst = (KamiStr*)target->p;
+            KamiStr* src = (KamiStr*)rhs->p;
+            int64_t need = dst->len + src->len;
+            if (need <= dst->cap) {
+                memcpy(dst->data + dst->len, src->data, (size_t)src->len);
+                dst->len = need;
+                dst->data[need] = '\0';
+                dst->hash = 0; // contents changed: recompute lazily
+                return;
+            }
+            int64_t cap = dst->cap < 8 ? 16 : dst->cap * 2;
+            while (cap < need) cap *= 2;
+            // gc_alloc may collect, but dst/src stay rooted via caller slots
+            // (mark&sweep never moves objects, so the pointers stay valid).
+            KamiStr* grown = str_new_cap(dst->data, dst->len, cap);
+            memcpy(grown->data + dst->len, src->data, (size_t)src->len);
+            grown->len = need;
+            grown->data[need] = '\0';
+            target->p = grown;
+            return;
+        }
+    }
+    kami_binop(KOP_ADD, target, target, rhs);
+}
+
+
 void kami_copy(KamiValue* dst, const KamiValue* src) {
     Lock lk(g_lock);
     KamiValue tmp = *src;
@@ -169,11 +217,25 @@ void kami_make_float(KamiValue* out, double v) {
     out->f = v;
 }
 
+// Startup pre-interning: fills a codegen cache cell with the KamiStr* for a
+// constant-pool literal. The object is owned by g_intern (a GC root).
+void kami_intern_str(void** cell, const char* data, int64_t len) {
+    Lock lk(g_lock);
+    KamiStr*& cached = g_intern[data];
+    if (!cached) cached = str_new(data, len);
+    *cell = cached;
+}
+
 void kami_make_str(KamiValue* out, const char* data, int64_t len) {
     Lock lk(g_lock);
-    KamiStr* s = str_new(data, len);
+    // Generated code passes pointers into the constant pool: intern by
+    // address so hot loops don't allocate a fresh object per evaluation.
+    // Safe with kami_str_iadd: interned strings have cap == len, so the
+    // first append always takes the copy-and-grow path.
+    KamiStr*& cached = g_intern[data];
+    if (!cached) cached = str_new(data, len);
     out->tag = KT_STR;
-    out->p = s;
+    out->p = cached;
 }
 
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n) {
@@ -212,12 +274,16 @@ void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name
     f->name = name;
     f->captures = nullptr;
     f->ncaptures = 0;
+    f->kwonly = 16;
+    f->flags = 0;
+    f->param_names = "";
     out->tag = KT_FUNC;
     out->p = f;
 }
 
 void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t arity,
-                       const char* name, KamiValue** capture_slots, int64_t ncap) {
+                       const char* name, KamiValue** capture_slots, int64_t ncap,
+                       int64_t kwonly, int64_t flags, const char* param_names) {
     Lock lk(g_lock);
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
@@ -227,6 +293,9 @@ void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t a
     f->name = name;
     f->ncaptures = ncap;
     f->captures = nullptr;
+    f->kwonly = kwonly;
+    f->flags = flags;
+    f->param_names = param_names;
     out->tag = KT_FUNC;
     out->p = f; // root before the capture array alloc (which can GC)
     if (ncap > 0) {
@@ -263,6 +332,7 @@ int32_t kami_truthy(const KamiValue* v) {
     case KT_LIST: return ((KamiList*)v->p)->len != 0;
     case KT_MAP:
     case KT_SET: return ((KamiMap*)v->p)->count != 0;
+    case KT_PYOBJ: return pyobj_truthy(v);
     default: return 1;
     }
 }

@@ -29,6 +29,17 @@ static uint64_t g_bytes_since_gc = 0;
 static uint64_t g_gc_threshold = 1 << 20; // 1 MiB
 static uint64_t g_gc_runs = 0;
 
+// Escape-analysis recycling (Part II.2): headers of provably-dead containers,
+// bucketed by allocation size, ready for immediate reuse by gc_alloc without
+// a new allocation or GC pressure. Cleared at every collection (the entries
+// are unreachable, so the sweep reclaims them normally).
+static std::unordered_map<uint64_t, std::vector<ObjHeader*>> g_recycle;
+
+// Interned string literals (kami_make_str is only called with pointers to
+// the module's constant pool, so the data pointer is a stable identity).
+// Values are GC roots: the map is marked during collection.
+std::unordered_map<const void*, KamiStr*> g_intern;
+
 // ---- thread-local frame registration ----
 namespace {
 struct TlsReg {
@@ -112,10 +123,16 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
 }
 
 void gc_collect() {
+    g_recycle.clear(); // entries are unreachable: let this sweep free them
     g_gc_runs++;
     // mark
     std::vector<ObjHeader*> stack;
     for (auto& v : g_globals) mark_value(&v, stack);
+    for (auto& kv : g_intern)
+        if (!kv.second->h.mark) {
+            kv.second->h.mark = 1;
+            stack.push_back(&kv.second->h);
+        }
     for (auto& pin : g_pins)
         for (int64_t i = 0; i < pin.second; i++) mark_value(&pin.first[i], stack);
     for (FrameStack* fs : g_frame_stacks)
@@ -156,6 +173,9 @@ void gc_collect() {
             case KT_FUNC: free(((KamiFuncObj*)h)->captures); break;
             case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
+            case KT_PYOBJ:
+                pyobj_finalize(h);
+                break;
             case KT_THREAD: {
                 ThreadData* td = ((KamiThreadObj*)h)->td;
                 if (td) {
@@ -176,6 +196,18 @@ void gc_collect() {
 }
 
 void* gc_alloc(uint64_t size, uint32_t type) {
+    // recycled header of the same size (still linked in g_all_objects)?
+    auto it = g_recycle.find(size);
+    if (it != g_recycle.end() && !it->second.empty()) {
+        ObjHeader* h = it->second.back();
+        it->second.pop_back();
+        ObjHeader* next = h->next;
+        memset(h, 0, size);
+        h->type = type;
+        h->size = size;
+        h->next = next; // keep its place in the all-objects chain
+        return h;       // no new bytes: zero GC pressure
+    }
     if (g_bytes_since_gc > g_gc_threshold) gc_collect();
     ObjHeader* h = (ObjHeader*)calloc(1, size);
     if (!h) panic("out of memory");
@@ -186,6 +218,39 @@ void* gc_alloc(uint64_t size, uint32_t type) {
     g_all_objects = h;
     g_bytes_since_gc += size;
     return h;
+}
+
+// `slot = <new container>` over a slot whose old value the compiler proved
+// unaliased: the old list/dict/set is dead right now. Free its external
+// buffers and queue the header for reuse. Anything but a container is left
+// for the GC (strings share their header with the data).
+extern "C" void kami_free_hint(KamiValue* slot) {
+    Lock lk(g_lock);
+    switch (slot->tag) {
+    case KT_LIST: {
+        KamiList* l = (KamiList*)slot->p;
+        free(l->items);
+        l->items = nullptr; // sweep-safe if never reused: free(nullptr) is ok
+        l->len = l->cap = 0;
+        g_recycle[l->h.size].push_back(&l->h);
+        break;
+    }
+    case KT_MAP:
+    case KT_SET: {
+        KamiMap* m = (KamiMap*)slot->p;
+        free(m->entries);
+        free(m->index);
+        m->entries = nullptr;
+        m->index = nullptr;
+        m->count = m->nentries = m->ecap = m->icap = 0;
+        g_recycle[m->h.size].push_back(&m->h);
+        break;
+    }
+    default:
+        return;
+    }
+    slot->tag = KT_NONE;
+    slot->i = 0;
 }
 
 void gc_track_extra(uint64_t bytes) { g_bytes_since_gc += bytes; }
@@ -257,7 +322,8 @@ void kami_global_set(int64_t idx, const KamiValue* v) {
 }
 
 void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t arity,
-                           const char* name) {
+                           const char* name, int64_t kwonly, int64_t flags,
+                           const char* param_names) {
     Lock lk(g_lock);
     KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
     f->fn = fnptr;
@@ -267,6 +333,9 @@ void kami_global_make_func(int64_t idx, void* fnptr, int64_t min_arity, int64_t 
     f->name = name;
     f->captures = nullptr;
     f->ncaptures = 0;
+    f->kwonly = kwonly;
+    f->flags = flags;
+    f->param_names = param_names;
     g_globals[(size_t)idx].tag = KT_FUNC;
     g_globals[(size_t)idx].p = f;
 }
