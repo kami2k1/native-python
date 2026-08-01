@@ -1367,6 +1367,11 @@ std::string dump_expr(const Expr* e) {
         return s + ")";
     }
     case ExprKind::Starred: return "(* " + dump_expr(e->a.get()) + ")";
+    case ExprKind::CCall: {
+        std::string s = "(ccall " + e->sval + ":" + e->csig;
+        for (auto& a : e->args) s += " " + dump_expr(a.get());
+        return s + ")";
+    }
     }
     return "?";
 }

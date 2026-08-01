@@ -1,5 +1,7 @@
 #include "sema.h"
 
+#include "cext.h"
+
 #include "../../runtime/include/kami_builtins.h"
 #include "../../runtime/include/kami_runtime.h"
 
@@ -115,6 +117,13 @@ static bool noop_module(const std::string& name) {
            name == "dataclasses" || name == "collections.abc";
 }
 
+// Modules whose members are C functions rather than Python ones: the C
+// extensions CPython's own library is built on, plus the two FFI front ends.
+static bool ffi_module(const std::string& name) { return is_ffi_module(name); }
+static bool cabi_module(const std::string& name) {
+    return is_cext_module(name) || ffi_module(name);
+}
+
 // module constants
 struct ModConst {
     int kind; // 0=float, 1=str, 2=int
@@ -213,6 +222,16 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
     return false;
 }
 
+// Modules that are neither native, nor in the project, nor found in any Python
+// installation on this machine.
+static std::string unknown_module_msg(const std::string& name) {
+    return "unknown module '" + name +
+           "' (built in: math, time, random, threading, sys, os, json, socket, requests, "
+           "logging, string, doctest, re — or put '" + name +
+           ".py' next to your input file; `kamipy paths` lists every directory searched, "
+           "including the auto-discovered Python installations)";
+}
+
 struct FuncEntry {
     Stmt* def;
     int index;
@@ -234,6 +253,15 @@ struct Sema {
     std::unordered_map<std::string, BuiltinSig> from_imports;  // name → builtin
     std::unordered_map<std::string, ModConst> from_consts;     // name → const value
     std::unordered_map<std::string, std::string> user_imports; // alias → bundled local module
+
+    // ---- C-ABI binding state (see cext.h) ----
+    std::unordered_map<std::string, CPrimitive> from_natives; // `from _math import sqrt`
+    std::unordered_map<std::string, std::string> ffi_names;   // alias → "ctypes.CDLL", "cffi.FFI"
+    std::unordered_map<std::string, std::string> clibs;       // alias → link library
+    std::set<std::string> ffi_objects;                        // cffi FFI() instances
+    std::unordered_map<std::string, std::string> cdef_sigs;   // cdef()'d prototypes
+    std::unordered_map<std::string, char> cfunc_ret;          // "lib.fn" → restype code
+    std::unordered_map<std::string, std::string> cfunc_args;  // "lib.fn" → argtype codes
 
     int try_depth = 0; // imports inside try/except may fail softly
     Stmt* cur_func = nullptr;
@@ -320,12 +348,14 @@ struct Sema {
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
+        if (cabi_module(modname)) {
+            imports[s->alias.empty() ? modname : s->alias] = modname;
+            for (auto& extra : s->body) register_import(extra.get());
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return; // try: import X / except ImportError: pass
-            err(s->line, "unknown module '" + modname +
-                             "' (built in: math, time, random, threading, sys, os, json, "
-                             "socket, requests, logging, string, doctest — or put '" +
-                             modname + ".py' next to your input file to bundle it)");
+            err(s->line, unknown_module_msg(modname));
         }
         imports[s->alias.empty() ? modname : s->alias] = modname;
         for (auto& extra : s->body) register_import(extra.get());
@@ -361,12 +391,26 @@ struct Sema {
             }
             return;
         }
+        if (is_cext_module(modname)) {
+            // `from _math import sqrt` / `from posix import getcwd`
+            for (auto& [n, alias] : s->import_names) {
+                CPrimitive p;
+                int64_t cv;
+                if (cext_lookup(modname, n, p)) from_natives[alias] = p;
+                else if (cext_const(modname, n, cv)) from_consts[alias] = {2, 0, "", cv};
+                else if (try_depth == 0)
+                    err(s->line, "C extension module '" + modname + "' has no member '" + n + "'");
+            }
+            return;
+        }
+        if (ffi_module(modname)) {
+            // `from ctypes import CDLL` / `from cffi import FFI`
+            for (auto& [n, alias] : s->import_names) ffi_names[alias] = modname + "." + n;
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return;
-            err(s->line, "unknown module '" + modname +
-                             "' (built in: math, time, random, threading, sys, os, json, "
-                             "socket, requests, logging, string, doctest — or put '" +
-                             modname + ".py' next to your input file to bundle it)");
+            err(s->line, unknown_module_msg(modname));
         }
         auto& tbl = modules().at(modname);
         for (auto& [n, alias] : s->import_names) {
@@ -758,6 +802,85 @@ struct Sema {
         return true;
     }
 
+    // ---- C-ABI lowering ----------------------------------------------------
+
+    // Remember a C function so codegen can `declare` it and the driver can pass
+    // the right -l flag to the linker.
+    void record_native(int line, const std::string& symbol, const std::string& csig,
+                       const std::string& lib) {
+        for (auto& n : mod.natives) {
+            if (n.symbol != symbol) continue;
+            if (n.csig != csig)
+                err(line, "C symbol '" + symbol + "' is called with two different signatures ('" +
+                              n.csig + "' and '" + csig + "')");
+            if (!lib.empty()) mod.link_libs.insert(lib);
+            return;
+        }
+        mod.natives.push_back({symbol, csig});
+        if (!lib.empty()) mod.link_libs.insert(lib);
+    }
+
+    // Turn a Python-looking call into a direct C call: `call double @sqrt(...)`.
+    void become_ccall(Expr* e, const std::string& symbol, const std::string& csig,
+                      const std::string& lib) {
+        if (!valid_csig(csig))
+            err(e->line, "cannot bind '" + symbol + "': unsupported C signature '" + csig + "'");
+        if (e->args.size() != csig.size() - 1)
+            err(e->line, symbol + "() takes " + std::to_string(csig.size() - 1) +
+                             " argument(s) through the C ABI, got " +
+                             std::to_string(e->args.size()));
+        if (!e->kwargs.empty())
+            err(e->line, symbol + "(): C functions do not take keyword arguments");
+        record_native(e->line, symbol, csig, lib);
+        e->kind = ExprKind::CCall;
+        e->sval = symbol;
+        e->csig = csig;
+        e->a.reset();
+    }
+
+    // `_math.sqrt(x)` / `posix.getcwd()`: either a runtime primitive or a plain
+    // C call, depending on how the mapping table binds the member.
+    void lower_cprimitive(Expr* e, const std::string& what, const CPrimitive& p) {
+        if ((int)e->args.size() < p.min_args || (int)e->args.size() > p.max_args)
+            err(e->line, what + "() got " + std::to_string(e->args.size()) + " argument(s)");
+        if (p.builtin_id >= 0) {
+            become_builtin_call(e, what, p.builtin_id);
+            return;
+        }
+        become_ccall(e, p.symbol, p.csig, p.lib);
+    }
+
+    // With no explicit argtypes, ctypes passes ints as ints and (as a courtesy
+    // KamiPython adds) float literals as doubles and strings as char*.
+    static char guess_arg_code(const Expr* a) {
+        switch (a->kind) {
+        case ExprKind::FloatLit: return 'd';
+        case ExprKind::StrLit: return 's';
+        default: return 'i';
+        }
+    }
+
+    // `lib.fn(...)` where `lib` came from ctypes.CDLL / ffi.dlopen.
+    void lower_clib_call(Expr* e, const std::string& alias, const std::string& fname) {
+        for (auto& a : e->args) resolve_expr(a.get());
+        std::string key = alias + "." + fname;
+        std::string csig;
+        auto sit = cdef_sigs.find(fname);
+        auto rit = cfunc_ret.find(key);
+        auto ait = cfunc_args.find(key);
+        if (rit == cfunc_ret.end() && ait == cfunc_args.end() && sit != cdef_sigs.end()) {
+            csig = sit->second; // declared by cffi's cdef()
+        } else {
+            csig = std::string(1, rit != cfunc_ret.end() ? rit->second : 'i');
+            if (ait != cfunc_args.end()) {
+                csig += ait->second;
+            } else {
+                for (auto& a : e->args) csig += guess_arg_code(a.get());
+            }
+        }
+        become_ccall(e, fname, csig, clibs.at(alias));
+    }
+
     void become_builtin_call(Expr* e, const std::string& name, int64_t id) {
         e->kind = ExprKind::Call;
         auto callee = std::make_unique<Expr>();
@@ -923,6 +1046,18 @@ struct Sema {
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
                 !name_shadowed(e->a->sval)) {
                 const std::string& modname = imports.at(e->a->sval);
+                int64_t iv;
+                if (cext_const(modname, e->sval, iv)) {
+                    // `_socket.AF_INET`, `posix.O_RDONLY`: compile-time constants.
+                    e->kind = ExprKind::IntLit;
+                    e->ival = iv;
+                    e->a.reset();
+                    return;
+                }
+                if (ffi_module(modname))
+                    err(e->line, modname + "." + e->sval +
+                                     " is only supported in a library-handle assignment, a "
+                                     "restype/argtypes assignment, or a call");
                 ModConst cv;
                 if (module_const(modname, e->sval, cv)) {
                     apply_const(e, cv);
@@ -1003,6 +1138,12 @@ struct Sema {
                         callee->res_idx = c->second.global;
                         return; // dynamic call: runtime instantiates
                     }
+                    auto cn = from_natives.find(n);
+                    if (cn != from_natives.end() && !globals.count(n)) {
+                        resolve_args();
+                        lower_cprimitive(e, n, cn->second);
+                        return;
+                    }
                     auto fi = from_imports.find(n);
                     if (fi != from_imports.end() && !globals.count(n)) {
                         resolve_args();
@@ -1077,11 +1218,47 @@ struct Sema {
                 e->a = std::move(callee);
                 return;
             }
+            // lib.fn(...) where lib is a ctypes/cffi library handle → C call.
+            // No name_shadowed() guard: a name only becomes a handle by way of
+            // an assignment the compiler consumed, so there is nothing to shadow.
+            if (e->a->kind == ExprKind::Name && clibs.count(e->a->sval)) {
+                lower_clib_call(e, e->a->sval, e->sval);
+                return;
+            }
+            // ffi.cdef("double sqrt(double);") — compile-time declaration only.
+            if (e->a->kind == ExprKind::Name && ffi_objects.count(e->a->sval)) {
+                if (e->sval == "cdef" && e->args.size() == 1 &&
+                    e->args[0]->kind == ExprKind::StrLit) {
+                    parse_cdef(e->args[0]->sval, cdef_sigs);
+                    e->args.clear();
+                    e->kwargs.clear();
+                    become_builtin_call(e, "ffi.cdef", KB_NOOP);
+                    return;
+                }
+                err(e->line, "cffi: only ffi.cdef(<literal>) and `lib = ffi.dlopen(<literal>)` "
+                             "are supported");
+            }
+            // _math.sqrt(...) / posix.getcwd(...) — C extension members.
+            if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
+                is_cext_module(imports.at(e->a->sval)) && !name_shadowed(e->a->sval)) {
+                const std::string& modname = imports.at(e->a->sval);
+                for (auto& a : e->args) resolve_expr(a.get());
+                CPrimitive p;
+                if (!cext_lookup(modname, e->sval, p))
+                    err(e->line, "C extension module '" + modname + "' has no member '" + e->sval +
+                                     "'");
+                lower_cprimitive(e, modname + "." + e->sval, p);
+                return;
+            }
             for (auto& a : e->args) resolve_expr(a.get());
             for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
                 !name_shadowed(e->a->sval)) {
                 const std::string& modname = imports.at(e->a->sval);
+                if (ffi_module(modname))
+                    err(e->line, modname + "." + e->sval +
+                                     "(): expected `handle = " + modname +
+                                     (modname == "ctypes" ? ".CDLL(<literal>)`" : ".FFI()`"));
                 auto& mm = modules().at(modname);
                 auto it = mm.find(e->sval);
                 if (it == mm.end())
@@ -1155,6 +1332,8 @@ struct Sema {
         }
         case ExprKind::Closure:
             return;
+        case ExprKind::CCall:
+            return; // produced by this pass, never fed back into it
         case ExprKind::MapLit:
             for (auto& p : e->pairs) {
                 resolve_expr(p.first.get());
@@ -1310,10 +1489,113 @@ struct Sema {
         for (auto& sp : body) resolve_stmt(sp.get());
     }
 
+    // ---- ctypes / cffi statement forms -------------------------------------
+
+    // Name of the FFI entry point a call refers to: "ctypes.CDLL", "cffi.FFI",
+    // "ctypes.cdll.LoadLibrary", or "" when the call is something else.
+    std::string ffi_callee(const Expr* e) const {
+        if (e->kind == ExprKind::Call && e->a && e->a->kind == ExprKind::Name) {
+            auto it = ffi_names.find(e->a->sval); // `from cffi import FFI` → FFI()
+            if (it != ffi_names.end()) return it->second;
+            return "";
+        }
+        if (e->kind != ExprKind::MethodCall || !e->a) return "";
+        if (e->a->kind == ExprKind::Name) {
+            auto it = imports.find(e->a->sval);
+            if (it != imports.end() && ffi_module(it->second)) return it->second + "." + e->sval;
+            return "";
+        }
+        // ctypes.cdll.LoadLibrary("libm.so.6") / ctypes.windll.LoadLibrary(...)
+        if (e->a->kind == ExprKind::Attr && e->a->a && e->a->a->kind == ExprKind::Name) {
+            auto it = imports.find(e->a->a->sval);
+            if (it != imports.end() && it->second == "ctypes")
+                return "ctypes." + e->a->sval + "." + e->sval;
+        }
+        return "";
+    }
+
+    // Binds `lib = ctypes.CDLL("libm.so.6")`, `ffi = cffi.FFI()` and
+    // `lib = ffi.dlopen("libm.so.6")`. Returns true when the statement was a
+    // compile-time binding and produces no code.
+    bool bind_ffi_assign(Stmt* s) {
+        Expr* v = s->e1.get();
+        // lib = ffi.dlopen("libm.so.6")
+        if (v->kind == ExprKind::MethodCall && v->a && v->a->kind == ExprKind::Name &&
+            ffi_objects.count(v->a->sval) && v->sval == "dlopen") {
+            if (v->args.size() != 1 || v->args[0]->kind != ExprKind::StrLit)
+                err(s->line, "ffi.dlopen() needs a string literal so the library can be linked "
+                             "at build time");
+            clibs[s->name] = derive_link_lib(v->args[0]->sval);
+            s->kind = StmtKind::Pass;
+            return true;
+        }
+        std::string callee = ffi_callee(v);
+        if (callee.empty()) return false;
+        if (callee == "cffi.FFI") {
+            ffi_objects.insert(s->name);
+            s->kind = StmtKind::Pass;
+            return true;
+        }
+        bool is_dll = callee == "ctypes.CDLL" || callee == "ctypes.WinDLL" ||
+                      callee == "ctypes.OleDLL" || callee == "ctypes.PyDLL" ||
+                      callee == "ctypes.cdll.LoadLibrary" ||
+                      callee == "ctypes.windll.LoadLibrary";
+        if (!is_dll) return false;
+        // CDLL(None) means "this process", i.e. libc — already linked in.
+        if (v->args.size() == 1 && v->args[0]->kind == ExprKind::NoneLit) {
+            clibs[s->name] = "";
+            s->kind = StmtKind::Pass;
+            return true;
+        }
+        if (v->args.empty() || v->args[0]->kind != ExprKind::StrLit)
+            err(s->line, callee + "() needs a string literal so the library can be linked at "
+                                  "build time");
+        clibs[s->name] = derive_link_lib(v->args[0]->sval);
+        s->kind = StmtKind::Pass;
+        return true;
+    }
+
+    // Binds `lib.fn.restype = ctypes.c_double` and
+    // `lib.fn.argtypes = [ctypes.c_double]`.
+    bool bind_ffi_attr_assign(Stmt* s) {
+        if (s->name != "restype" && s->name != "argtypes") return false;
+        Expr* base = s->e1.get();
+        if (base->kind != ExprKind::Attr || !base->a || base->a->kind != ExprKind::Name)
+            return false;
+        auto lib = clibs.find(base->a->sval);
+        if (lib == clibs.end()) return false;
+        std::string key = base->a->sval + "." + base->sval;
+        // The right-hand side names ctypes types; spell them out as codes.
+        auto type_name = [](const Expr* t) -> std::string {
+            if (t->kind == ExprKind::Attr) return t->sval;
+            if (t->kind == ExprKind::Name) return t->sval;
+            if (t->kind == ExprKind::NoneLit) return "None";
+            return "";
+        };
+        if (s->name == "restype") {
+            char c = ctypes_type_code(type_name(s->e3.get()));
+            if (!c) err(s->line, key + ".restype: unsupported ctypes type");
+            cfunc_ret[key] = c;
+        } else {
+            if (s->e3->kind != ExprKind::ListLit)
+                err(s->line, key + ".argtypes must be a list literal of ctypes types");
+            std::string codes;
+            for (auto& t : s->e3->args) {
+                char c = ctypes_type_code(type_name(t.get()));
+                if (!c || c == 'v') err(s->line, key + ".argtypes: unsupported ctypes type");
+                codes += c;
+            }
+            cfunc_args[key] = codes;
+        }
+        s->kind = StmtKind::Pass;
+        return true;
+    }
+
     void resolve_stmt(Stmt* s) {
         switch (s->kind) {
         case StmtKind::ExprStmt: resolve_expr(s->e1.get()); return;
         case StmtKind::Assign:
+            if (bind_ffi_assign(s)) return;
             resolve_expr(s->e1.get());
             resolve_target(s, s->name);
             return;
@@ -1323,6 +1605,7 @@ struct Sema {
             resolve_expr(s->e3.get());
             return;
         case StmtKind::AttrAssign:
+            if (bind_ffi_attr_assign(s)) return;
             resolve_expr(s->e1.get());
             resolve_expr(s->e3.get());
             return;

@@ -4,6 +4,85 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.6.0] — 2026-08-01 — Tự động tìm Python hệ thống + gắn kết C-ABI (C extensions, ctypes/cffi)
+
+Trước bản này, `import X` chỉ tìm được `X.py` cạnh file input hoặc trong `runtime/pylib/`
+ship kèm binary — muốn dùng thêm module stdlib là phải copy tay. Bản này bỏ hẳn ràng buộc đó:
+compiler tự dò môi trường Python trên máy và **compile chính source stdlib thật của CPython**.
+
+### Added — Auto-discovery môi trường Python hệ thống (`compiler/src/modules.cpp`)
+Hàm `find_system_python_stdlib()` trả về danh sách import root, tốt nhất trước, dò theo thứ tự:
+1. `KAMIPY_PYTHON_STDLIB` (ghi đè tường minh, phân tách `:` / `;`).
+2. `PYTHONHOME` → `<prefix>/Lib` (Windows) hoặc `<prefix>/lib/python3.*`.
+3. Từng entry của `PYTHONPATH`.
+4. Trình thông dịch `python3`/`python.exe` trên `PATH` — nhờ đó virtualenv, pyenv, conda đều được nhận.
+5. Quét theo nền tảng:
+   - **Windows**: Registry `HKCU`/`HKLM\Software\Python\PythonCore` (kể cả `Wow6432Node`) →
+     `InstallPath`; `%LOCALAPPDATA%\Programs\Python\Python3*\Lib`; `C:\Python3*\Lib`;
+     `C:\Program Files\Python3*\Lib` và `Program Files (x86)`.
+   - **Linux/macOS**: `/usr/lib/python3.*`, `/usr/local/lib/python3.*`, `/usr/lib64/...`,
+     `/opt/homebrew/...`, `~/.pyenv/versions/*/lib/python3.*`, framework build của macOS.
+
+Mỗi thư mục phải chứa "dấu vân tay" stdlib (`os.py` / `json/__init__.py` / `types.py`) mới được
+nhận, sắp xếp nguồn tường minh trước nguồn quét, Python mới trước Python cũ. Kết quả được cache.
+
+### Changed — thứ tự resolve import (`resolve_module`)
+`project → native → system Python → pylib đi kèm`:
+- File `X.py` cạnh input **luôn** thắng (đúng semantics CPython).
+- Module runtime đã có primitive C-ABI (`math`, `os`, `json`, `socket`, `re`, …) giữ nguyên đường
+  native — nhanh hơn và đã được kiểm chứng, không kéo cả package CPython vào.
+- Còn lại: nạp `.py` **thật** từ Python hệ thống. Hỗ trợ cả package (`X/__init__.py`) và `pkg.mod`.
+- `pylib` đi kèm trở thành **fallback thật**: nếu máy không có Python, hoặc source CPython dùng
+  cú pháp compiler chưa nhận (`*args/**kwargs`, nested class, …), quá trình tự rơi xuống bản
+  `runtime/pylib/`. Chỉ khi hết lựa chọn mới cảnh báo và bỏ qua module đó.
+
+### Added — Tích hợp C extension & C-ABI (`compiler/src/cext.cpp`, `runtime/src/syscalls.cpp`)
+Nửa "C" của stdlib CPython nay có chỗ đáp: bảng map từng thành viên C extension sang
+**runtime primitive** hoặc **lời gọi C trực tiếp** trong LLVM IR (`call double @sqrt(double)`).
+- `_math` → libm trực tiếp (sqrt, sin, cos, tan, exp, log, log2/log10, atan/asin/acos, sinh/cosh/tanh,
+  cbrt, expm1, log1p, pow, atan2, fmod, hypot, copysign, remainder) + primitive cho factorial/gcd/isqrt.
+- `_os` / `posix` / `nt` → `os.*` primitive, cộng I/O file descriptor **thật**:
+  `open/read/write/close/lseek` (syscall), hằng `O_RDONLY/O_WRONLY/O_CREAT/O_TRUNC/O_APPEND`,
+  `SEEK_*` — cờ được runtime dịch lại nên cùng một source chạy được cả Windows.
+- `_socket` → primitive `socket()`, `gethostname()`, và `htons/ntohs/htonl/ntohl` gọi thẳng
+  libc / `ws2_32.dll`; hằng `AF_INET`, `SOCK_STREAM`, …
+- `_struct` → `pack`/`unpack`/`calcsize` cài trong `runtime/src/syscalls.cpp`
+  (`b B h H i I l L q Q f d x`, tiền tố `< > ! = @`, có dấu/không dấu, đệm `x`).
+- `_json` → `json.loads/dumps` primitive; `_time`, `_random` → primitive tương ứng.
+- `from _math import sqrt` hoạt động y như `_math.sqrt`.
+
+### Added — `ctypes` / `cffi` → native call + tự động sinh cờ link
+- `lib = ctypes.CDLL("libm.so.6")` (và `WinDLL`/`OleDLL`/`PyDLL`/`cdll.LoadLibrary`,
+  `CDLL(None)` = chính process) được xử lý **ở compile time**: tên thư viện suy ra cờ linker
+  (`libm.so.6` → `-lm`, `ws2_32.dll` → `-lws2_32`, `libc.so.6`/`msvcrt.dll` → không cần gì).
+- `lib.f.restype = ctypes.c_double` / `lib.f.argtypes = [...]` dựng chữ ký; thiếu `argtypes` thì
+  suy ra từ đối số thực tế (float → `double`, str → `char*`, còn lại → integer).
+- `cffi`: `ffi = cffi.FFI()`, `ffi.cdef("double cbrt(double);")`, `ffi = ffi.dlopen(...)` —
+  prototype trong `cdef()` được parse để lấy chữ ký chính xác.
+- **Độ rộng kiểu được tôn trọng**: C `int` là 32-bit (`trunc`/`sext` quanh lời gọi), `long` theo
+  LP64/LLP64, `float` khác `double`. Truyền i64 vào tham số `int` là UB, không phải tiện tay.
+- Đối số được unbox qua runtime (`kami_c_arg_i64/f64/cstr`) nên sai kiểu là lỗi Python bắt được,
+  không phải hỏng stack.
+
+### Added — CLI & chẩn đoán
+- `kamipy paths` — in mọi thư mục mà `import` sẽ tìm, theo thứ tự (project → pylib → Python hệ thống).
+- `kamipy build ... -v/--verbose` — in từng module resolve về đâu và cờ link C-ABI nào được thêm.
+- `kamipy build ... --no-system-stdlib` (hoặc `KAMIPY_NO_SYSTEM_STDLIB=1`) — tắt auto-discovery.
+
+### Verification
+- `import stat` và `import colorsys` compile từ **`/usr/lib/python3.13/*.py` thật**, output
+  **trùng từng byte** với CPython (`tests/integration/feat_system_stdlib.py`).
+- `import json / math / socket / os` vẫn đi đường native primitive như trước.
+- 3 integration test mới (`feat_cext_cabi`, `feat_ctypes_ffi_posix`, `feat_system_stdlib`) và
+  1 unit suite mới (`tests/unit/test_cabi.cpp`: suy luận cờ link, bảng kiểu ctypes, parser `cdef()`,
+  bảng map C extension, tính bất biến của discovery). Tổng: 3 unit + 48 integration, all green.
+
+### Known limits
+Phần lớn stdlib CPython vẫn chưa compile được vì dùng `*args/**kwargs`, nested class, generator —
+compiler báo chính xác file:dòng:lý do rồi rơi xuống fallback thay vì làm hỏng cả build.
+
+---
+
 ## [v0.5.1] — 2026-08-01 — `requests` native 100%: bỏ hẳn curl + Windows UX
 
 Theo đúng triết lý "dịch cả thư viện, không gọi process ngoài": `requests` được viết lại

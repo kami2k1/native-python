@@ -337,31 +337,104 @@ KIR ──codegen──▶ LLVM IR ──llc/TargetMachine──▶ .o (x86-64 o
 
 ---
 
-## 9. Import system (PHASE 10 — design)
+## 9. Import system (as built)
 
-**Static imports**, no dynamic runtime importing:
+**Static imports, no dynamic runtime importing.** Everything a program imports is
+compiled into the same executable; there is no `sys.modules`, no import hook, no
+`.pyc`. The whole subsystem lives in `compiler/src/modules.cpp`.
+
+### 9.1 Where `import X` looks
 
 ```
-import math
-   │ resolve: stdlib first, then files next to main.py
-   ▼ compile module (recursively; cycles detected → error)
-   ▼ each module → its own LLVM module / object, symbols prefixed kami_mod_<name>_
-   ▼ link everything into one executable
+import X
+  1. project      X.py or X/__init__.py next to the input file
+  2. native       a module the runtime implements (math, os, json, socket, re, ...)
+  3. system Python the CPython installation discovered on this machine
+  4. bundled pylib runtime/pylib/, shipped next to the kamipy binary
 ```
 
-The stdlib (`math`, `json`, `filesystem`, `time`, `random`) is written in C++ inside `libkamirt` and exposed through a symbol table so the semantic analyzer knows function signatures.
+A project file always wins, as in CPython. A native module beats CPython's source
+on purpose: `import json` should stay a C-ABI primitive call rather than drag in the
+whole `json/` package. Everything else is read from the machine's real stdlib, and
+the shipped `pylib/` is the *fallback* — used when no Python is installed, or when
+CPython's source for that module uses syntax this compiler does not accept yet. A
+candidate that fails to **parse** falls through to the next one, which is what makes
+that ordering safe; only when no candidate is left does the driver warn and skip.
+
+Modules are spliced into the main program dependency-first, with `if __name__ ==
+"__main__":` blocks dropped, so `utils.helper()` resolves to a plain call to
+`helper()`. Import cycles are detected and reported.
+
+### 9.2 Discovering the system Python
+
+`find_system_python_stdlib()` returns import roots, best first, and caches the
+result. It never runs a subprocess — it only reads environment variables, the
+Windows registry and the filesystem.
+
+| Order | Source |
+|---|---|
+| 1 | `$KAMIPY_PYTHON_STDLIB` — explicit override, `:`/`;` separated |
+| 2 | `$PYTHONHOME` → `<prefix>/Lib` (Windows) or `<prefix>/lib/python3.*` |
+| 3 | `$PYTHONPATH` entries, used as-is |
+| 4 | `python3` / `python.exe` on `$PATH` → its prefix (catches virtualenv, pyenv, conda) |
+| 5 | Windows: registry `HKCU`/`HKLM\Software\Python\PythonCore` (and `Wow6432Node`) → `InstallPath`; `%LOCALAPPDATA%\Programs\Python\Python3*\Lib`; `C:\Python3*\Lib`; `C:\Program Files[ (x86)]\Python3*\Lib` |
+| 5 | Unix: `/usr/lib/python3.*`, `/usr/local/lib/python3.*`, `/usr/lib64/...`, `/opt/homebrew/...`, `~/.pyenv/versions/*/lib/python3.*`, macOS framework builds |
+
+A directory is only accepted if it contains a stdlib fingerprint (`os.py`,
+`json/__init__.py` or `types.py`), so a stray backup folder cannot poison the
+search path. Within one priority level the newest Python version sorts first.
+
+`kamipy paths` prints the whole list; `kamipy build -v` reports every resolution;
+`--no-system-stdlib` (or `KAMIPY_NO_SYSTEM_STDLIB=1`) turns discovery off.
+
+### 9.3 C extensions and the C ABI
+
+CPython's standard library is only half Python — the interesting half is C
+extension modules. `compiler/src/cext.cpp` maps their members onto one of two
+things:
+
+* a **runtime primitive** (`_json.loads` → `KB_JSON_LOADS`), or
+* a **direct C call** emitted into the IR (`_math.sqrt` → `call double @sqrt(double)`).
+
+`runtime/src/syscalls.cpp` holds the primitives that have no natural Python
+expression: descriptor I/O (`open/read/write/close/lseek`), `gethostname`, and
+`struct.pack`/`unpack`/`calcsize`.
+
+`ctypes` and `cffi` are understood at compile time, not runtime:
+
+```python
+lib = ctypes.CDLL("libm.so.6")     # → link flag -lm, derived from the name
+lib.sqrt.restype = ctypes.c_double # → return type
+lib.sqrt.argtypes = [ctypes.c_double]
+lib.sqrt(2.25)                     # → call double @sqrt(double 2.25)
+```
+
+Signatures are carried as a compact string: the first character is the return
+type, the rest are parameters, and **each C width has its own code** — `'l'` is a
+32-bit C `int`, `'i'` is a 64-bit `long`/`size_t`/pointer, `'f'` is `float`, `'d'`
+is `double`, `'s'` is `const char*`. Handing an i64 to a function whose parameter
+is a C `int` is undefined behaviour, not a nicety, so codegen emits the
+`trunc`/`sext`/`fptrunc`/`fpext` conversions around the call. Arguments are
+unboxed through `kami_c_arg_i64/f64/cstr`, so a type mismatch is a catchable
+Python-level error rather than a corrupted stack. The driver collects the
+libraries these bindings need and appends `-l<name>` to the clang command.
 
 ---
 
-## 10. CLI (PHASE 12 — design)
+## 10. CLI (as built)
 
 ```
-kamipy build main.py [-o app] [-O0|-O2] [--emit-llvm] [--emit-kir]
-kamipy run   main.py        # build into a temp dir, then exec
+kamipy build <file.py> [-o app] [-O0|-O1|-O2] [--emit-llvm] [--emit-ast]
+                       [--no-system-stdlib] [-v|--verbose]
+kamipy run   <file.py>      # build into .kamipy-cache/, then exec
+kamipy paths                # every directory `import` searches, in order
 kamipy clean                # remove .kamipy-cache/
 ```
 
-`--emit-llvm`/`--emit-kir` support debugging and golden-file tests.
+`--emit-llvm`/`--emit-ast` support debugging and golden-file tests. `paths` and
+`-v` exist to make import resolution diagnosable without guesswork: `paths`
+answers "where would it look?", `-v` answers "where did it actually find it, and
+what did it link against?".
 
 ---
 

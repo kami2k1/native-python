@@ -435,6 +435,7 @@ struct FnGen {
             temp_top = save;
             return t;
         }
+        case ExprKind::CCall: return gen_ccall(e);
         case ExprKind::MethodCall: {
             int t = alloc_temp(); // before args: see Call above
             int save = temp_top;
@@ -451,6 +452,83 @@ struct FnGen {
         }
         }
         throw CompileError(e->line, "internal error: bad expression kind in codegen");
+    }
+
+    // ---- direct C-ABI calls ------------------------------------------------
+    // The whole point of a CCall is that no dynamic dispatch happens: values are
+    // unboxed into machine types, the C function is called exactly as C would
+    // call it, and the result is boxed back. `sqrt(2.0)` becomes three
+    // instructions, not a builtin-table lookup.
+    static const char* ir_type(char code) {
+        switch (code) {
+        case 'i': return "i64";
+        case 'l': return "i32";
+        case 'd': return "double";
+        case 'f': return "float";
+        case 's': return "ptr";
+        default: return "void";
+        }
+    }
+
+    int gen_ccall(const Expr* e) {
+        int t = alloc_temp(); // result slot first: see Call above
+        int save = temp_top;
+        std::vector<int> slots;
+        for (auto& a : e->args) slots.push_back(gen_expr(a.get()));
+        // Unbox every argument through the runtime, which raises a catchable
+        // Python-level error on a type mismatch instead of corrupting the stack.
+        // The helpers always yield the widest form (i64 / double / ptr); narrow
+        // parameters are then truncated to their real C width.
+        std::vector<std::string> vals;
+        for (size_t i = 0; i < slots.size(); i++) {
+            char code = e->csig[i + 1];
+            const char* helper = (code == 'd' || code == 'f')
+                                     ? "kami_c_arg_f64"
+                                     : (code == 's' ? "kami_c_arg_cstr" : "kami_c_arg_i64");
+            const char* wide = (code == 'd' || code == 'f') ? "double"
+                                                           : (code == 's' ? "ptr" : "i64");
+            std::string v = r();
+            emit(v + " = call " + wide + " @" + helper + "(ptr " + slot_ptr(slots[i]) + ")");
+            if (code == 'l') {
+                std::string n = r();
+                emit(n + " = trunc i64 " + v + " to i32");
+                v = n;
+            } else if (code == 'f') {
+                std::string n = r();
+                emit(n + " = fptrunc double " + v + " to float");
+                v = n;
+            }
+            vals.push_back(std::string(ir_type(code)) + " " + v);
+        }
+        std::string argstr;
+        for (size_t i = 0; i < vals.size(); i++) argstr += (i ? ", " : "") + vals[i];
+        char ret = e->csig[0];
+        std::string rp = slot_ptr(t);
+        if (ret == 'v') {
+            emit("call void @" + e->sval + "(" + argstr + ")");
+            emit("call void @kami_make_none(ptr " + rp + ")");
+            temp_top = save;
+            return t;
+        }
+        std::string rv = r();
+        emit(rv + " = call " + ir_type(ret) + " @" + e->sval + "(" + argstr + ")");
+        if (ret == 'l') { // C int → Python int: sign-extend, never read garbage
+            std::string w = r();
+            emit(w + " = sext i32 " + rv + " to i64");
+            emit("call void @kami_make_int(ptr " + rp + ", i64 " + w + ")");
+        } else if (ret == 'f') {
+            std::string w = r();
+            emit(w + " = fpext float " + rv + " to double");
+            emit("call void @kami_make_float(ptr " + rp + ", double " + w + ")");
+        } else if (ret == 'd') {
+            emit("call void @kami_make_float(ptr " + rp + ", double " + rv + ")");
+        } else if (ret == 's') {
+            emit("call void @kami_c_ret_cstr(ptr " + rp + ", ptr " + rv + ")");
+        } else {
+            emit("call void @kami_make_int(ptr " + rp + ", i64 " + rv + ")");
+        }
+        temp_top = save;
+        return t;
     }
 
     // Materialize a capture source (in enclosing-frame terms) into a slot,
@@ -1297,6 +1375,10 @@ declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
 declare void @kami_rethrow()
 declare void @kami_run_module(ptr)
+declare i64 @kami_c_arg_i64(ptr)
+declare double @kami_c_arg_f64(ptr)
+declare ptr @kami_c_arg_cstr(ptr)
+declare void @kami_c_ret_cstr(ptr, ptr)
 
 )";
 
@@ -1378,6 +1460,20 @@ std::string codegen(const Module& m, const std::string& source_name) {
     }
     out += "\n";
     out += RUNTIME_DECLS;
+    // C functions bound from C extension modules / ctypes / cffi. They are
+    // ordinary external symbols: the linker resolves them against libc, libm,
+    // ws2_32 or whatever -l flag the driver added for them.
+    if (!m.natives.empty()) {
+        out += "; --- C-ABI bindings ---\n";
+        for (const NativeDecl& n : m.natives) {
+            std::string params;
+            for (size_t i = 1; i < n.csig.size(); i++)
+                params += (i > 1 ? ", " : "") + std::string(FnGen::ir_type(n.csig[i]));
+            out += "declare " + std::string(FnGen::ir_type(n.csig[0])) + " @" + n.symbol + "(" +
+                   params + ")\n";
+        }
+        out += "\n";
+    }
     out += fns;
     out += main_fn;
     return out;

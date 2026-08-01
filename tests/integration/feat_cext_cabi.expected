@@ -1,0 +1,16 @@
+sqrt 4.0
+pow 1024.0
+hypot 5.0
+fmod 1.0
+factorial 720
+isqrt 4
+calcsize 6
+roundtrip [7, 300]
+bigendian [66051]
+double [0.5]
+signed [-3]
+htons 13330
+ntohl 305419896
+readback raw syscall
+O_CREAT 64
+from-import 1.5 120
