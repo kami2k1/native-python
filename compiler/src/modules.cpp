@@ -7,6 +7,7 @@
 // sees one AST.
 #include "modules.h"
 
+#include "driver.h"
 #include "lexer.h"
 #include "parser.h"
 #include "sema.h"
@@ -407,16 +408,7 @@ std::vector<std::string> stdlib_search_dirs(const std::string& argv0) {
             throw std::runtime_error(std::string("KAMIPY_STDLIB is not a directory: ") + env);
         return {env};
     }
-    fs::path dir;
-#ifndef _WIN32
-    std::error_code ec;
-    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    if (!ec) dir = exe.parent_path();
-#endif
-    if (dir.empty()) {
-        fs::path a(argv0);
-        dir = a.has_parent_path() ? fs::absolute(a).parent_path() : fs::current_path();
-    }
+    fs::path dir = executable_dir(argv0);
     fs::path up1 = dir.parent_path();
     fs::path up2 = up1.parent_path();
     std::vector<std::string> out;

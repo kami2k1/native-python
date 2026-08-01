@@ -78,6 +78,8 @@ static fs::path self_dir(const std::string& argv0) {
     return fs::current_path();
 }
 
+std::string executable_dir(const std::string& argv0) { return self_dir(argv0).string(); }
+
 std::string find_runtime_lib(const std::string& argv0) {
     if (const char* env = getenv("KAMIPY_RT_LIB")) {
         if (fs::exists(env)) return env;
