@@ -112,19 +112,42 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
         }
         num_result_float(out, as_num(a) - as_num(b));
         return;
-    case KOP_MUL:
+    case KOP_MUL: {
         if (a->tag == KT_INT && b->tag == KT_INT) { num_result_int(out, a->i * b->i); return; }
         if (is_num(a) && is_num(b)) { num_result_float(out, as_num(a) * as_num(b)); return; }
-        if (a->tag == KT_STR && b->tag == KT_INT) { // "ab" * 3
-            KamiStr* x = (KamiStr*)a->p;
-            std::string s;
-            for (int64_t i = 0; i < b->i; i++) s.append(x->data, (size_t)x->len);
-            out->tag = KT_STR;
-            out->p = str_new(s.data(), (int64_t)s.size());
+        // sequence repetition: "ab" * 3 / 3 * "ab" / [0] * n / n * [0]
+        const KamiValue* seq = nullptr;
+        const KamiValue* cnt = nullptr;
+        if ((a->tag == KT_STR || a->tag == KT_LIST) && (b->tag == KT_INT || b->tag == KT_BOOL)) {
+            seq = a;
+            cnt = b;
+        } else if ((b->tag == KT_STR || b->tag == KT_LIST) &&
+                   (a->tag == KT_INT || a->tag == KT_BOOL)) {
+            seq = b;
+            cnt = a;
+        }
+        if (seq) {
+            int64_t n = cnt->i < 0 ? 0 : cnt->i;
+            if (seq->tag == KT_STR) {
+                KamiStr* x = (KamiStr*)seq->p;
+                std::string s;
+                s.reserve((size_t)(x->len * n));
+                for (int64_t i = 0; i < n; i++) s.append(x->data, (size_t)x->len);
+                out->tag = KT_STR;
+                out->p = str_new(s.data(), (int64_t)s.size());
+            } else {
+                KamiList* x = (KamiList*)seq->p;
+                KamiList* r = list_new(x->len * n > 0 ? x->len * n : 1);
+                for (int64_t i = 0; i < n; i++)
+                    for (int64_t k = 0; k < x->len; k++) r->items[r->len++] = x->items[k];
+                out->tag = KT_LIST;
+                out->p = r;
+            }
             return;
         }
         panic(std::string("unsupported operand types for *: '") + type_name(a->tag) +
               "' and '" + type_name(b->tag) + "'");
+    }
     case KOP_DIV: {
         double y = as_num(b);
         if (y == 0.0) panic("division by zero");
@@ -367,9 +390,24 @@ void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
     KamiValue v = *seq;
     switch (v.tag) {
     case KT_LIST:
-    case KT_STR:
         *out = v;
         return;
+    case KT_STR: {
+        // Materialize into a list of 1-char strings. Callers (for-loops via
+        // kami_iter_cond/get, and as_list_pinned in builtins) all treat the
+        // result as a list, so a bare KT_STR here would be misread as a
+        // KamiList* and crash.
+        KamiStr* s = (KamiStr*)v.p;
+        KamiList* r = list_new(s->len > 0 ? s->len : 1);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int64_t i = 0; i < s->len; i++) {
+            KamiValue ch{KT_STR, {0}};
+            ch.p = str_new(s->data + i, 1);
+            r->items[r->len++] = ch;
+        }
+        return;
+    }
     case KT_MAP:
     case KT_SET: {
         KamiMap* m = (KamiMap*)v.p;
@@ -596,6 +634,11 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 out->tag = KT_NONE; out->i = 0;
                 return;
             }
+            if (m == "clear" && nargs == 0) {
+                l->len = 0;
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
         } else if (o.tag == KT_STR) {
             KamiStr* s = (KamiStr*)o.p;
             std::string sv(s->data, (size_t)s->len);
@@ -793,6 +836,124 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 out->tag = KT_BOOL; out->i = r;
                 return;
             }
+            if ((m == "isalnum" || m == "isnumeric" || m == "isdecimal") && nargs == 0) {
+                bool r = !sv.empty();
+                for (unsigned char c : sv) {
+                    bool okc = m == "isalnum" ? (isalnum(c) != 0) : (isdigit(c) != 0);
+                    if (!okc) { r = false; break; }
+                }
+                out->tag = KT_BOOL; out->i = r;
+                return;
+            }
+            if (m == "casefold" && nargs == 0) { // like lower() for ASCII
+                std::string r = sv;
+                for (char& c : r) c = (char)tolower((unsigned char)c);
+                out->tag = KT_STR;
+                out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if (m == "swapcase" && nargs == 0) {
+                std::string r = sv;
+                for (char& c : r) {
+                    if (islower((unsigned char)c)) c = (char)toupper((unsigned char)c);
+                    else if (isupper((unsigned char)c)) c = (char)tolower((unsigned char)c);
+                }
+                out->tag = KT_STR;
+                out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if (m == "index" && nargs == 1) { // like find() but raises if absent
+                if (argv[0]->tag != KT_STR) panic("str.index() expects a str");
+                KamiStr* p = (KamiStr*)argv[0]->p;
+                size_t f = sv.find(std::string(p->data, (size_t)p->len));
+                if (f == std::string::npos) panic("ValueError: substring not found");
+                out->tag = KT_INT;
+                out->i = (int64_t)f;
+                return;
+            }
+            if (m == "rfind" && nargs == 1) {
+                if (argv[0]->tag != KT_STR) panic("str.rfind() expects a str");
+                KamiStr* p = (KamiStr*)argv[0]->p;
+                size_t f = sv.rfind(std::string(p->data, (size_t)p->len));
+                out->tag = KT_INT;
+                out->i = f == std::string::npos ? -1 : (int64_t)f;
+                return;
+            }
+            if ((m == "ljust" || m == "rjust" || m == "center") && nargs >= 1 && nargs <= 2) {
+                if (argv[0]->tag != KT_INT) panic("str." + m + "() width must be an int");
+                int64_t w = argv[0]->i;
+                char fill = ' ';
+                if (nargs == 2 && argv[1]->tag == KT_STR) {
+                    KamiStr* fs = (KamiStr*)argv[1]->p;
+                    if (fs->len >= 1) fill = fs->data[0];
+                }
+                std::string r = sv;
+                int64_t pad = w - (int64_t)sv.size();
+                if (pad > 0) {
+                    if (m == "ljust") r = sv + std::string((size_t)pad, fill);
+                    else if (m == "rjust") r = std::string((size_t)pad, fill) + sv;
+                    else {
+                        int64_t left = pad / 2, right = pad - left;
+                        r = std::string((size_t)left, fill) + sv + std::string((size_t)right, fill);
+                    }
+                }
+                out->tag = KT_STR;
+                out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if ((m == "removeprefix" || m == "removesuffix") && nargs == 1) {
+                if (argv[0]->tag != KT_STR) panic("str." + m + "() expects a str");
+                KamiStr* p = (KamiStr*)argv[0]->p;
+                std::string pre(p->data, (size_t)p->len);
+                std::string r = sv;
+                if (m == "removeprefix") {
+                    if (sv.size() >= pre.size() && sv.compare(0, pre.size(), pre) == 0)
+                        r = sv.substr(pre.size());
+                } else {
+                    if (sv.size() >= pre.size() &&
+                        sv.compare(sv.size() - pre.size(), pre.size(), pre) == 0)
+                        r = sv.substr(0, sv.size() - pre.size());
+                }
+                out->tag = KT_STR;
+                out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if (m == "format") {
+                // Supports {}, {0}, {1}, and format specs like {:.2f}, {:5},
+                // {0:>8}. Keyword fields ({name}) are not available because
+                // method calls don't carry kwargs in this runtime.
+                std::string r;
+                int64_t auto_idx = 0;
+                for (size_t i = 0; i < sv.size(); i++) {
+                    if (sv[i] == '{' && i + 1 < sv.size() && sv[i + 1] == '{') { r += '{'; i++; continue; }
+                    if (sv[i] == '}' && i + 1 < sv.size() && sv[i + 1] == '}') { r += '}'; i++; continue; }
+                    if (sv[i] != '{') { r += sv[i]; continue; }
+                    size_t close = sv.find('}', i);
+                    if (close == std::string::npos) panic("str.format(): single '{' encountered");
+                    std::string field = sv.substr(i + 1, close - i - 1);
+                    i = close;
+                    std::string spec;
+                    size_t colon = field.find(':');
+                    if (colon != std::string::npos) {
+                        spec = field.substr(colon + 1);
+                        field = field.substr(0, colon);
+                    }
+                    int64_t idx;
+                    if (field.empty()) idx = auto_idx++;
+                    else idx = (int64_t)strtoll(field.c_str(), nullptr, 10);
+                    if (idx < 0 || idx >= nargs)
+                        panic("str.format(): index " + std::to_string(idx) + " out of range");
+                    r += format_value(argv[idx], spec);
+                }
+                out->tag = KT_STR;
+                out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if (m == "encode" && nargs <= 1) { // no real bytes type: identity str
+                out->tag = KT_STR;
+                out->p = str_new(sv.data(), (int64_t)sv.size());
+                return;
+            }
         } else if (o.tag == KT_MAP) {
             KamiMap* mp = (KamiMap*)o.p;
             if (m == "keys" && nargs == 0) {
@@ -856,6 +1017,105 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 mp->icap = 0;
                 mp->count = 0;
                 out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if (m == "copy" && nargs == 0) {
+                kami_make_set(out);
+                KamiMap* r = (KamiMap*)out->p;
+                KamiValue none{KT_NONE, {0}};
+                for (int64_t i = 0; i < mp->nentries; i++)
+                    if (mp->entries[i].used) map_set(r, &mp->entries[i].key, &none);
+                return;
+            }
+            if (m == "pop" && nargs == 0) {
+                for (int64_t i = 0; i < mp->nentries; i++) {
+                    if (mp->entries[i].used) {
+                        *out = mp->entries[i].key;
+                        map_del(mp, &mp->entries[i].key);
+                        return;
+                    }
+                }
+                panic("KeyError: 'pop from an empty set'");
+            }
+            if ((m == "union" || m == "intersection" || m == "difference" ||
+                 m == "symmetric_difference") && nargs == 1) {
+                if (argv[0]->tag != KT_SET) panic("set." + m + "() expects a set");
+                KamiMap* other = (KamiMap*)argv[0]->p;
+                kami_make_set(out);
+                KamiMap* r = (KamiMap*)out->p;
+                KamiValue none{KT_NONE, {0}};
+                KamiValue tmp;
+                if (m == "union") {
+                    for (int64_t i = 0; i < mp->nentries; i++)
+                        if (mp->entries[i].used) map_set(r, &mp->entries[i].key, &none);
+                    for (int64_t i = 0; i < other->nentries; i++)
+                        if (other->entries[i].used) map_set(r, &other->entries[i].key, &none);
+                } else if (m == "intersection") {
+                    for (int64_t i = 0; i < mp->nentries; i++)
+                        if (mp->entries[i].used && map_get(other, &mp->entries[i].key, &tmp))
+                            map_set(r, &mp->entries[i].key, &none);
+                } else if (m == "difference") {
+                    for (int64_t i = 0; i < mp->nentries; i++)
+                        if (mp->entries[i].used && !map_get(other, &mp->entries[i].key, &tmp))
+                            map_set(r, &mp->entries[i].key, &none);
+                } else { // symmetric_difference
+                    for (int64_t i = 0; i < mp->nentries; i++)
+                        if (mp->entries[i].used && !map_get(other, &mp->entries[i].key, &tmp))
+                            map_set(r, &mp->entries[i].key, &none);
+                    for (int64_t i = 0; i < other->nentries; i++)
+                        if (other->entries[i].used && !map_get(mp, &other->entries[i].key, &tmp))
+                            map_set(r, &other->entries[i].key, &none);
+                }
+                return;
+            }
+            if ((m == "update" || m == "difference_update" ||
+                 m == "intersection_update") && nargs == 1) {
+                if (argv[0]->tag != KT_SET) panic("set." + m + "() expects a set");
+                KamiMap* other = (KamiMap*)argv[0]->p;
+                KamiValue none{KT_NONE, {0}};
+                KamiValue tmp;
+                if (m == "update") {
+                    for (int64_t i = 0; i < other->nentries; i++)
+                        if (other->entries[i].used) map_set(mp, &other->entries[i].key, &none);
+                } else if (m == "difference_update") {
+                    for (int64_t i = 0; i < other->nentries; i++)
+                        if (other->entries[i].used) map_del(mp, &other->entries[i].key);
+                } else { // intersection_update
+                    std::vector<KamiValue> drop;
+                    for (int64_t i = 0; i < mp->nentries; i++)
+                        if (mp->entries[i].used && !map_get(other, &mp->entries[i].key, &tmp))
+                            drop.push_back(mp->entries[i].key);
+                    for (auto& k : drop) map_del(mp, &k);
+                }
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if (m == "isdisjoint" && nargs == 1) {
+                if (argv[0]->tag != KT_SET) panic("set.isdisjoint() expects a set");
+                KamiMap* other = (KamiMap*)argv[0]->p;
+                KamiValue tmp;
+                bool disjoint = true;
+                for (int64_t i = 0; i < mp->nentries; i++)
+                    if (mp->entries[i].used && map_get(other, &mp->entries[i].key, &tmp)) {
+                        disjoint = false;
+                        break;
+                    }
+                out->tag = KT_BOOL; out->i = disjoint;
+                return;
+            }
+            if ((m == "issubset" || m == "issuperset") && nargs == 1) {
+                if (argv[0]->tag != KT_SET) panic("set." + m + "() expects a set");
+                KamiMap* other = (KamiMap*)argv[0]->p;
+                KamiMap* a = m == "issubset" ? mp : other;
+                KamiMap* b = m == "issubset" ? other : mp;
+                KamiValue tmp;
+                bool ok = true;
+                for (int64_t i = 0; i < a->nentries; i++)
+                    if (a->entries[i].used && !map_get(b, &a->entries[i].key, &tmp)) {
+                        ok = false;
+                        break;
+                    }
+                out->tag = KT_BOOL; out->i = ok;
                 return;
             }
         } else if (o.tag == KT_SOCKET) {

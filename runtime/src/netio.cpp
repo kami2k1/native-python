@@ -461,57 +461,6 @@ static KamiSocket* sock_new(int64_t fd) {
     return s;
 }
 
-// ---------------- subprocess capture (for requests via curl) ----------------
-#ifndef _WIN32
-static int capture_process(const std::vector<std::string>& args, std::string& out) {
-    int fds[2];
-    if (pipe(fds) != 0) return -1;
-    pid_t pid = fork();
-    if (pid < 0) return -1;
-    if (pid == 0) {
-        dup2(fds[1], 1);
-        ::close(fds[0]);
-        ::close(fds[1]);
-        std::vector<char*> argv;
-        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-        argv.push_back(nullptr);
-        execvp(argv[0], argv.data());
-        _exit(127);
-    }
-    ::close(fds[1]);
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof buf)) > 0) out.append(buf, (size_t)n);
-    ::close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-}
-#else
-static int capture_process(const std::vector<std::string>& args, std::string& out) {
-    std::string cmd;
-    for (auto& a : args) {
-        if (!cmd.empty()) cmd += " ";
-        if (a.find_first_of(" \t\"") != std::string::npos) {
-            cmd += "\"";
-            for (char c : a) {
-                if (c == '"') cmd += "\\\"";
-                else cmd += c;
-            }
-            cmd += "\"";
-        } else {
-            cmd += a;
-        }
-    }
-    FILE* p = _popen(cmd.c_str(), "rb");
-    if (!p) return -1;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-    return _pclose(p);
-}
-#endif
-
 } // namespace kami
 
 using namespace kami;
@@ -630,6 +579,79 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         else set_none();
         return true;
     }
+    case KB_OS_CHDIR:
+        fs::current_path(arg_str(0, "os.chdir"), ec);
+        if (ec) panic("os.chdir: " + ec.message());
+        set_none();
+        return true;
+    case KB_OS_GETPID:
+#ifdef _WIN32
+        out->tag = KT_INT;
+        out->i = (int64_t)GetCurrentProcessId();
+#else
+        out->tag = KT_INT;
+        out->i = (int64_t)getpid();
+#endif
+        return true;
+    case KB_OS_URANDOM: {
+        int64_t n = argv[0]->tag == KT_INT ? argv[0]->i : 0;
+        if (n < 0) panic("os.urandom: negative count");
+        std::string bytes;
+        bytes.resize((size_t)n);
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) {
+            size_t got = fread(&bytes[0], 1, (size_t)n, f);
+            fclose(f);
+            (void)got;
+        } else {
+            for (int64_t i = 0; i < n; i++) bytes[(size_t)i] = (char)(rand() & 0xff);
+        }
+        out->tag = KT_STR;
+        out->p = str_new(bytes.data(), (int64_t)bytes.size());
+        return true;
+    }
+    case KB_OS_WALK: {
+        // Returns a list of (dirpath, [dirnames], [filenames]) triples (as lists).
+        std::string root = arg_str(0, "os.walk");
+        KamiList* result = list_new(4);
+        out->tag = KT_LIST;
+        out->p = result;
+        std::error_code wec;
+        std::vector<std::string> dirs{root};
+        while (!dirs.empty()) {
+            std::string cur = dirs.front();
+            dirs.erase(dirs.begin());
+            KamiList* dnames = list_new(4);
+            KamiList* fnames = list_new(4);
+            for (fs::directory_iterator it(cur, wec), end; !wec && it != end; it.increment(wec)) {
+                std::string name = it->path().filename().string();
+                KamiValue nv;
+                nv.tag = KT_STR;
+                nv.p = str_new(name.data(), (int64_t)name.size());
+                if (it->is_directory(wec)) {
+                    list_push(dnames, &nv);
+                    dirs.push_back(it->path().string());
+                } else {
+                    list_push(fnames, &nv);
+                }
+            }
+            KamiList* triple = list_new(3);
+            KamiValue cv;
+            cv.tag = KT_STR;
+            cv.p = str_new(cur.data(), (int64_t)cur.size());
+            list_push(triple, &cv);
+            KamiValue dv{KT_LIST, {0}};
+            dv.p = dnames;
+            list_push(triple, &dv);
+            KamiValue fv{KT_LIST, {0}};
+            fv.p = fnames;
+            list_push(triple, &fv);
+            KamiValue tv{KT_LIST, {0}};
+            tv.p = triple;
+            list_push(result, &tv);
+        }
+        return true;
+    }
     // ---- os.path ----
     case KB_OSP_EXISTS: set_bool(fs::exists(arg_str(0, "os.path.exists"), ec)); return true;
     case KB_OSP_ISFILE:
@@ -658,6 +680,56 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
     case KB_OSP_ABSPATH:
         set_str(fs::absolute(arg_str(0, "os.path.abspath"), ec).string());
         return true;
+    case KB_OSP_EXPANDUSER: {
+        std::string p = arg_str(0, "os.path.expanduser");
+        if (!p.empty() && p[0] == '~') {
+            const char* home = getenv("HOME");
+#ifdef _WIN32
+            if (!home) home = getenv("USERPROFILE");
+#endif
+            if (home) p = std::string(home) + p.substr(1);
+        }
+        set_str(p);
+        return true;
+    }
+    case KB_OSP_ISABS: {
+        std::string p = arg_str(0, "os.path.isabs");
+        set_bool(fs::path(p).is_absolute());
+        return true;
+    }
+    case KB_OSP_SPLITEXT: {
+        fs::path p = arg_str(0, "os.path.splitext");
+        std::string full = p.string();
+        std::string ext = p.extension().string();
+        std::string root = ext.empty() ? full : full.substr(0, full.size() - ext.size());
+        KamiList* r = list_new(2);
+        out->tag = KT_LIST;
+        out->p = r;
+        KamiValue a, b;
+        a.tag = KT_STR;
+        a.p = str_new(root.data(), (int64_t)root.size());
+        list_push(r, &a);
+        b.tag = KT_STR;
+        b.p = str_new(ext.data(), (int64_t)ext.size());
+        list_push(r, &b);
+        return true;
+    }
+    case KB_OSP_SPLIT: {
+        fs::path p = arg_str(0, "os.path.split");
+        std::string head = p.parent_path().string();
+        std::string tail = p.filename().string();
+        KamiList* r = list_new(2);
+        out->tag = KT_LIST;
+        out->p = r;
+        KamiValue a, b;
+        a.tag = KT_STR;
+        a.p = str_new(head.data(), (int64_t)head.size());
+        list_push(r, &a);
+        b.tag = KT_STR;
+        b.p = str_new(tail.data(), (int64_t)tail.size());
+        list_push(r, &b);
+        return true;
+    }
     // ---- logging ----
     case KB_LOG_BASICCONFIG: {
         // args (from sema): [level|None, format|None]
@@ -703,14 +775,12 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         out->p = s;
         return true;
     }
-    // ---- requests (via curl: supports http + https) ----
+    // ---- requests: native HTTP client (sockets + TLS), no external process ----
     case KB_REQUESTS_GET:
     case KB_REQUESTS_POST: {
         std::string url = arg_str(0, "requests");
-        // -s (no progress) without -S: connection errors surface as a Python
-        // RequestException, not as stray curl noise on stderr.
-        std::vector<std::string> cmd = {"curl", "-s", "-w",
-                                        "\n__KAMI_HTTP_STATUS__:%{http_code}"};
+        std::string method = id == KB_REQUESTS_GET ? "GET" : "POST";
+        std::string body, content_type;
         double timeout = 0;
         if (id == KB_REQUESTS_GET) {
             if (nargs >= 2 && argv[1]->tag != KT_NONE) {
@@ -719,45 +789,28 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
             }
         } else {
             if (nargs >= 2 && argv[1]->tag != KT_NONE) { // data or json payload
-                std::string body;
                 if (argv[1]->tag == KT_STR) {
                     KamiStr* s = (KamiStr*)argv[1]->p;
                     body.assign(s->data, (size_t)s->len);
                 } else {
                     body = json_dumps(argv[1]);
-                    cmd.push_back("-H");
-                    cmd.push_back("Content-Type: application/json");
+                    content_type = "application/json";
                 }
-                cmd.push_back("--data-binary");
-                cmd.push_back(body);
-                cmd.push_back("-X");
-                cmd.push_back("POST");
-            } else {
-                cmd.push_back("-X");
-                cmd.push_back("POST");
             }
             if (nargs >= 3 && argv[2]->tag != KT_NONE) {
                 if (argv[2]->tag == KT_FLOAT) timeout = argv[2]->f;
                 else if (argv[2]->tag == KT_INT) timeout = (double)argv[2]->i;
             }
         }
-        if (timeout > 0) {
-            cmd.push_back("--max-time");
-            char buf[32];
-            snprintf(buf, sizeof buf, "%.3f", timeout);
-            cmd.push_back(buf);
-        }
-        cmd.push_back(url);
-        std::string raw;
+        sock_startup();
+        long code = 0;
+        std::string resp_body, err;
         lk.unlock();
-        int rc = capture_process(cmd, raw);
+        bool ok2 = http_request(method, url, body, content_type, timeout, code,
+                                resp_body, err);
         lk.lock();
-        size_t mark = raw.rfind("\n__KAMI_HTTP_STATUS__:");
-        if (rc != 0 || mark == std::string::npos)
-            panic("RequestException: request to '" + url + "' failed (curl exit " +
-                  std::to_string(rc) + ")");
-        std::string body = raw.substr(0, mark);
-        long code = strtol(raw.c_str() + mark + strlen("\n__KAMI_HTTP_STATUS__:"), nullptr, 10);
+        if (!ok2)
+            panic("RequestException: request to '" + url + "' failed (" + err + ")");
         // build Response object
         KamiClassObj* cls = internal_class("Response");
         KamiInstance* inst = (KamiInstance*)gc_alloc(sizeof(KamiInstance), KT_OBJECT);
@@ -773,7 +826,7 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         v.i = code >= 200 && code < 400;
         (*inst->fields)["ok"] = v;
         v.tag = KT_STR;
-        v.p = str_new(body.data(), (int64_t)body.size());
+        v.p = str_new(resp_body.data(), (int64_t)resp_body.size());
         (*inst->fields)["text"] = v;
         return true;
     }

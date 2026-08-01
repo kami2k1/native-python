@@ -15,6 +15,8 @@
 #include <vector>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <process.h>
 #else
 #include <sys/wait.h>
@@ -60,7 +62,13 @@ int run_process(const std::vector<std::string>& args) {
 }
 
 static fs::path self_dir(const std::string& argv0) {
-#ifndef _WIN32
+#ifdef _WIN32
+    // argv[0] is just "kamipy" when launched via PATH — ask the OS for the
+    // real executable location so kamirt.lib is found from any directory.
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return fs::path(buf).parent_path();
+#else
     std::error_code ec;
     fs::path p = fs::read_symlink("/proc/self/exe", ec);
     if (!ec) return p.parent_path();
@@ -111,7 +119,12 @@ static void collect_import_names(Stmt* s, std::vector<std::string>& out) {
         out.push_back(s->name);
         for (auto& extra : s->body) collect_import_names(extra.get(), out);
         return;
-    case StmtKind::FromImport: out.push_back(s->name); return;
+    case StmtKind::FromImport:
+        if (!s->name.empty()) out.push_back(s->name);
+        // `from . import a, b` — the imported names are sibling modules.
+        if (s->relative && s->name.empty())
+            for (auto& [n, alias] : s->import_names) out.push_back(n);
+        return;
     default: break;
     }
     for (auto& c : s->body) collect_import_names(c.get(), out);
@@ -153,6 +166,22 @@ struct Bundler {
         return base_dir / (rel + ".py");
     }
 
+    // Bundled standard-library modules are shipped as *real Python* in a
+    // pylib/ folder next to the kamipy binary (and in the source tree). This is
+    // the project's core idea: the library is translated as Python, compiled by
+    // the same pipeline — never reimplemented at the C++ layer.
+    fs::path stdlib_path(const std::string& name) const {
+        if (name.find('.') != std::string::npos) return {}; // no dotted stdlib yet
+        std::error_code ec;
+        for (const fs::path& dir : stdlib_dirs) {
+            fs::path cand = dir / (name + ".py");
+            if (fs::exists(cand, ec)) return cand;
+        }
+        return {};
+    }
+
+    std::vector<fs::path> stdlib_dirs;
+
     void process(std::vector<StmtPtr>& body) {
         std::vector<std::string> names;
         for (auto& sp : body) collect_import_names(sp.get(), names);
@@ -160,10 +189,19 @@ struct Bundler {
     }
 
     void load(const std::string& name) {
-        if (loaded.count(name) || known_builtin_module(name)) return;
+        if (loaded.count(name)) return;
         fs::path file = module_path(name);
         std::error_code ec;
-        if (!fs::exists(file, ec)) return; // sema reports unknown module (or soft-fails in try)
+        bool local = fs::exists(file, ec);
+        if (!local) {
+            // A local file shadows the bundled stdlib (Python semantics). Only
+            // fall back to the shipped pylib when no local file exists.
+            fs::path lib = stdlib_path(name);
+            if (lib.empty()) return; // truly unknown: sema reports it (or try/except)
+            file = lib;
+        } else if (known_builtin_module(name)) {
+            return; // native module and no local override
+        }
         if (loading.count(name))
             throw std::runtime_error("circular import between local modules involving '" +
                                      name + "'");
@@ -186,9 +224,17 @@ struct Bundler {
 };
 } // namespace
 
-static void bundle_local_modules(Module& mod, const fs::path& input) {
+static void bundle_local_modules(Module& mod, const fs::path& input, const std::string& argv0) {
     Bundler b;
     b.base_dir = fs::absolute(input).parent_path();
+    // Where to find the shipped Python stdlib (pylib/). Checked in order:
+    //   <binary dir>/pylib, <binary dir>/../pylib, <source>/runtime/pylib,
+    //   $KAMIPY_PYLIB.
+    fs::path bindir = self_dir(argv0);
+    b.stdlib_dirs = {bindir / "pylib", bindir.parent_path() / "pylib",
+                     bindir / ".." / "runtime" / "pylib",
+                     bindir.parent_path() / "runtime" / "pylib"};
+    if (const char* env = getenv("KAMIPY_PYLIB")) b.stdlib_dirs.insert(b.stdlib_dirs.begin(), env);
     b.process(mod.body);
     if (b.loaded.empty()) return;
     std::vector<StmtPtr> merged;
@@ -203,7 +249,8 @@ std::string build(const BuildOptions& opts) {
     std::string src = read_file(opts.input);
 
     Module mod = parse(lex(src));
-    bundle_local_modules(mod, opts.input);
+    mod.source_path = fs::absolute(opts.input).string();
+    bundle_local_modules(mod, opts.input, opts.argv0);
     analyze(mod);
     if (opts.emit_ast) {
         fputs(dump_module(mod).c_str(), stdout);
@@ -234,9 +281,14 @@ std::string build(const BuildOptions& opts) {
 #ifndef _WIN32
     cmd.push_back("-pthread");
     cmd.push_back("-lm");
+#ifdef KAMI_RT_NEEDS_OPENSSL
+    cmd.push_back("-lssl");
+    cmd.push_back("-lcrypto");
+#endif
     cmd.push_back("-Wl,--gc-sections");
 #else
     cmd.push_back("-lws2_32");
+    cmd.push_back("-lwinhttp");
 #endif
     // clang warns about override of module-less IR opt flags; keep output clean:
     cmd.push_back("-Wno-override-module");

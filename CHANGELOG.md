@@ -4,6 +4,90 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.5.1] — 2026-08-01 — `requests` native 100%: bỏ hẳn curl + Windows UX
+
+Theo đúng triết lý "dịch cả thư viện, không gọi process ngoài": `requests` được viết lại
+từ tầng socket ngay trong runtime — hết mọi phụ thuộc curl.
+
+### Added — thư viện chuẩn viết bằng Python, bundle khi import (`runtime/pylib/`)
+Đúng tinh thần "dịch cả thư viện, không code ở tầng C++": các module stdlib thuần thuật
+toán được viết bằng **Python thật** trong `runtime/pylib/`, ship cạnh binary `kamipy`, và
+được chính pipeline compile khi chương trình `import`.
+- `itertools`: count, repeat, chain, accumulate, combinations, permutations,
+  combinations_with_replacement, product (a,b / repeat=), pairwise, zip_longest, starmap,
+  islice — bản eager (trả list).
+- `functools`: reduce.
+- File `X.py` cục bộ vẫn ưu tiên hơn stdlib bundle (đúng semantics CPython). Đặt biến môi
+  trường `KAMIPY_PYLIB` để trỏ tới thư mục pylib tùy chỉnh.
+
+### Added — mở rộng stdlib native & phương thức
+- **Sequence repetition**: `[0]*n`, `n*[x]`, `"ab"*n` (cả hai chiều toán hạng).
+- **math**: factorial, gcd, isqrt, hypot, log(x, base), log2/log10, atan/asin/acos/atan2,
+  degrees/radians, trunc, isnan/isinf; hằng `tau`, `nan`.
+- **random**: randrange, choice, shuffle, uniform, sample, choices; `seed()` không tham số.
+- **time**: monotonic, perf_counter.
+- **os**: walk, chdir, getpid, urandom; **os.path**: expanduser, splitext, split, isabs;
+  hằng `os.name/sep/linesep`, `sys.maxsize/platform`, `socket.AF_INET/...`,
+  `string.printable/hexdigits/octdigits`.
+- **str**: casefold, swapcase, index, rfind, ljust/rjust/center, removeprefix/removesuffix,
+  isalnum/isnumeric, **`format()`** (`{}`, `{0}`, format spec `{:.2f}` / `{:05d}`).
+- **list.clear**; **set**: union/intersection/difference/symmetric_difference (+ biến thể
+  `_update`), isdisjoint, issubset/issuperset, copy, pop.
+- **int(x, base)** và `int()/float()` chịu được khoảng trắng đầu/cuối.
+
+### Added — cú pháp
+- **for/while ... else** (chạy `else` khi vòng lặp kết thúc không qua `break`).
+- **Ellipsis `...`** (type stub `tuple[int, ...]`, thân stub `def f(): ...`) — mô hình hoá None.
+- **bytes literal `b"..."`** — nhận như str (runtime str lưu byte bất kỳ).
+- **`__file__`** → đường dẫn tuyệt đối của file input.
+- **Relative imports** `from .mod import x` / `from . import mod` → bundle file `.py` cùng thư mục;
+  **`from X import *`** là no-op cho module bundle.
+- **import list nhiều dòng/ngoặc** `from m import (a, b, c)`.
+- `doctest.testmod(verbose=...)` nhận & bỏ qua kwargs.
+
+### Added — `requests` native (bỏ hẳn curl)
+- **HTTP client viết lại từ tầng socket trong runtime** (`runtime/src/http_client.cpp`) —
+  không sinh process ngoài, đúng triết lý "dịch cả thư viện":
+  - Windows: **WinHTTP** (system API; TLS qua SChannel, proxy hệ thống + redirect tự động).
+  - POSIX: raw TCP socket + **OpenSSL** cho https (tùy chọn lúc build; http thuần không cần),
+    tự xử lý `Transfer-Encoding: chunked`, `Content-Length`, redirect (301/302/303/307/308,
+    tối đa 5 hop, POST→GET như python-requests), timeout (connect + send + recv),
+    proxy qua `http_proxy`/`https_proxy` (CONNECT tunnel cho https).
+- Lỗi mạng chỉ surface qua `RequestException` — không còn rác stderr
+  (`curl: option -w: requires parameter`, `curl: (7) ...`).
+
+### Added — default parameter values là biểu thức bất kỳ
+- `def send(msg, thread_type=ThreadType.USER, retries=BASE + 5)` — không còn lỗi
+  "default parameter values must be literals". Default được codegen **đánh giá trong
+  prologue của hàm** (scope định nghĩa) khi caller bỏ qua tham số; kwargs bỏ qua tham số
+  giữa chỉ được phép khi default là literal (báo lỗi rõ nếu không).
+
+### Fixed — Windows UX
+- **Console UTF-8**: `SetConsoleOutputCP(CP_UTF8)` lúc khởi động runtime — tiếng Việt
+  in ra đúng thay vì `Kß╗₧I CHß║áY...`.
+- **`kamipy` chạy từ thư mục bất kỳ**: dùng `GetModuleFileName` thay vì `argv[0]` để
+  tìm `kamirt.lib` cạnh binary (hết lỗi "cannot find kamirt.lib" khi kamipy nằm trong PATH).
+
+### Fixed — Windows / MSVC
+- **`error C2177: constant too big`** (`sema.cpp`, `math.inf`): thay literal `1e999` bằng
+  `std::numeric_limits<double>::infinity()`. Đây là lỗi chặn toàn bộ build `kamipy_core`
+  trên MSVC → `kamipy.exe` không bao giờ được tạo lại.
+- **`/EHsc` → `/EHs`** trong CMake: runtime ném exception C++ xuyên qua ranh giới
+  `extern "C"` (`kami_raise` → `kami_try`). Với `/EHc`, MSVC coi hàm `extern "C"` là
+  nothrow và **có thể xoá luôn catch handler** → `try/except` crash lúc chạy trên Windows.
+  Sửa luôn 2 warning C4297 (`kami_raise`, `kami_rethrow`).
+
+### Verification (v0.5.1)
+- Integration **PASS toàn bộ** (suite mới: `feat_requests_native` — HTTP server viết bằng
+  KamiPython phục vụ chính client `requests` native; `feat_default_exprs`, `feat_stdlib2`,
+  `feat_syntax2`, `feat_pylib` — byte-identical CPython 3.11).
+- `requests` native kiểm chứng thật: GET/POST + JSON echo + chunked + redirect qua server
+  local; **HTTPS thật tới example.com** (TLS verify, status 200) và qua proxy CONNECT tunnel.
+- Corpus 2.182 file GitHub: build **1059 → ~1190**, chạy **748 → ~900** (đo bằng
+  `tools/corpus_survey.sh`).
+
+---
+
 ## [v0.5.0] — 2026-08-01 — Comprehensions++, insertion-ordered dicts, unpacking, PEP 695 syntax
 
 Nhóm cú pháp còn thiếu hay gặp trong corpus. Đo lại trên 2.182 file GitHub:
