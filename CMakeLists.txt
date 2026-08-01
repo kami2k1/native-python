@@ -57,6 +57,7 @@ add_library(kamipy_core STATIC
     compiler/src/lexer.cpp
     compiler/src/parser.cpp
     compiler/src/sema.cpp
+    compiler/src/typeinf.cpp
     compiler/src/codegen.cpp
     compiler/src/cext.cpp
     compiler/src/modules.cpp

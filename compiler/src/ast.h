@@ -41,6 +41,18 @@ struct CompClause {
 // Name/Call resolution (filled by sema)
 enum class Res { Unresolved, Local, Global, BuiltinFunc, UserFunc, Capture };
 
+// Static types inferred by the type-inference pass (typeinf.cpp). A small,
+// sound lattice: TY_BOT (no information yet) < concrete type < TY_ANY.
+enum KType : uint8_t {
+    TY_BOT = 0,
+    TY_INT,
+    TY_FLOAT,
+    TY_BOOL,
+    TY_STR,
+    TY_NONE,
+    TY_ANY,
+};
+
 using ExprPtr = std::unique_ptr<Expr>;
 
 struct Expr {
@@ -70,6 +82,7 @@ struct Expr {
     int64_t res_idx = 0;       // local slot / global index / builtin id / func index
     std::vector<int64_t> comp_tidx; // ListComp resolved target slots
     std::vector<int> comp_tkind;    // 1=local 2=global
+    uint8_t sty = TY_ANY;      // static type (typeinf.cpp)
 };
 
 // ---------------- statements ----------------
@@ -129,6 +142,7 @@ struct Stmt {
     // Assign `s = s + x` where sema's alias analysis proved `s` has no live
     // aliases: codegen emits an in-place buffer append (kami_str_iadd).
     bool str_iadd = false;
+    uint8_t sty = TY_ANY; // For: static type of the loop variable (typeinf.cpp)
 };
 
 // A C function the compiled program calls directly (from a C extension mapping
@@ -136,6 +150,16 @@ struct Stmt {
 struct NativeDecl {
     std::string symbol;
     std::string csig; // see cext.h: first char = return type, rest = parameters
+};
+
+// Per-function results of the type-inference pass (parallel to
+// Module::functions). Filled by infer_types() in typeinf.cpp.
+struct FuncTypeInfo {
+    std::vector<uint8_t> locals; // static type per local slot (KType)
+    std::vector<uint8_t> params; // join of argument types over all call sites
+    uint8_t ret = TY_BOT;        // join of all return expression types
+    bool escapes = true;         // name used as a value → dynamic calls possible
+    bool native_ok = false;      // monomorphized @n_<alias> specialization emitted
 };
 
 struct Module {
@@ -156,7 +180,18 @@ struct Module {
     // C-ABI bindings discovered while analysing this module.
     std::vector<NativeDecl> natives;   // unique (symbol, signature) pairs
     std::set<std::string> link_libs;   // extra -l<name> flags for the linker
+
+    // Type-inference results (parallel to `functions`); see typeinf.cpp.
+    std::vector<FuncTypeInfo> ftypes;
 };
+
+// Type inference & monomorphization analysis (typeinf.cpp). Runs after
+// analyze(); stamps Expr::sty / Stmt::sty and fills Module::ftypes.
+void infer_types(Module& m);
+
+// libm symbol for a builtin math id usable in native (monomorphized) bodies,
+// or null. Shared between typeinf.cpp and codegen.cpp.
+const char* native_math_symbol(int64_t id, int* arity);
 
 // S-expression dump for tests/debugging.
 std::string dump_expr(const Expr* e);

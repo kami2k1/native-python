@@ -158,6 +158,7 @@ std::string build(const BuildOptions& opts) {
     mod.source_path = fs::absolute(opts.input).string();
     bundle_imported_modules(mod, import_policy(opts.input, opts.argv0, opts));
     analyze(mod);
+    infer_types(mod);
     if (opts.emit_ast) {
         fputs(dump_module(mod).c_str(), stdout);
         return "";
