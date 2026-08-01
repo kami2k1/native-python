@@ -586,6 +586,11 @@ struct Lexer {
 
 std::vector<Token> lex(const std::string& src) {
     Lexer lx(src);
+    // Skip a UTF-8 BOM (EF BB BF) — Windows Notepad prepends one by default,
+    // which would otherwise surface as "unexpected character" on line 1.
+    if (src.size() >= 3 && (unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB &&
+        (unsigned char)src[2] == 0xBF)
+        lx.pos = 3;
     lx.run();
     return std::move(lx.out);
 }

@@ -4,6 +4,7 @@
 #include "../../runtime/include/kami_runtime.h"
 
 #include <cmath>
+#include <limits>
 #include <set>
 #include <unordered_map>
 
@@ -103,7 +104,12 @@ struct ModConst {
 static bool module_const(const std::string& mod, const std::string& attr, ModConst& out) {
     if (mod == "math" && attr == "pi") { out = {0, 3.14159265358979323846, "", 0}; return true; }
     if (mod == "math" && attr == "e") { out = {0, 2.71828182845904523536, "", 0}; return true; }
-    if (mod == "math" && attr == "inf") { out = {0, 1e999, "", 0}; return true; }
+    if (mod == "math" && attr == "inf") {
+        // NOTE: do not use a literal like 1e999 here — MSVC rejects it with
+        // "error C2177: constant too big" and the whole compiler fails to build.
+        out = {0, std::numeric_limits<double>::infinity(), "", 0};
+        return true;
+    }
     if (mod == "logging") {
         if (attr == "DEBUG") { out = {2, 0, "", 10}; return true; }
         if (attr == "INFO") { out = {2, 0, "", 20}; return true; }
@@ -149,6 +155,7 @@ struct Sema {
     std::unordered_map<std::string, std::string> imports;      // alias → module
     std::unordered_map<std::string, BuiltinSig> from_imports;  // name → builtin
     std::unordered_map<std::string, ModConst> from_consts;     // name → const value
+    std::unordered_map<std::string, std::string> user_imports; // alias → bundled local module
 
     int try_depth = 0; // imports inside try/except may fail softly
     Stmt* cur_func = nullptr;
@@ -228,11 +235,19 @@ struct Sema {
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
+        if (mod.user_modules.count(modname)) {
+            // Local .py module bundled by the driver: its top-level code is
+            // already spliced into this module. "alias.x" resolves to "x".
+            user_imports[s->alias.empty() ? modname : s->alias] = modname;
+            for (auto& extra : s->body) register_import(extra.get());
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return; // try: import X / except ImportError: pass
             err(s->line, "unknown module '" + modname +
-                             "' (available: math, time, random, threading, sys, os, json, "
-                             "socket, requests, logging, string, doctest)");
+                             "' (built in: math, time, random, threading, sys, os, json, "
+                             "socket, requests, logging, string, doctest — or put '" +
+                             modname + ".py' next to your input file to bundle it)");
         }
         imports[s->alias.empty() ? modname : s->alias] = modname;
         for (auto& extra : s->body) register_import(extra.get());
@@ -241,11 +256,24 @@ struct Sema {
     void register_from_import(Stmt* s) {
         const std::string& modname = s->name;
         if (noop_module(modname)) return; // names are annotation-only
+        if (mod.user_modules.count(modname)) {
+            // Bundled local module: its top-level names are already globals in
+            // this module. Plain "from utils import helper" needs no mapping;
+            // "as" renames are not supported yet (would need a rename pass).
+            for (auto& [n, alias] : s->import_names) {
+                if (alias != n)
+                    err(s->line, "'from " + modname + " import " + n + " as " + alias +
+                                     "' — 'as' renames are not supported for bundled "
+                                     "local modules yet; use the original name");
+            }
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return;
             err(s->line, "unknown module '" + modname +
-                             "' (available: math, time, random, threading, sys, os, json, "
-                             "socket, requests, logging, string, doctest)");
+                             "' (built in: math, time, random, threading, sys, os, json, "
+                             "socket, requests, logging, string, doctest — or put '" +
+                             modname + ".py' next to your input file to bundle it)");
         }
         auto& tbl = modules().at(modname);
         for (auto& [n, alias] : s->import_names) {
@@ -446,7 +474,7 @@ struct Sema {
             e->sval = "__main__";
             return;
         }
-        if (imports.count(n))
+        if (imports.count(n) || user_imports.count(n))
             err(e->line, "module '" + n + "' can only be used as '" + n + ".<name>'");
         auto fi2 = from_imports.find(n);
         if (fi2 != from_imports.end()) {
@@ -467,7 +495,7 @@ struct Sema {
         if (cur_func && locals.count(n) && !global_decls.count(n)) return true;
         return globals.count(n) || funcs.count(n) || classes.count(n) ||
                builtins().count(n) || from_imports.count(n) || from_consts.count(n) ||
-               imports.count(n);
+               imports.count(n) || user_imports.count(n);
     }
 
     // Rewrites call kwargs/defaults into plain positional args when the callee
@@ -741,6 +769,17 @@ struct Sema {
                 if (p) resolve_expr(p.get());
             return;
         case ExprKind::Attr: {
+            // Bundled local module: "utils.CONSTANT" → plain name "CONSTANT"
+            // (bundled modules share the program's global namespace).
+            if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
+                !name_shadowed(e->a->sval)) {
+                std::string attr = e->sval;
+                e->kind = ExprKind::Name;
+                e->sval = attr;
+                e->a.reset();
+                resolve_expr(e);
+                return;
+            }
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
                 !name_shadowed(e->a->sval)) {
                 const std::string& modname = imports.at(e->a->sval);
@@ -854,6 +893,20 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
+            // Bundled local module: "utils.helper(args)" → plain call "helper(args)".
+            // Re-resolving as a Call keeps kwargs/default-argument support.
+            if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
+                !name_shadowed(e->a->sval)) {
+                auto callee = std::make_unique<Expr>();
+                callee->kind = ExprKind::Name;
+                callee->line = e->line;
+                callee->sval = e->sval;
+                e->kind = ExprKind::Call;
+                e->a = std::move(callee);
+                e->sval.clear();
+                resolve_expr(e);
+                return;
+            }
             // logging.<level>(...) and logging.basicConfig(...) — special forms.
             if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
                 imports.at(e->a->sval) == "logging" && !name_shadowed(e->a->sval)) {
@@ -926,7 +979,22 @@ struct Sema {
                                          "'");
                     apply_signature(e, mit->second, false);
                 } else {
-                    err(e->line, "keyword arguments are not supported on method calls");
+                    // Dynamic receiver (e.g. a module that soft-failed to import
+                    // inside try/except, or an arbitrary object). Don't hard-fail
+                    // the whole build: defer to a catchable runtime error so
+                    // guarded code paths still compile.
+                    e->kind = ExprKind::Call;
+                    e->args.clear();
+                    e->kwargs.clear();
+                    auto callee = std::make_unique<Expr>();
+                    callee->kind = ExprKind::Name;
+                    callee->line = e->line;
+                    callee->sval = "kwargs-unsupported";
+                    callee->res = Res::BuiltinFunc;
+                    callee->res_idx = KB_KWARGS_UNSUPPORTED;
+                    e->a = std::move(callee);
+                    e->sval.clear();
+                    return;
                 }
             }
             resolve_expr(e->a.get());
@@ -1356,6 +1424,10 @@ void analyze(Module& m) {
     s.collect_module();
     for (auto& sp : m.body) s.resolve_stmt(sp.get());
     m.nglobals = (int64_t)s.globals.size();
+}
+
+bool known_builtin_module(const std::string& name) {
+    return noop_module(name) || modules().count(name) != 0;
 }
 
 } // namespace kami
