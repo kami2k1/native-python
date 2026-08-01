@@ -72,6 +72,15 @@ target_link_libraries(kamipy PRIVATE kamipy_core)
 # kamipy expects libkamirt.a next to its own binary
 add_dependencies(kamipy kamirt)
 
+# Ship the pure-Python standard library (itertools, functools, ...) next to the
+# kamipy binary so the driver can bundle it on import. The library is Python —
+# compiled by the same pipeline, never reimplemented in C++.
+add_custom_command(TARGET kamipy POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/runtime/pylib
+            $<TARGET_FILE_DIR:kamipy>/pylib
+    COMMENT "Copying Python stdlib (pylib/) next to kamipy")
+
 # ---- tests ----
 enable_testing()
 
