@@ -517,6 +517,17 @@ struct Parser {
                 return e;
             }
             ExprPtr inner = parse_expr();
+            while (!check(Tok::RPAREN) && !check(Tok::COMMA) && !check(Tok::KW_FOR) &&
+                   (check(Tok::STRING) || check(Tok::LPAREN))) {
+                ExprPtr next_e = parse_expr();
+                auto add_e = std::make_unique<Expr>();
+                add_e->kind = ExprKind::Binary;
+                add_e->op = KOP_ADD;
+                add_e->line = inner->line;
+                add_e->a = std::move(inner);
+                add_e->b = std::move(next_e);
+                inner = std::move(add_e);
+            }
             if (check(Tok::KW_FOR)) {
                 ExprPtr comp = parse_comprehension_tail(std::move(inner));
                 expect(Tok::RPAREN, "')'");
