@@ -83,7 +83,7 @@ toán được viết bằng **Python thật** trong `runtime/pylib/`, ship cạ
   `feat_syntax2`, `feat_pylib` — byte-identical CPython 3.11).
 - `requests` native kiểm chứng thật: GET/POST + JSON echo + chunked + redirect qua server
   local; **HTTPS thật tới example.com** (TLS verify, status 200) và qua proxy CONNECT tunnel.
-- Corpus 2.182 file GitHub: build **1059 → ~1190**, chạy **748 → ~900** (đo bằng
+- Corpus 2.182 file GitHub: build **1059 → 1205 (55%)**, chạy **784 → 915** (đo bằng
   `tools/corpus_survey.sh`).
 
 ---
