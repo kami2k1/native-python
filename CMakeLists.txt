@@ -16,7 +16,7 @@ if(MSVC)
     # assumes extern "C" never throws and may delete the catch handler,
     # breaking try/except at runtime (and emitting warning C4297).
     add_compile_options(/utf-8 /EHs)
-    set(KAMI_RT_OPTS /O2)
+    set(KAMI_RT_OPTS $<$<NOT:$<CONFIG:Debug>>:/O2>)
 else()
     set(KAMI_RT_OPTS -O2)
 endif()

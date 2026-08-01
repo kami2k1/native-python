@@ -35,6 +35,23 @@ static void check_arity(int64_t nargs, int64_t lo, int64_t hi, const char* fn) {
 
 static std::mt19937_64 g_rng{0xC0FFEEull};
 
+static inline int64_t mulmod_64(int64_t a, int64_t b, int64_t m) {
+#if defined(__SIZEOF_INT128__) || (defined(__GNUC__) && !defined(_MSC_VER))
+    return (int64_t)(((__int128)a * b) % m);
+#else
+    uint64_t res = 0;
+    uint64_t ua = (uint64_t)((a % m + m) % m);
+    uint64_t ub = (uint64_t)((b % m + m) % m);
+    uint64_t um = (uint64_t)m;
+    while (ub > 0) {
+        if (ub & 1) res = (res + ua) % um;
+        ua = (ua * 2) % um;
+        ub >>= 1;
+    }
+    return (int64_t)res;
+#endif
+}
+
 // Python-like format(value, spec): [[fill]align][sign][width][,][.prec][type]
 std::string format_value(KamiValue* v, const std::string& spec) {
     char fill = ' ';
@@ -805,6 +822,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         out->p = str_new(line.data(), (int64_t)line.size());
         return;
     }
+
     case KB_POW: {
         check_arity(nargs, 2, 3, "pow");
         if (nargs == 3) {
@@ -817,8 +835,8 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             int64_t result = 1 % mod;
             int64_t b = ((base % mod) + mod) % mod;
             while (e > 0) {
-                if (e & 1) result = (int64_t)(((__int128)result * b) % mod);
-                b = (int64_t)(((__int128)b * b) % mod);
+                if (e & 1) result = mulmod_64(result, b, mod);
+                b = mulmod_64(b, b, mod);
                 e >>= 1;
             }
             set_int(out, result);
