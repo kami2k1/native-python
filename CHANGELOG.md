@@ -4,6 +4,52 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.5.0] — 2026-08-01 — Comprehensions++, insertion-ordered dicts, unpacking, PEP 695 syntax
+
+Nhóm cú pháp còn thiếu hay gặp trong corpus. Đo lại trên 2.182 file GitHub:
+
+| Mốc | Build được | Chạy được |
+|---|---|---|
+| v0.4.0 | 1015 | 748 |
+| **v0.5.0** | **1059 (49%)** | **784** |
+
+### Added — comprehensions
+- **Dict comprehension** `{k: v for ...}`, **set comprehension** `{e for ...}`.
+- **Nested comprehensions**: nhiều mệnh đề `for` và nhiều `if`
+  (`[x*y for x in A for y in B if cond]`, `[c for row in grid for c in row]`).
+- Comprehension tổng quát hoá thành chuỗi clause (mỗi clause có targets + iter + conds),
+  hỗ trợ unpack target (`{v: k for k, v in d.items()}`).
+
+### Added — insertion-ordered dict/set (compact dict kiểu CPython)
+Refactor `KamiMap`: entries lưu **theo thứ tự chèn** + bảng băm index (entry_index+1).
+Duyệt/print/`keys()/values()/items()`/`for k in d` giờ theo thứ tự chèn — **khớp CPython**.
+Xoá key giữ nguyên thứ tự phần còn lại; cập nhật key giữ nguyên vị trí; re-insert sau khi xoá
+đi về cuối. Kiểm chứng stress (grow/delete/re-insert 1000 phần tử) byte-identical CPython, ASan clean.
+
+### Added — unpacking & syntax
+- **Starred trong list literal**: `[0, *a, 4]`, `[*quick_sort(lo), pivot, *quick_sort(hi)]`,
+  `[*range(x), 99]`.
+- **Tuple-target assignment**: `(a, b) = f()`, `(x, y, z) = [1, 2, 3]`.
+- **Non-literal default parameters**: `def f(n=SIZE*2)` (đánh giá tại def-time trong prologue).
+- **PEP 695 generics syntax**: `class Box[T]:`, `def identity[T](x):` — cú pháp `[...]` được
+  bỏ qua (KamiPython là ngôn ngữ động, không dùng type params).
+- **Class base là biểu thức** (`class T(unittest.TestCase)`, `class W(tk.Tk)`): parse được;
+  chỉ mô hình hoá kế thừa từ class định nghĩa trong file, base ngoài được bỏ qua (tạo class rỗng).
+
+### Verification
+- Integration **37/37 PASS** (4 suite mới: `feat_comprehensions`, `feat_dict_order`,
+  `feat_unpacking`, `feat_generics` — 3/4 byte-identical CPython 3.11; generics test
+  không cross-check được vì CPython 3.11 chưa có PEP 695).
+- ASan CLEAN trên dict-order stress + comprehensions + gc_stress; rebuild sạch 0 error/0 warning.
+- Corpus: build 1015→**1059**, chạy 748→**784**.
+
+### Known limitations
+- Set duyệt theo thứ tự băm (CPython cũng không đảm bảo thứ tự set) → test set dùng `sorted`.
+- Tuple-target lồng nhau `(a, (b, c)) = ...` chưa hỗ trợ (báo lỗi rõ).
+- PEP 695 type params chỉ là cú pháp (bỏ qua), không kiểm tra kiểu.
+
+---
+
 ## [v0.4.0] — 2026-08-01 — Functional Python: lambda, closures, decorators, map/filter + regex (`re`)
 
 Bổ sung lớp "functional" của Python và module `re` — nhóm lỗi lớn tiếp theo trong corpus.

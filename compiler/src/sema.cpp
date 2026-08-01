@@ -953,17 +953,31 @@ struct Sema {
                 resolve_expr(p.second.get());
             }
             return;
-        case ExprKind::ListComp: {
-            resolve_expr(e->b.get()); // iterable first (targets not yet bound)
-            for (auto& n : e->params) {
-                int k;
-                int64_t idx;
-                resolve_target_name(k, idx, n);
-                e->comp_tkind.push_back(k);
-                e->comp_tidx.push_back(idx);
-            }
+        case ExprKind::Starred:
             resolve_expr(e->a.get());
-            if (e->c) resolve_expr(e->c.get());
+            return;
+        case ExprKind::ListComp:
+        case ExprKind::SetComp:
+        case ExprKind::MapComp: {
+            // Clauses are evaluated left-to-right; each clause's iterable sees
+            // targets bound by earlier clauses.
+            for (auto& cl : e->clauses) {
+                resolve_expr(cl.iter.get());
+                for (auto& n : cl.targets) {
+                    int k;
+                    int64_t idx;
+                    resolve_target_name(k, idx, n);
+                    cl.tkind.push_back(k);
+                    cl.tidx.push_back(idx);
+                }
+                for (auto& c : cl.conds) resolve_expr(c.get());
+            }
+            if (e->kind == ExprKind::MapComp) {
+                resolve_expr(e->pairs[0].first.get());
+                resolve_expr(e->pairs[0].second.get());
+            } else {
+                resolve_expr(e->a.get());
+            }
             return;
         }
         }

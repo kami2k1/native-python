@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 namespace kami {
 
@@ -329,16 +330,48 @@ struct FnGen {
             return t;
         }
         case ExprKind::ListLit: {
-            int save = temp_top;
-            std::vector<int> slots;
-            for (auto& a : e->args) slots.push_back(gen_expr(a.get()));
-            fill_argbuf(slots);
-            temp_top = save;
+            bool anyStar = false;
+            for (auto& a : e->args)
+                if (a->kind == ExprKind::Starred) anyStar = true;
+            if (!anyStar) {
+                int save = temp_top;
+                std::vector<int> slots;
+                for (auto& a : e->args) slots.push_back(gen_expr(a.get()));
+                fill_argbuf(slots);
+                temp_top = save;
+                int t = alloc_temp();
+                emit("call void @kami_make_list(ptr " + slot_ptr(t) + ", ptr %argbuf, i64 " +
+                     std::to_string(slots.size()) + ")");
+                return t;
+            }
+            // starred: start empty, append plain items / extend starred iterables
             int t = alloc_temp();
-            emit("call void @kami_make_list(ptr " + slot_ptr(t) + ", ptr %argbuf, i64 " +
-                 std::to_string(slots.size()) + ")");
+            emit("call void @kami_make_list(ptr " + slot_ptr(t) + ", ptr %argbuf, i64 0)");
+            for (auto& a : e->args) {
+                int save = temp_top;
+                if (a->kind == ExprKind::Starred) {
+                    int seq = gen_expr(a->a.get());
+                    std::vector<int> one{seq};
+                    fill_argbuf(one);
+                    int dummy = alloc_temp();
+                    emit("call void @kami_method(ptr " + slot_ptr(dummy) + ", ptr " +
+                         slot_ptr(t) + ", ptr " + str_const("extend") +
+                         ", ptr %argbuf, i64 1)");
+                } else {
+                    int v = gen_expr(a.get());
+                    std::vector<int> one{v};
+                    fill_argbuf(one);
+                    int dummy = alloc_temp();
+                    emit("call void @kami_method(ptr " + slot_ptr(dummy) + ", ptr " +
+                         slot_ptr(t) + ", ptr " + str_const("append") +
+                         ", ptr %argbuf, i64 1)");
+                }
+                temp_top = save;
+            }
             return t;
         }
+        case ExprKind::Starred:
+            throw CompileError(e->line, "* is only allowed inside a list/call");
         case ExprKind::SetLit: {
             int t = alloc_temp();
             emit("call void @kami_make_set(ptr " + slot_ptr(t) + ")");
@@ -365,7 +398,9 @@ struct FnGen {
             return t;
         }
         case ExprKind::ListComp:
-            return gen_listcomp(e);
+        case ExprKind::SetComp:
+        case ExprKind::MapComp:
+            return gen_comprehension(e);
         case ExprKind::Closure:
             return gen_closure(e->res_idx);
         case ExprKind::Call: {
@@ -452,38 +487,27 @@ struct FnGen {
         return result;
     }
 
-    int gen_listcomp(const Expr* e) {
+    int gen_comprehension(const Expr* e) {
         int result = alloc_temp();
-        emit("call void @kami_make_list(ptr " + slot_ptr(result) + ", ptr %argbuf, i64 0)");
-        auto emit_body = [&](int elem_slot) {
-            // bind targets
-            if (e->params.size() == 1) {
-                assign_kind(e->comp_tkind[0], e->comp_tidx[0], elem_slot);
+        if (e->kind == ExprKind::ListComp)
+            emit("call void @kami_make_list(ptr " + slot_ptr(result) + ", ptr %argbuf, i64 0)");
+        else if (e->kind == ExprKind::SetComp)
+            emit("call void @kami_make_set(ptr " + slot_ptr(result) + ")");
+        else
+            emit("call void @kami_make_map(ptr " + slot_ptr(result) + ")");
+        // emit the innermost body (element production)
+        std::function<void()> emit_elem = [&]() {
+            int save2 = temp_top;
+            if (e->kind == ExprKind::MapComp) {
+                int k = gen_expr(e->pairs[0].first.get());
+                int v = gen_expr(e->pairs[0].second.get());
+                emit("call void @kami_index_set(ptr " + slot_ptr(result) + ", ptr " +
+                     slot_ptr(k) + ", ptr " + slot_ptr(v) + ")");
+            } else if (e->kind == ExprKind::SetComp) {
+                int v = gen_expr(e->a.get());
+                emit("call void @kami_set_add(ptr " + slot_ptr(result) + ", ptr " +
+                     slot_ptr(v) + ")");
             } else {
-                for (size_t i = 0; i < e->params.size(); i++) {
-                    int save2 = temp_top;
-                    int part = alloc_temp();
-                    emit("call void @kami_unpack(ptr " + slot_ptr(part) + ", ptr " +
-                         slot_ptr(elem_slot) + ", i64 " + std::to_string(i) + ", i64 " +
-                         std::to_string(e->params.size()) + ")");
-                    assign_kind(e->comp_tkind[i], e->comp_tidx[i], part);
-                    temp_top = save2;
-                }
-            }
-            std::string Lskip;
-            if (e->c) {
-                int save2 = temp_top;
-                int c = gen_expr(e->c.get());
-                std::string b = truthy(c);
-                temp_top = save2;
-                std::string Lyes = newlabel();
-                Lskip = newlabel();
-                emit("br i1 " + b + ", label %" + Lyes + ", label %" + Lskip);
-                C().terminated = true;
-                start_block(Lyes);
-            }
-            {
-                int save2 = temp_top;
                 int v = gen_expr(e->a.get());
                 std::vector<int> one{v};
                 fill_argbuf(one);
@@ -491,11 +515,46 @@ struct FnGen {
                 emit("call void @kami_method(ptr " + slot_ptr(dummy) + ", ptr " +
                      slot_ptr(result) + ", ptr " + str_const("append") +
                      ", ptr %argbuf, i64 1)");
-                temp_top = save2;
             }
-            if (e->c) start_block(Lskip);
+            temp_top = save2;
         };
-        gen_iteration(e->b.get(), emit_body, nullptr, nullptr);
+        // recursively nest the clauses
+        std::function<void(size_t)> gen_clause = [&](size_t ci) {
+            if (ci == e->clauses.size()) { emit_elem(); return; }
+            const CompClause& cl = e->clauses[ci];
+            auto body = [&](int elem_slot) {
+                if (cl.targets.size() == 1) {
+                    assign_kind(cl.tkind[0], cl.tidx[0], elem_slot);
+                } else {
+                    for (size_t i = 0; i < cl.targets.size(); i++) {
+                        int save2 = temp_top;
+                        int part = alloc_temp();
+                        emit("call void @kami_unpack(ptr " + slot_ptr(part) + ", ptr " +
+                             slot_ptr(elem_slot) + ", i64 " + std::to_string(i) + ", i64 " +
+                             std::to_string(cl.targets.size()) + ")");
+                        assign_kind(cl.tkind[i], cl.tidx[i], part);
+                        temp_top = save2;
+                    }
+                }
+                // conditions: skip element if any is falsey
+                std::vector<std::string> skips;
+                for (auto& cptr : cl.conds) {
+                    int save2 = temp_top;
+                    int c = gen_expr(cptr.get());
+                    std::string b = truthy(c);
+                    temp_top = save2;
+                    std::string Lyes = newlabel(), Lskip = newlabel();
+                    emit("br i1 " + b + ", label %" + Lyes + ", label %" + Lskip);
+                    C().terminated = true;
+                    start_block(Lyes);
+                    skips.push_back(Lskip);
+                }
+                gen_clause(ci + 1);
+                for (size_t i = skips.size(); i-- > 0;) start_block(skips[i]);
+            };
+            gen_iteration(cl.iter.get(), body, nullptr, nullptr);
+        };
+        gen_clause(0);
         return result;
     }
 
