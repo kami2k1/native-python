@@ -4,6 +4,27 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## v0.9.0 — Third-party packages: compile từ site-packages hoặc bridge qua CPython nhúng / site-packages compilation + transparent CPython bridge
+
+**`import flask` giờ chạy**: compiler tự d√≤ site-packages/dist-packages của các bản Python trên máy (`kamipy paths` liệt kê), **thử biên dịch** package thuần Python (probe transitive như stdlib), và những gì không dịch được (flask, numpy, PIL, cv2, zlapi, ...) **tự động bridge qua libpython nhúng** — không cần cấu hình, không cần chép file.
+
+### Bridge hai chiều (pycapi.cpp)
+- **Compiled function → Python callable**: `@app.route("/")` decorator, callback, key= functions... — PyCFunction + capsule trampoline, giữ đúng `__name__` (Flask endpoints), nhận *args/**kwargs từ Python, trả kết quả ngược lại; chạy được từ thread của Python (Flask worker threads).
+- **Subclass class Python từ code biên dịch**: `class Bot(ZaloAPI): def onMessage(self, ...)` — tạo type(name, (base,), {}) lúc runtime, method biên dịch gắn qua `PyInstanceMethod_New` nên `self` bind chuẩn; `super().__init__(...)` hoạt động; Python gọi ngược callback vào native code (đúng pattern bot SDK như zlapi).
+- **kwargs mọi ngả**: `app.run(host=..., port=...)`, `Flask(__name__)`, `jsonify(ok=True)`, `f(*args, **kw)` → `PyObject_Call`; index get/set (`request.json["msg"]`, `app.config[...] = ...`), attr set, iterate pyobj (`for x in pyobj`).
+- **Khóa đúng thứ tự (kami lock → GIL), không giữ lock qua call Python**: `app.run()` block vô hạn không còn treo toàn bộ runtime (trước đây deadlock — main giữ runtime lock trong serve loop, worker thread chờ). Trampoline drop GIL rồi lấy lại đúng thứ tự.
+- **Chọn đúng libpython**: theo `python3`/`python.exe` trên PATH (đúng interpreter mà `python app.py` dùng — nơi pip đã cài package), override bằng `KAMIPY_LIBPYTHON`; `KAMIPY_SITE_PACKAGES` thêm đường dẫn package (compiler + sys.path lúc runtime).
+- Chuyển đổi list→tuple theo yêu cầu callee (PIL colors), str→bytes như trước; dict key luôn tuple-hóa.
+
+### Compiler
+- `resolve_module` thêm tầng **SitePackages** (chỉ bundle khi probe transitive sạch — không bao giờ vỡ nửa chừng); `import X`/`from X import y` không resolve được nhưng có trong site-packages → tự pyext.
+- `from PIL import Image` khi `PIL` compile được nhưng `PIL.Image` thì không → cả statement đi qua bridge; runtime getattr fallback sang import submodule (đúng ngữ nghĩa from-import của CPython).
+- Kwargs cho callee động (`jsonify(ok=True)`) → CallStar; mapping tên dunder (`__version__`) khớp quy tắc mangle; `del <module>` là no-op; kế thừa `__init__` từ base class (kami class chain); base class từ module bundle (`from fakezalo import ZaloAPI`).
+
+Test: `tests/integration/feat_site_packages.py` (fixture SDK không compile được + module compile được; subclass + callback + kwargs), validated thêm bằng Flask 3 thật (server + route + POST JSON + thread nền), numpy, PIL.
+
+---
+
 ## v0.8.0 — Generators (yield) + concurrent.futures thẳng từ Python env / Generators + concurrent.futures compiled from the system Python source
 
 **Nguyên tắc / principle:** không viết thêm file lib `.py` nào — compiler tự tìm, tự đọc, tự build source thật của CPython trên máy (`kamipy paths`). / No hand-written `.py` shims: the compiler locates, reads and compiles the real CPython sources from the discovered installation.

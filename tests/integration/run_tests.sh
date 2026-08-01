@@ -43,8 +43,18 @@ for py in "$DIR"/*.py; do
                 continue
             fi
             ;;
+        feat_site_packages)
+            # needs the CPython shared library at runtime for the bridge
+            if [ "$IS_WINDOWS" = 0 ] && ! ldconfig -p 2>/dev/null | grep -q "libpython3"; then
+                echo "SKIP: $base (no libpython3 shared library found)"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            export KAMIPY_SITE_PACKAGES="$DIR/fixtures/site"
+            ;;
     esac
     count=$((count + 1))
+    if [ "$base" != "feat_site_packages" ]; then unset KAMIPY_SITE_PACKAGES; fi
     if ! "$KAMIPY" build "$py" -o "$TMP/$base" > "$TMP/$base.buildlog" 2>&1; then
         echo "BUILD FAIL: $base"
         cat "$TMP/$base.buildlog"

@@ -1411,6 +1411,53 @@ struct FnGen {
             }
             break;
         case StmtKind::ClassDef: {
+            if (s->pyobj_base) {
+                // Subclass of a CPython-bridged class: build the type at
+                // runtime — type(name, (base,), {}) with the compiled methods
+                // installed as instance methods.
+                int save2 = temp_top;
+                int base = alloc_temp();
+                emit("call void @kami_global_get(ptr " + slot_ptr(base) + ", i64 " +
+                     std::to_string(s->target_idx) + ")");
+                if (!s->vararg.empty()) { // dotted base: mod.Class
+                    int a = alloc_temp();
+                    emit("call void @kami_attr_get(ptr " + slot_ptr(a) + ", ptr " +
+                         slot_ptr(base) + ", ptr " + str_const(s->vararg) + ")");
+                    base = a;
+                }
+                int cls = alloc_temp();
+                emit("call void @kami_pyext_subclass(ptr " + slot_ptr(cls) + ", ptr " +
+                     str_const(s->name) + ", ptr " + slot_ptr(base) + ")");
+                for (auto& msp : s->body) {
+                    if (msp->kind == StmtKind::FuncDef) {
+                        const Stmt* mth = msp.get();
+                        int s3 = temp_top;
+                        int fnv = alloc_temp();
+                        size_t fmin = mth->params.size() - mth->defaults.size();
+                        emit("call void @kami_make_closure(ptr " + slot_ptr(fnv) +
+                             ", ptr @u_" + mth->alias + ", i64 " + std::to_string(fmin) +
+                             ", i64 " + std::to_string(mth->params.size()) + ", ptr " +
+                             str_const(mth->name) + ", ptr %argbuf, i64 0, i64 " +
+                             std::to_string(func_kwonly(mth)) + ", i64 " +
+                             std::to_string(func_flags(mth)) + ", ptr " +
+                             str_const(join_params(mth)) + ")");
+                        emit("call void @kami_pyext_class_method(ptr " + slot_ptr(cls) +
+                             ", ptr " + str_const(mth->name) + ", ptr " + slot_ptr(fnv) +
+                             ")");
+                        temp_top = s3;
+                    } else if (msp->kind == StmtKind::Assign) {
+                        int s3 = temp_top;
+                        int v = gen_expr(msp->e1.get());
+                        emit("call void @kami_attr_set(ptr " + slot_ptr(cls) + ", ptr " +
+                             str_const(msp->name) + ", ptr " + slot_ptr(v) + ")");
+                        temp_top = s3;
+                    }
+                }
+                emit("call void @kami_global_set(i64 " + std::to_string(s->global_idx) +
+                     ", ptr " + slot_ptr(cls) + ")");
+                temp_top = save2;
+                break;
+            }
             if (!s->decorators.empty()) {
                 int cur = alloc_temp();
                 emit("call void @kami_global_get(ptr " + slot_ptr(cur) + ", i64 " +
@@ -2095,6 +2142,8 @@ declare void @kami_free_hint(ptr)
 declare void @kami_intern_str(ptr, ptr, i64)
 declare void @kami_pyext_import(ptr, ptr)
 declare void @kami_pyext_getattr(ptr, ptr, ptr)
+declare void @kami_pyext_subclass(ptr, ptr, ptr)
+declare void @kami_pyext_class_method(ptr, ptr, ptr)
 declare void @kami_map_merge(ptr, ptr)
 declare void @kami_panic(ptr)
 declare i32 @kami_range_cond(ptr, ptr, ptr)

@@ -162,6 +162,10 @@ void kami_run_module(void* module_fn);
 void kami_pyext_import(KamiValue* out, const char* name);
 // getattr(module, name) → global (used for `from _hashlib import ...`).
 void kami_pyext_getattr(KamiValue* out, const KamiValue* module, const char* name);
+// `class Bot(ZaloAPI)` where the base is a bridged CPython class: creates the
+// runtime type(name, (base,), {}) and installs compiled methods on it.
+void kami_pyext_subclass(KamiValue* out, const char* name, const KamiValue* base);
+void kami_pyext_class_method(KamiValue* cls, const char* name, const KamiValue* fn);
 
 // Escape-analysis hint: the container held in this slot is provably dead
 // (about to be overwritten, no aliases) — recycle its memory immediately.

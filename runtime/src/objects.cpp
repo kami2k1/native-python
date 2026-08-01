@@ -95,12 +95,13 @@ void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
 }
 
 void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name) {
-    Lock lk(g_lock);
-    KamiValue o = *obj;
-    if (o.tag == KT_PYOBJ) { // bridged CPython object
+    if (obj->tag == KT_PYOBJ) { // bridged CPython object: no runtime lock held
+        KamiValue o = *obj;
         pyobj_attr_get(out, &o, name);
         return;
     }
+    Lock lk(g_lock);
+    KamiValue o = *obj;
     if (o.tag == KT_GEN) {
         // `g.__next__` read as a value (itertools.count().__next__): a bound
         // callable that advances the generator.
@@ -175,6 +176,11 @@ void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name) {
 }
 
 void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val) {
+    if (obj->tag == KT_PYOBJ) { // bridged CPython object: no runtime lock held
+        KamiValue o = *obj;
+        pyobj_attr_set(&o, name, val);
+        return;
+    }
     Lock lk(g_lock);
     KamiValue o = *obj;
     if (o.tag == KT_OBJECT) {

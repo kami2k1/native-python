@@ -283,6 +283,76 @@ const std::vector<fs::path>& find_system_python_stdlib() {
     return dirs;
 }
 
+namespace {
+
+// site-packages / dist-packages directories that belong to the discovered
+// stdlib roots. A stdlib root looks like:
+//   Windows:  C:\...\Python312\Lib          → Lib\site-packages
+//   POSIX:    /usr/lib/python3.11           → .../python3.11/site-packages,
+//             plus Debian's dist-packages twins in /usr/local and /usr/lib.
+std::vector<fs::path> discover_site_packages() {
+    std::vector<fs::path> out;
+    std::error_code ec;
+    auto add = [&](const fs::path& d) {
+        if (d.empty() || !fs::is_directory(d, ec)) return;
+        fs::path canon = fs::weakly_canonical(d, ec);
+        if (ec) canon = d;
+        for (const auto& e : out)
+            if (e == canon) return;
+        out.push_back(canon);
+    };
+    if (const char* env = getenv("KAMIPY_SITE_PACKAGES"))
+        for (const std::string& d : split_path_list(env)) add(d);
+    for (const fs::path& lib : find_system_python_stdlib()) {
+        add(lib / "site-packages");  // Windows + venvs
+        add(lib / "dist-packages");  // Debian system python
+        std::string base = path_to_utf8(lib.filename()); // "python3.11" / "Lib"
+        if (base.rfind("python3", 0) == 0) {
+            // Debian: pip installs into /usr/local/lib/python3.X/dist-packages
+            add(fs::path("/usr/local/lib") / base / "dist-packages");
+            add(fs::path("/usr/local/lib") / base / "site-packages");
+            add(fs::path("/usr/lib/python3/dist-packages"));
+            // user site: ~/.local/lib/python3.X/site-packages
+            if (const char* home = getenv("HOME"))
+                add(fs::path(home) / ".local" / "lib" / base / "site-packages");
+        } else {
+            // Windows user site: %APPDATA%\Python\Python3XX\site-packages
+            std::string ver = path_to_utf8(lib.parent_path().filename()); // Python312
+            if (const char* appdata = getenv("APPDATA"); appdata && !ver.empty())
+                add(fs::path(appdata) / "Python" / ver / "site-packages");
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+const std::vector<fs::path>& find_site_packages() {
+    static const std::vector<fs::path> dirs = discover_site_packages();
+    return dirs;
+}
+
+bool site_packages_has(const std::string& dotted) {
+    std::error_code ec;
+    std::string top = dotted.substr(0, dotted.find('.'));
+    for (const fs::path& dir : find_site_packages()) {
+        if (fs::is_regular_file(dir / (top + ".py"), ec)) return true;
+        if (fs::is_directory(dir / top, ec) &&
+            (fs::exists(dir / top / "__init__.py", ec) ||
+             fs::exists(dir / top / "__init__.pyi", ec)))
+            return true;
+        // compiled C extension: top.cpython-311-x86_64-linux-gnu.so / top.pyd
+        for (const fs::path& e : list_dir(dir)) {
+            std::string fn = path_to_utf8(e.filename());
+            if (fn.rfind(top + ".", 0) != 0) continue;
+            if (fn.size() > 3 && (fn.compare(fn.size() - 3, 3, ".so") == 0 ||
+                                  fn.compare(fn.size() - 4, 4, ".pyd") == 0))
+                return true;
+        }
+    }
+    return false;
+}
+
 std::vector<fs::path> bundled_pylib_dirs(const fs::path& bindir) {
     std::vector<fs::path> dirs;
     if (const char* env = getenv("KAMIPY_PYLIB")) dirs.push_back(env);
@@ -358,6 +428,18 @@ std::vector<ResolvedModule> resolve_module(const std::string& dotted, const Impo
             break;
         }
     }
+    // Third-party packages (site-packages/dist-packages): pure-Python sources
+    // are compile candidates; whatever cannot be compiled is bridged through
+    // the embedded CPython interpreter instead (see sema's pyext fallback).
+    if (pol.use_system_python)
+        for (const fs::path& dir : find_site_packages()) {
+            ResolvedModule sp;
+            if (find_in_dir(dir, dotted, sp.path)) {
+                sp.origin = ModuleOrigin::SitePackages;
+                out.push_back(sp);
+                break;
+            }
+        }
     return out;
 }
 
@@ -487,6 +569,12 @@ std::string library_prefix(const std::string& dotted) {
     for (char& ch : prefix)
         if (ch == '.') ch = '_';
     return prefix;
+}
+
+std::string mangled_library_name(const std::string& prefix, const std::string& name) {
+    // must mirror mangle_module's dunder exclusion below
+    if (name.size() > 4 && name.compare(0, 2, "__") == 0) return name;
+    return prefix + name;
 }
 
 void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix) {
@@ -622,7 +710,8 @@ void hoist_lazy_getattr(Module& sub, const std::string& modname,
             // the function-local dance the hoisting replaces
             for (auto& [n, alias] : fi->import_names) {
                 imp->import_names.emplace_back(n, n);
-                exports[modname + "." + n] = library_prefix(fi->name) + n;
+                exports[modname + "." + n] =
+                    mangled_library_name(library_prefix(fi->name), n);
             }
             auto guard = std::make_unique<Stmt>();
             guard->kind = StmtKind::Try;
@@ -678,6 +767,7 @@ struct Bundler {
         case ModuleOrigin::Project: return "project";
         case ModuleOrigin::Pylib: return "bundled pylib";
         case ModuleOrigin::SystemPython: return "system Python";
+        case ModuleOrigin::SitePackages: return "site-packages";
         default: return "native";
         }
     }
@@ -710,6 +800,18 @@ struct Bundler {
             } catch (CompileError& e) {
                 if (found.origin == ModuleOrigin::Project || last) {
                     loading.erase(name);
+                    if (found.origin == ModuleOrigin::SitePackages) {
+                        // Third-party source we cannot compile: the import is
+                        // bridged through the embedded CPython at runtime
+                        // (sema's pyext fallback) — no warning needed.
+                        if (pol.verbose)
+                            fprintf(stderr,
+                                    "kamipy: site-packages copy of '%s' is not compilable "
+                                    "(%s:%d: %s) — bridging through CPython\n",
+                                    name.c_str(), found.path.string().c_str(), e.line,
+                                    e.what());
+                        return;
+                    }
                     if (found.origin != ModuleOrigin::Project) {
                         // No fallback left. Say precisely what was rejected and
                         // carry on: the program may guard the import with
@@ -742,8 +844,12 @@ struct Bundler {
             // A library copy is only usable when its own (unguarded) imports
             // resolve too — CPython packages use relative imports we cannot
             // bundle (json/__init__.py -> .decoder). Fall back while we can.
-            if (!last && found.origin != ModuleOrigin::Project &&
-                !imports_resolvable(sub)) {
+            // site-packages sources additionally must probe clean even as the
+            // last candidate: a third-party package that cannot be compiled
+            // whole is bridged through the embedded CPython instead (sema
+            // routes the import to kami_pyext_import).
+            if ((!last || found.origin == ModuleOrigin::SitePackages) &&
+                found.origin != ModuleOrigin::Project && !imports_resolvable(sub)) {
                 if (pol.verbose)
                     fprintf(stderr,
                             "kamipy: %s copy of '%s' has unresolvable imports — "
@@ -770,7 +876,7 @@ struct Bundler {
                     if (!mod.module_prefix.count(sp->name)) continue;
                     for (auto& [n, alias] : sp->import_names)
                         mod.module_exports[name + "." + alias] =
-                            mod.module_prefix[sp->name] + n;
+                            mangled_library_name(mod.module_prefix[sp->name], n);
                 }
             }
             for (auto& sp : sub.body) {

@@ -550,6 +550,10 @@ void kami_unop(int64_t op, KamiValue* out, const KamiValue* a) {
 }
 
 void kami_index_get(KamiValue* out, const KamiValue* obj, const KamiValue* idx) {
+    if (obj->tag == KT_PYOBJ) {
+        pyobj_index_get(out, obj, idx);
+        return;
+    }
     Lock lk(g_lock);
     KamiValue o = *obj, ix = *idx;
     switch (o.tag) {
@@ -581,6 +585,10 @@ void kami_index_get(KamiValue* out, const KamiValue* obj, const KamiValue* idx) 
 }
 
 void kami_index_set(KamiValue* obj, const KamiValue* idx, const KamiValue* val) {
+    if (obj->tag == KT_PYOBJ) {
+        pyobj_index_set(obj, idx, val);
+        return;
+    }
     Lock lk(g_lock);
     KamiValue o = *obj, ix = *idx, v = *val;
     switch (o.tag) {
@@ -618,6 +626,11 @@ void kami_del_index(KamiValue* obj, const KamiValue* idx) {
 }
 
 void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
+    if (seq->tag == KT_PYOBJ) { // bridged CPython iterable → list
+        KamiValue v = *seq;
+        pyobj_iter_list(out, &v);
+        return;
+    }
     Lock lk(g_lock);
     KamiValue v = *seq;
     switch (v.tag) {
@@ -716,6 +729,10 @@ void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
 }
 
 void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs) {
+    if (fn->tag == KT_PYOBJ) { // bridged CPython callable: no runtime lock held
+        pyobj_call(out, fn, argv, nargs);
+        return;
+    }
     KamiFn f = nullptr;
     KamiFn init = nullptr;
     KamiValue* f_caps = nullptr;
@@ -773,9 +790,6 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             } else if (nargs != 0) {
                 panic(std::string(c->name) + "() takes no arguments");
             }
-        } else if (fn->tag == KT_PYOBJ) {
-            pyobj_call(out, fn, argv, nargs);
-            return;
         } else {
             if (fn->tag != KT_FUNC)
                 panic(std::string("'") + type_name(fn->tag) + "' object is not callable");
@@ -854,6 +868,10 @@ void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
     for (size_t i = 0; i < vals.size(); i++) argv[i] = &vals[i];
     int64_t nargs = (int64_t)vals.size();
     KamiMap* kwmap = (KamiMap*)kw->p;
+    if (fn->tag == KT_PYOBJ) { // bridged CPython callable: keywords via PyObject_Call
+        pyobj_call(out, fn, argv.data(), nargs, kwmap);
+        return;
+    }
 
     KamiFn f = nullptr;
     KamiFn init = nullptr;
@@ -894,6 +912,11 @@ void kami_call_star(KamiValue* out, const KamiValue* fn, const KamiValue* pos,
                           "() does not accept keyword arguments through **kwargs");
                 if (nargs > 16) panic("too many arguments in *args call to a builtin");
                 builtin_id = fo->builtin_id;
+            } else if (fo->flags & KFN_GENERATOR) {
+                n2 = prep_user_argv(fo, argv.data(), nargs, kwmap, argv2.data(), packed);
+                KamiValue fnval = *fn;
+                gen_create_from_func(out, fo, &fnval, argv2.data(), n2);
+                return;
             } else {
                 n2 = prep_user_argv(fo, argv.data(), nargs, kwmap, argv2.data(), packed);
                 f = (KamiFn)fo->fn;
@@ -941,10 +964,11 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
         KamiValue o = *obj;
         std::string m = name;
         if (kwmap && kwmap->count && o.tag != KT_OBJECT && o.tag != KT_CLASS &&
-            o.tag != KT_SYNC)
+            o.tag != KT_SYNC && o.tag != KT_PYOBJ)
             panic(m + "() does not accept keyword arguments");
         if (o.tag == KT_PYOBJ) { // bridged CPython object: dispatch through the C-API
-            pyobj_method(out, obj, m, argv, nargs);
+            lk.unlock(); // the method may block forever (app.run, socket reads)
+            pyobj_method(out, obj, m, argv, nargs, kwmap);
             return;
         }
         if (o.tag == KT_GEN) { // __next__ / send / close / throw

@@ -149,6 +149,11 @@ std::string describe_import_paths(const std::string& argv0) {
     const auto& sys = find_system_python_stdlib();
     if (sys.empty()) out += "  <none found — falling back to the bundled pylib>\n";
     for (const fs::path& d : sys) out += "  " + path_to_string(d) + "\n";
+    out += "\nthird-party packages (site-packages / dist-packages):\n";
+    const auto& site = find_site_packages();
+    if (site.empty())
+        out += "  <none found>\n";
+    for (const fs::path& d : site) out += "  " + path_to_string(d) + "\n";
     return out;
 }
 
