@@ -75,6 +75,8 @@ void kami_make_bool(KamiValue* out, int64_t b);
 void kami_make_int(KamiValue* out, int64_t v);
 void kami_make_float(KamiValue* out, double v);
 void kami_make_str(KamiValue* out, const char* data, int64_t len);
+// Pre-interns a constant-pool string literal into a codegen cache cell.
+void kami_intern_str(void** cell, const char* data, int64_t len);
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
 // `*args` prologue: packs argv[first..nargs) into a list stored in *out.
 void kami_pack_varargs(KamiValue* out, KamiValue** argv, int64_t nargs, int64_t first);

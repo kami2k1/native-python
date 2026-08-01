@@ -114,10 +114,13 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 
 | Benchmark | KamiPython | Go 1.24 | CPython 3.11 | vs Go | vs CPython |
 |---|---|---|---|---|---|
-| integer_loop (1e8, mod chain) | **0.53 s** | 0.37 s | 5.4 s | 0.70x | **10.1x** |
-| math (1e8 float ops) | **0.56 s** | 0.57 s | 5.3 s | **1.02x** | **9.5x** |
-| recursion fib(32) | **6–11 ms** | 12–16 ms | 282 ms | **1.1–2.6x** | **25–46x** |
-| string_test (1M `+=`) | **13–25 ms** | 8 ms (strings.Builder) | 42 ms | ~0.3x | **1.7x** |
+| integer_loop (1e8, mod chain) | **0.44 s** (= C/clang: 0.43 s) | 0.37 s | 5.5 s | 0.84x | **12.4x** |
+| math (1e8 float ops) | **0.55 s** | 0.58 s | 5.4 s | **1.04x** | **9.8x** |
+| recursion fib(32) | **6.3 ms** | 12.4 ms | 283 ms | **1.97x** | **45x** |
+| string_test (1M `+=`) | **6.0 ms** | 10.4 ms (strings.Builder) | 45 ms | **1.73x** | **7.4x** |
+
+3/4 hạng mục **nhanh hơn Go**; integer_loop đạt đúng tốc độ C (`clang -O2` cùng thuật toán: 0.43 s) —
+phần chênh còn lại là backend Go phát chuỗi lệnh `%`-by-constant khác LLVM trên vi kiến trúc này.
 
 | Metric | KamiPython | C++ (-O2) | CPython 3.11 | Target |
 |---|---|---|---|---|

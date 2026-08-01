@@ -84,6 +84,7 @@ struct Expr {
     std::vector<int64_t> comp_tidx; // ListComp resolved target slots
     std::vector<int> comp_tkind;    // 1=local 2=global
     uint8_t sty = TY_ANY;      // static type (typeinf.cpp)
+    bool nonneg = false;       // int expr provably >= 0 (typeinf.cpp)
 };
 
 // ---------------- statements ----------------
@@ -174,6 +175,10 @@ struct FuncTypeInfo {
     bool guarded = false;
     std::vector<uint8_t> spec_locals, spec_params;
     uint8_t spec_ret = TY_BOT;
+    // Non-negativity lattice (optimistic true, cleared by any possibly-
+    // negative assignment). Lets codegen emit plain sdiv/srem for // and %
+    // by positive constants — the exact codegen Go gets for its % operator.
+    std::vector<uint8_t> locals_nn, spec_locals_nn;
 };
 
 // Effective (native-callable) view of a function's signature.

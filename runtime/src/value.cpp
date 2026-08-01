@@ -217,6 +217,15 @@ void kami_make_float(KamiValue* out, double v) {
     out->f = v;
 }
 
+// Startup pre-interning: fills a codegen cache cell with the KamiStr* for a
+// constant-pool literal. The object is owned by g_intern (a GC root).
+void kami_intern_str(void** cell, const char* data, int64_t len) {
+    Lock lk(g_lock);
+    KamiStr*& cached = g_intern[data];
+    if (!cached) cached = str_new(data, len);
+    *cell = cached;
+}
+
 void kami_make_str(KamiValue* out, const char* data, int64_t len) {
     Lock lk(g_lock);
     // Generated code passes pointers into the constant pool: intern by

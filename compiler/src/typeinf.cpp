@@ -124,6 +124,26 @@ struct TypeInf {
     std::vector<uint8_t>& locals_of(FnCtx& c) {
         return spec_mode ? c.fi->spec_locals : c.fi->locals;
     }
+    std::vector<uint8_t>& locals_nn_of(FnCtx& c) {
+        return spec_mode ? c.fi->spec_locals_nn : c.fi->locals_nn;
+    }
+    void clear_nn(FnCtx& c, int64_t idx) {
+        if (!c.fi) return;
+        auto& nn = locals_nn_of(c);
+        if (idx >= 0 && (size_t)idx < nn.size() && nn[idx]) {
+            if (freeze) return;
+            nn[idx] = 0;
+            changed = true;
+        }
+    }
+    void join_nn(FnCtx& c, int64_t idx, bool v) {
+        if (!v) clear_nn(c, idx);
+    }
+    bool local_nn(FnCtx& c, int64_t idx) {
+        if (!c.fi) return false;
+        auto& nn = locals_nn_of(c);
+        return idx >= 0 && (size_t)idx < nn.size() && nn[idx];
+    }
     uint8_t& ret_of(FnCtx& c) { return spec_mode ? c.fi->spec_ret : c.fi->ret; }
 
     void join_into(uint8_t& slot, uint8_t t) {
@@ -157,7 +177,59 @@ struct TypeInf {
         // codegen never unboxes a maybe-uninitialized value.
         if (freeze && t == TY_BOT) t = TY_ANY;
         e->sty = t;
+        e->nonneg = expr_nonneg(c, e);
         return t;
+    }
+
+    // Provable non-negativity for int-typed expressions (children already
+    // stamped by type_expr_inner's recursion).
+    bool expr_nonneg(FnCtx& c, Expr* e) {
+        if (!is_intlike(e->sty)) return false;
+        switch (e->kind) {
+        case ExprKind::IntLit: return e->ival >= 0;
+        case ExprKind::BoolLit: return true;
+        case ExprKind::Name:
+            return e->res == Res::Local && local_nn(c, e->res_idx);
+        case ExprKind::Binary:
+            switch (e->op) {
+            case KOP_ADD: case KOP_MUL: case KOP_BITOR: case KOP_BITXOR:
+            case KOP_FLOORDIV:
+                return e->a->nonneg && e->b->nonneg;
+            case KOP_MOD: // floored: the result's sign follows the divisor
+                return e->b->nonneg;
+            case KOP_BITAND: // two's complement: one non-negative operand wins
+                return e->a->nonneg || e->b->nonneg;
+            case KOP_SHR:
+                return e->a->nonneg;
+            case KOP_EQ: case KOP_NE: case KOP_LT: case KOP_GT:
+            case KOP_LE: case KOP_GE: case KOP_IN: case KOP_IS: case KOP_ISNOT:
+                return true; // bool
+            default: return false; // SUB/SHL/POW may go negative or wrap
+            }
+        case ExprKind::Unary: return e->op == KUOP_NOT;
+        case ExprKind::BoolOp: return e->a->nonneg && e->b->nonneg;
+        case ExprKind::IfExp: return e->a->nonneg && e->c->nonneg;
+        case ExprKind::Call: {
+            const Expr* callee = e->a.get();
+            if (callee->res == Res::BuiltinFunc)
+                return callee->res_idx == KB_LEN || callee->res_idx == KB_ORD;
+            return false;
+        }
+        default: return false;
+        }
+    }
+
+    // Is a range(...) loop variable provably non-negative?
+    bool range_var_nonneg(const Expr* it) {
+        const auto& args = it->args;
+        bool start_nn = args.size() == 1 ? true : args[0]->nonneg;
+        if (!start_nn) return false;
+        if (args.size() < 3) return true; // step 1
+        const Expr* st = args[2].get();
+        if (st->nonneg) return true; // positive step: values stay >= start
+        // negative constant step: values stay > stop
+        if (st->kind == ExprKind::IntLit && st->ival < 0 && args[1]->nonneg) return true;
+        return false;
     }
 
     uint8_t type_expr_inner(FnCtx& c, Expr* e) {
@@ -321,7 +393,10 @@ struct TypeInf {
             for (auto& cl : e->clauses) {
                 type_expr(c, cl.iter.get());
                 for (size_t i = 0; i < cl.tkind.size(); i++)
-                    if (cl.tkind[i] == 1) join_local(c, cl.tidx[i], TY_ANY);
+                    if (cl.tkind[i] == 1) {
+                        join_local(c, cl.tidx[i], TY_ANY);
+                        clear_nn(c, cl.tidx[i]);
+                    }
                 for (auto& cond : cl.conds) type_expr(c, cond.get());
             }
             if (e->a) type_expr(c, e->a.get());
@@ -366,7 +441,10 @@ struct TypeInf {
             return;
         case StmtKind::Assign: {
             uint8_t t = type_expr(c, s->e1.get());
-            if (s->target_res == Res::Local) join_local(c, s->target_idx, t);
+            if (s->target_res == Res::Local) {
+                join_local(c, s->target_idx, t);
+                join_nn(c, s->target_idx, s->e1->nonneg);
+            }
             return;
         }
         case StmtKind::IndexAssign:
@@ -382,8 +460,10 @@ struct TypeInf {
             for (auto& v : s->values) type_expr(c, v.get());
             for (auto& t : s->targets) {
                 type_expr(c, t.get());
-                if (t->kind == ExprKind::Name && t->res == Res::Local)
+                if (t->kind == ExprKind::Name && t->res == Res::Local) {
                     join_local(c, t->res_idx, TY_ANY);
+                    clear_nn(c, t->res_idx);
+                }
             }
             return;
         case StmtKind::If:
@@ -394,19 +474,31 @@ struct TypeInf {
             return;
         case StmtKind::For: {
             type_expr(c, s->e1.get());
-            uint8_t elem = int_range(s->e1.get()) ? TY_INT : TY_ANY;
+            bool rng = s->e1->kind == ExprKind::Call &&
+                       s->e1->a->res == Res::BuiltinFunc &&
+                       s->e1->a->res_idx == KB_RANGE;
+            uint8_t elem = rng ? TY_INT : TY_ANY; // range loops are always ints
             if (s->params.size() == 1) {
-                if (s->target_res == Res::Local) join_local(c, s->target_idx, elem);
+                if (s->target_res == Res::Local) {
+                    join_local(c, s->target_idx, elem);
+                    join_nn(c, s->target_idx, rng && range_var_nonneg(s->e1.get()));
+                }
             } else {
                 for (size_t i = 0; i < s->multi_tkind.size(); i++)
-                    if (s->multi_tkind[i] == 1) join_local(c, s->multi_tidx[i], TY_ANY);
+                    if (s->multi_tkind[i] == 1) {
+                        join_local(c, s->multi_tidx[i], TY_ANY);
+                        clear_nn(c, s->multi_tidx[i]);
+                    }
             }
             walk_stmts(c, s->body);
             walk_stmts(c, s->orelse);
             return;
         }
         case StmtKind::FuncDef: // nested def: local receives a closure value
-            if (s->target_res == Res::Local) join_local(c, s->target_idx, TY_ANY);
+            if (s->target_res == Res::Local) {
+                join_local(c, s->target_idx, TY_ANY);
+                clear_nn(c, s->target_idx);
+            }
             return;                       // its body is walked as its own function
         case StmtKind::Return:
             if (c.fi) {
@@ -422,7 +514,10 @@ struct TypeInf {
         case StmtKind::Try:
             walk_stmts(c, s->body);
             for (auto& h : s->handlers) {
-                if (h.as_kind == 1) join_local(c, h.as_idx, TY_ANY);
+                if (h.as_kind == 1) {
+                    join_local(c, h.as_idx, TY_ANY);
+                    clear_nn(c, h.as_idx);
+                }
                 walk_stmts(c, h.body);
             }
             walk_stmts(c, s->orelse);
@@ -430,14 +525,19 @@ struct TypeInf {
             return;
         case StmtKind::With:
             if (s->e1) type_expr(c, s->e1.get());
-            if (s->target_res == Res::Local) join_local(c, s->target_idx, TY_ANY);
+            if (s->target_res == Res::Local) {
+                join_local(c, s->target_idx, TY_ANY);
+                clear_nn(c, s->target_idx);
+            }
             walk_stmts(c, s->body);
             return;
         case StmtKind::Del:
             for (auto& t : s->targets) {
                 type_expr(c, t.get());
-                if (t->kind == ExprKind::Name && t->res == Res::Local)
+                if (t->kind == ExprKind::Name && t->res == Res::Local) {
                     join_local(c, t->res_idx, TY_ANY);
+                    clear_nn(c, t->res_idx);
+                }
             }
             return;
         default: return;
@@ -685,6 +785,7 @@ struct TypeInf {
             for (size_t p = 0; p < fi.params.size(); p++)
                 if (fi.params[p] == TY_FLOAT) fi.spec_params[p] = TY_FLOAT;
             fi.spec_locals.assign((size_t)f->nlocals, TY_BOT);
+            fi.spec_locals_nn.assign((size_t)f->nlocals, 1);
             fi.spec_ret = TY_BOT;
             fi.guarded = true; // provisional; dropped below if non-native
         }
@@ -697,8 +798,10 @@ struct TypeInf {
                 Stmt* f = mod.functions[i];
                 FnCtx c{f, &info(i)};
                 for (size_t p = 0; p < f->params.size() && p < info(i).spec_locals.size();
-                     p++)
+                     p++) {
                     join_into(info(i).spec_locals[p], info(i).spec_params[p]);
+                    clear_nn(c, (int64_t)p); // argument signs are unknown
+                }
                 walk_stmts(c, f->body);
                 if (!always_returns(f->body)) join_into(info(i).spec_ret, TY_NONE);
             }
@@ -735,6 +838,7 @@ struct TypeInf {
             size_t nlocals = (size_t)f->nlocals;
             mod.ftypes[i].locals.assign(nlocals, TY_BOT);
             mod.ftypes[i].params.assign(f->params.size(), TY_BOT);
+            mod.ftypes[i].locals_nn.assign(nlocals, 1); // optimistic
         }
         find_escapes();
         // fixed point: parameter types feed locals feed returns feed call sites
@@ -747,9 +851,11 @@ struct TypeInf {
                 FnCtx c{f, &mod.ftypes[i]};
                 // parameters seed the local slots
                 size_t np = f->params.size();
-                for (size_t p = 0; p < np && p < c.fi->locals.size(); p++)
+                for (size_t p = 0; p < np && p < c.fi->locals.size(); p++) {
                     join_into(c.fi->locals[p],
                               c.fi->escapes ? (uint8_t)TY_ANY : c.fi->params[p]);
+                    clear_nn(c, (int64_t)p); // argument signs are unknown
+                }
                 // *args/**kwargs slots are tuple/dict
                 size_t extra = np;
                 if (!f->vararg.empty()) join_local(c, (int64_t)extra++, TY_ANY);

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 
 namespace kami {
 
@@ -38,13 +39,25 @@ std::string fmt_double(double d) {
 
 struct StrTable {
     std::vector<std::string> strs;
+    // String literals evaluated as VALUES get a pre-interned KamiStr* cache
+    // (filled once at startup): loading it is 1 instruction instead of a
+    // runtime call per evaluation. Keys are intern() ids.
+    std::map<int, int> value_cache;
     int intern(const std::string& s) {
         for (size_t i = 0; i < strs.size(); i++)
             if (strs[i] == s) return (int)i;
         strs.push_back(s);
         return (int)strs.size() - 1;
     }
+    int cache_for(int si) {
+        auto it = value_cache.find(si);
+        if (it != value_cache.end()) return it->second;
+        int id = (int)value_cache.size();
+        value_cache.emplace(si, id);
+        return id;
+    }
     std::string ref(int i) const { return "@.s" + std::to_string(i); }
+    std::string cache_ref(int c) const { return "@.ic" + std::to_string(c); }
 };
 
 static bool stmts_have_try(const std::vector<StmtPtr>& body);
@@ -256,8 +269,40 @@ struct FnGen {
 
     // Unboxed int // and % with Python floor/sign semantics and the same
     // error messages as the runtime. Handles b == 0 (panic) and b == -1
-    // (separate path: sdiv INT_MIN,-1 traps on x86).
-    int gen_int_divmod(int op, const std::string& a, const std::string& b) {
+    // (separate path: sdiv INT_MIN,-1 traps on x86). When the divisor is a
+    // positive constant and the dividend is provably non-negative
+    // (typeinf's value-range bit), floored == truncated and the emission
+    // collapses to a single sdiv/srem — exactly what Go emits for % and /.
+    int gen_int_divmod(const Expr* e, const std::string& a, const std::string& b) {
+        int op = (int)e->op;
+        bool bconst = e->b->kind == ExprKind::IntLit;
+        int64_t bc = bconst ? e->b->ival : 0;
+        if (bconst && bc != 0 && bc != -1) {
+            std::string q = r(), rm = r();
+            if (op == KOP_FLOORDIV) {
+                emit(q + " = sdiv i64 " + a + ", " + b);
+                if (e->a->nonneg && bc > 0) return store_int(q);
+                emit(rm + " = srem i64 " + a + ", " + b);
+                std::string nz = r(), x = r(), sd = r(), adj = r(), adj64 = r(), v = r();
+                emit(nz + " = icmp ne i64 " + rm + ", 0");
+                emit(x + " = xor i64 " + a + ", " + b);
+                emit(sd + " = icmp slt i64 " + x + ", 0");
+                emit(adj + " = and i1 " + nz + ", " + sd);
+                emit(adj64 + " = zext i1 " + adj + " to i64");
+                emit(v + " = sub i64 " + q + ", " + adj64);
+                return store_int(v);
+            }
+            emit(rm + " = srem i64 " + a + ", " + b);
+            if (e->a->nonneg && bc > 0) return store_int(rm);
+            std::string nz = r(), x = r(), sd = r(), adj = r(), addv = r(), v = r();
+            emit(nz + " = icmp ne i64 " + rm + ", 0");
+            emit(x + " = xor i64 " + rm + ", " + b);
+            emit(sd + " = icmp slt i64 " + x + ", 0");
+            emit(adj + " = and i1 " + nz + ", " + sd);
+            emit(addv + " = select i1 " + adj + ", i64 " + b + ", i64 0");
+            emit(v + " = add i64 " + rm + ", " + addv);
+            return store_int(v);
+        }
         std::string z = r();
         emit(z + " = icmp eq i64 " + b + ", 0");
         panic_block(op == KOP_FLOORDIV ? "integer division by zero"
@@ -342,7 +387,7 @@ struct FnGen {
             }
             if (e->op == KOP_FLOORDIV || e->op == KOP_MOD) {
                 std::string va = load_i64(a), vb = load_i64(b);
-                return gen_int_divmod((int)e->op, va, vb);
+                return gen_int_divmod(e, va, vb);
             }
             if (e->op == KOP_DIV) {
                 std::string vb = load_i64(b), z = r();
@@ -453,9 +498,13 @@ struct FnGen {
             return t;
         }
         case ExprKind::StrLit: {
+            // pre-interned at startup: no allocation, no runtime call
             int t = alloc_temp();
-            emit("call void @kami_make_str(ptr " + slot_ptr(t) + ", ptr " + str_const(e->sval) +
-                 ", i64 " + std::to_string(e->sval.size()) + ")");
+            int c = strtab.cache_for(strtab.intern(e->sval));
+            std::string p = r();
+            emit(p + " = load ptr, ptr " + strtab.cache_ref(c) + ", align 8");
+            store_tag(t, 4 /*KT_STR*/);
+            emit("store ptr " + p + ", ptr " + payload_ptr(t) + ", align 8");
             return t;
         }
         case ExprKind::Name:
@@ -1988,6 +2037,7 @@ declare void @kami_call_star(ptr, ptr, ptr, ptr)
 declare void @kami_method_star(ptr, ptr, ptr, ptr, ptr)
 declare void @kami_str_iadd(ptr, ptr)
 declare void @kami_free_hint(ptr)
+declare void @kami_intern_str(ptr, ptr, i64)
 declare void @kami_pyext_import(ptr, ptr)
 declare void @kami_pyext_getattr(ptr, ptr, ptr)
 declare void @kami_map_merge(ptr, ptr)
@@ -2090,7 +2140,36 @@ struct NativeGen {
         start_block(Lok);
     }
 
-    V gen_int_divmod(int op, const std::string& a, const std::string& b) {
+    V gen_int_divmod(const Expr* e, const std::string& a, const std::string& b) {
+        int op = (int)e->op;
+        bool bconst = e->b->kind == ExprKind::IntLit;
+        int64_t bc = bconst ? e->b->ival : 0;
+        if (bconst && bc != 0 && bc != -1) {
+            std::string q = r(), rm = r();
+            if (op == KOP_FLOORDIV) {
+                emit(q + " = sdiv i64 " + a + ", " + b);
+                if (e->a->nonneg && bc > 0) return {q, 'i'};
+                emit(rm + " = srem i64 " + a + ", " + b);
+                std::string nz = r(), x = r(), sd = r(), adj = r(), adj64 = r(), v = r();
+                emit(nz + " = icmp ne i64 " + rm + ", 0");
+                emit(x + " = xor i64 " + a + ", " + b);
+                emit(sd + " = icmp slt i64 " + x + ", 0");
+                emit(adj + " = and i1 " + nz + ", " + sd);
+                emit(adj64 + " = zext i1 " + adj + " to i64");
+                emit(v + " = sub i64 " + q + ", " + adj64);
+                return {v, 'i'};
+            }
+            emit(rm + " = srem i64 " + a + ", " + b);
+            if (e->a->nonneg && bc > 0) return {rm, 'i'};
+            std::string nz = r(), x = r(), sd = r(), adj = r(), addv = r(), v = r();
+            emit(nz + " = icmp ne i64 " + rm + ", 0");
+            emit(x + " = xor i64 " + rm + ", " + b);
+            emit(sd + " = icmp slt i64 " + x + ", 0");
+            emit(adj + " = and i1 " + nz + ", " + sd);
+            emit(addv + " = select i1 " + adj + ", i64 " + b + ", i64 0");
+            emit(v + " = add i64 " + rm + ", " + addv);
+            return {v, 'i'};
+        }
         std::string z = r();
         emit(z + " = icmp eq i64 " + b + ", 0");
         panic_if(z, op == KOP_FLOORDIV ? "integer division by zero"
@@ -2186,7 +2265,7 @@ struct NativeGen {
                     return {v, 'b'};
                 }
                 if (e->op == KOP_FLOORDIV || e->op == KOP_MOD)
-                    return gen_int_divmod((int)e->op, a.v, b.v);
+                    return gen_int_divmod(e, a.v, b.v);
                 if (e->op == KOP_DIV) {
                     std::string z = r();
                     emit(z + " = icmp eq i64 " + b.v + ", 0");
@@ -2636,6 +2715,12 @@ std::string codegen(const Module& m, const std::string& source_name) {
     main_fn += "  %argc64 = sext i32 %argc to i64\n";
     main_fn += "  call void @kami_rt_init(i64 %argc64, ptr %cargv)\n";
     main_fn += "  call void @kami_globals_init(i64 " + std::to_string(m.nglobals) + ")\n";
+    // pre-intern every string literal used as a value (cells live in g_intern,
+    // which the GC marks — no extra root registration needed)
+    for (auto& [si, ci] : strtab.value_cache)
+        main_fn += "  call void @kami_intern_str(ptr @.ic" + std::to_string(ci) +
+                   ", ptr " + strtab.ref(si) + ", i64 " +
+                   std::to_string(strtab.strs[(size_t)si].size()) + ")\n";
     for (const Stmt* f : m.functions) {
         if (f->global_idx < 0) continue; // methods have no global binding
         int si = strtab.intern(f->name);
@@ -2683,6 +2768,8 @@ std::string codegen(const Module& m, const std::string& source_name) {
         out += "@.s" + std::to_string(i) + " = private unnamed_addr constant [" +
                std::to_string(s.size() + 1) + " x i8] c\"" + escape_ir_string(s) + "\"\n";
     }
+    for (auto& [si, ci] : strtab.value_cache)
+        out += "@.ic" + std::to_string(ci) + " = private global ptr null\n";
     out += "\n";
     out += RUNTIME_DECLS;
     // libm functions used by monomorphized native bodies (sqrt, sin, ...).

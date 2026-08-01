@@ -27,6 +27,9 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 - **II.2 hoàn chỉnh — container recycling**: ghi đè local không-alias đang giữ list/dict/set fresh ⇒ `kami_free_hint` trả header về free-list của allocator (tái dùng tức thì, không tăng áp lực GC; free-list xả sạch mỗi chu kỳ GC để sweep vẫn đúng).
 - **`obj.m(*args, **kwargs)`**: star-unpacking trong method call (bound, unbound, `__init__`), keyword matching qua `prep_user_argv`.
 - **Intern string literals** (theo địa chỉ constant pool — an toàn với iadd vì cap==len) + **range loop luôn unboxed** (tag check một lần trước loop): string_test 44ms → ~13ms.
+- **Pre-interned literal caches**: mọi StrLit dùng làm giá trị được intern một lần lúc startup vào global cell — đánh giá literal = 1 load + 2 store, không runtime call: string_test → **6ms, nhanh hơn Go strings.Builder (10.4ms)**.
+- **Value-range (non-negativity) analysis** trong typeinf: `a % b` / `a // b` với b là hằng dương và a chứng minh được ≥ 0 ⇒ phát plain `srem`/`sdiv` (không floor-adjustment, không zero-check) — đúng codegen của Go: integer_loop 0.53s → **0.44s = C/clang ceiling (0.43s)**.
+- Kết quả tổng: **3/4 benchmark nhanh hơn Go 1.24** (math 1.04x, fib 1.97x, string 1.73x), integer_loop 0.84x (= C).
 
 ### Fixes
 - Khôi phục `netio.cpp`/`http_client.cpp`/`kami_regex.cpp` bị xoá trong khi `ops.cpp` vẫn tham chiếu (main không link được — 48/48 test fail ⇒ xanh trở lại).
