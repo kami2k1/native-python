@@ -21,6 +21,7 @@ const char* type_name(int64_t tag) {
     case KT_OBJECT: return "object";
     case KT_SET: return "set";
     case KT_FILE: return "file";
+    case KT_PYOBJ: return "pyobject";
     default: return "?";
     }
 }
@@ -58,6 +59,7 @@ std::string format_float(double d) {
 
 std::string value_str(const KamiValue* v) {
     switch (v->tag) {
+    case KT_PYOBJ: return pyobj_str(v);
     case KT_NONE: return "None";
     case KT_BOOL: return v->i ? "True" : "False";
     case KT_INT: return std::to_string(v->i);
@@ -280,6 +282,7 @@ int32_t kami_truthy(const KamiValue* v) {
     case KT_LIST: return ((KamiList*)v->p)->len != 0;
     case KT_MAP:
     case KT_SET: return ((KamiMap*)v->p)->count != 0;
+    case KT_PYOBJ: return pyobj_truthy(v);
     default: return 1;
     }
 }

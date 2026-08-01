@@ -154,6 +154,9 @@ void gc_collect() {
             case KT_FUNC: free(((KamiFuncObj*)h)->captures); break;
             case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
+            case KT_PYOBJ:
+                pyobj_finalize(h);
+                break;
             case KT_THREAD: {
                 ThreadData* td = ((KamiThreadObj*)h)->td;
                 if (td) {

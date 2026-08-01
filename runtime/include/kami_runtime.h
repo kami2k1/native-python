@@ -38,6 +38,7 @@ enum KamiTag : int64_t {
     KT_SET = 11,
     KT_FILE = 12,
     KT_SOCKET = 13,
+    KT_PYOBJ = 14, // CPython object bridged through the embedded C-API layer
 };
 
 enum KamiBinOp : int64_t {
@@ -135,6 +136,14 @@ void kami_raise(const KamiValue* msg);
 void kami_rethrow(void);
 // Top-level entry: runs the module body, catching runtime errors.
 void kami_run_module(void* module_fn);
+
+// --- CPython C-API bridge (pycapi.cpp) ---
+// Imports a real CPython extension module (.so/.pyd) through the system's
+// libpython and wraps it as a KT_PYOBJ value. Attribute access, calls and
+// method calls on KT_PYOBJ values are bridged automatically.
+void kami_pyext_import(KamiValue* out, const char* name);
+// getattr(module, name) → global (used for `from _hashlib import ...`).
+void kami_pyext_getattr(KamiValue* out, const KamiValue* module, const char* name);
 
 // --- diagnostics ---
 void kami_panic(const char* msg);

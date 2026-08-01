@@ -62,6 +62,10 @@ void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
 void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name) {
     Lock lk(g_lock);
     KamiValue o = *obj;
+    if (o.tag == KT_PYOBJ) { // bridged CPython object
+        pyobj_attr_get(out, &o, name);
+        return;
+    }
     if (o.tag == KT_OBJECT) {
         KamiInstance* in = (KamiInstance*)o.p;
         auto it = in->fields->find(name);

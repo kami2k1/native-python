@@ -136,6 +136,7 @@ struct Stmt {
     int raise_mode = 0;
     bool relative = false; // FromImport: leading-dot relative import
     bool star = false;     // FromImport: `from X import *`
+    bool pyext = false;    // Import/FromImport resolved to a CPython extension
     std::vector<ExprPtr> decorators;  // FuncDef/ClassDef decorator expressions
     bool is_closure = false;          // FuncDef compiled with a %captures param
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)

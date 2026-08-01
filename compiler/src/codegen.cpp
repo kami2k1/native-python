@@ -1405,9 +1405,31 @@ struct FnGen {
         case StmtKind::With:
             gen_with(s);
             break;
-        case StmtKind::Pass:
         case StmtKind::Import:
+            if (s->pyext) { // bridged CPython extension module
+                int t = alloc_temp();
+                emit("call void @kami_pyext_import(ptr " + slot_ptr(t) + ", ptr " +
+                     str_const(s->name) + ")");
+                emit("call void @kami_global_set(i64 " + std::to_string(s->global_idx) +
+                     ", ptr " + slot_ptr(t) + ")");
+            }
+            break;
         case StmtKind::FromImport:
+            if (s->pyext) { // from _hashlib import openssl_sha256, ...
+                int t = alloc_temp();
+                emit("call void @kami_pyext_import(ptr " + slot_ptr(t) + ", ptr " +
+                     str_const(s->name) + ")");
+                for (size_t i = 0; i < s->import_names.size(); i++) {
+                    int u = alloc_temp();
+                    emit("call void @kami_pyext_getattr(ptr " + slot_ptr(u) + ", ptr " +
+                         slot_ptr(t) + ", ptr " + str_const(s->import_names[i].first) +
+                         ")");
+                    emit("call void @kami_global_set(i64 " +
+                         std::to_string(s->multi_tidx[i]) + ", ptr " + slot_ptr(u) + ")");
+                }
+            }
+            break;
+        case StmtKind::Pass:
         case StmtKind::Global:
             break;
         }
@@ -1882,6 +1904,8 @@ declare void @kami_method(ptr, ptr, ptr, ptr, i64)
 declare void @kami_builtin(i64, ptr, ptr, i64)
 declare void @kami_call_star(ptr, ptr, ptr, ptr)
 declare void @kami_str_iadd(ptr, ptr)
+declare void @kami_pyext_import(ptr, ptr)
+declare void @kami_pyext_getattr(ptr, ptr, ptr)
 declare void @kami_map_merge(ptr, ptr)
 declare void @kami_panic(ptr)
 declare i32 @kami_range_cond(ptr, ptr, ptr)

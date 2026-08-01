@@ -117,6 +117,33 @@ static bool noop_module(const std::string& name) {
            name == "dataclasses" || name == "collections.abc";
 }
 
+// CPython C extension modules bridged through the embedded C-API layer
+// (pycapi.cpp): the compiled program loads the machine's real libpython at
+// runtime and lets CPython's import machinery link the original .so/.pyd.
+// Extend with KAMIPY_PYEXT=mod1,mod2 at compile time.
+static bool pyext_module(const std::string& name) {
+    static const std::set<std::string> known = {
+        "_hashlib",  "_ssl",       "_sqlite3",     "zlib",     "_bz2",
+        "_lzma",     "_zoneinfo",  "unicodedata",  "pyexpat",  "_elementtree",
+        "_decimal",  "_json",      "_csv",         "_pickle",  "_datetime",
+        "_multiprocessing", "select", "termios",   "readline", "_curses",
+        "_uuid",     "_lsprof",    "audioop",      "_crypt",   "mmap",
+    };
+    if (known.count(name)) return true;
+    if (const char* extra = getenv("KAMIPY_PYEXT")) {
+        std::string s = extra;
+        size_t p = 0;
+        while (p <= s.size()) {
+            size_t c = s.find(',', p);
+            std::string tok = s.substr(p, c == std::string::npos ? c : c - p);
+            if (tok == name) return true;
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+    }
+    return false;
+}
+
 // Modules whose members are C functions rather than Python ones: the C
 // extensions CPython's own library is built on, plus the two FFI front ends.
 static bool ffi_module(const std::string& name) { return is_ffi_module(name); }
@@ -353,6 +380,14 @@ struct Sema {
             for (auto& extra : s->body) register_import(extra.get());
             return;
         }
+        if (pyext_module(modname)) {
+            // Bridged CPython extension: the module becomes an ordinary global
+            // holding a KT_PYOBJ; codegen emits the runtime import here.
+            s->pyext = true;
+            s->global_idx = global_slot(s->alias.empty() ? modname : s->alias);
+            for (auto& extra : s->body) register_import(extra.get());
+            return;
+        }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {
             if (try_depth > 0) return; // try: import X / except ImportError: pass
             err(s->line, unknown_module_msg(modname));
@@ -406,6 +441,14 @@ struct Sema {
         if (ffi_module(modname)) {
             // `from ctypes import CDLL` / `from cffi import FFI`
             for (auto& [n, alias] : s->import_names) ffi_names[alias] = modname + "." + n;
+            return;
+        }
+        if (pyext_module(modname)) {
+            // `from _hashlib import openssl_sha256`: each name becomes a
+            // global bound to getattr(module, name) at this point at runtime.
+            s->pyext = true;
+            for (auto& [n, alias] : s->import_names)
+                s->multi_tidx.push_back(global_slot(alias));
             return;
         }
         if (modname.find('.') != std::string::npos || !modules().count(modname)) {

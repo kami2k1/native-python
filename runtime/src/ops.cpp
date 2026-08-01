@@ -602,6 +602,9 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             } else if (nargs != 0) {
                 panic(std::string(c->name) + "() takes no arguments");
             }
+        } else if (fn->tag == KT_PYOBJ) {
+            pyobj_call(out, fn, argv, nargs);
+            return;
         } else {
             if (fn->tag != KT_FUNC)
                 panic(std::string("'") + type_name(fn->tag) + "' object is not callable");
@@ -729,6 +732,10 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
         std::unique_lock<std::recursive_mutex> lk(g_lock);
         KamiValue o = *obj;
         std::string m = name;
+        if (o.tag == KT_PYOBJ) { // bridged CPython object: dispatch through the C-API
+            pyobj_method(out, obj, m, argv, nargs);
+            return;
+        }
         if (o.tag == KT_LIST) {
             KamiList* l = (KamiList*)o.p;
             if (m == "append" && nargs == 1) {

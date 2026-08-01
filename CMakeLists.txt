@@ -33,9 +33,13 @@ add_library(kamirt STATIC
     runtime/src/http_client.cpp
     runtime/src/kami_regex.cpp
     runtime/src/syscalls.cpp
+    runtime/src/pycapi.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
+if(NOT WIN32)
+    target_link_libraries(kamirt PUBLIC ${CMAKE_DL_LIBS})
+endif()
 if(WIN32)
     # winhttp: native HTTP/HTTPS client for `requests` (TLS via SChannel)
     target_link_libraries(kamirt PUBLIC ws2_32 winhttp)

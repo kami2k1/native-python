@@ -100,6 +100,11 @@ struct KamiFile {
     bool closed;
 };
 
+struct KamiPyObj {
+    ObjHeader h;
+    void* obj; // PyObject* (owned reference)
+};
+
 struct KamiSocket {
     ObjHeader h;
     int64_t fd;
@@ -212,6 +217,16 @@ std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);
 std::string& tls_error();                    // last caught error message (per thread)
+
+// CPython bridge (pycapi.cpp). All take the runtime lock themselves or are
+// called with it held as documented.
+void pyobj_finalize(ObjHeader* h);                                  // GC sweep
+void pyobj_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
+void pyobj_method(KamiValue* out, KamiValue* obj, const std::string& m,
+                  KamiValue** argv, int64_t nargs);
+void pyobj_call(KamiValue* out, const KamiValue* fn, KamiValue** argv, int64_t nargs);
+std::string pyobj_str(const KamiValue* v);
+int32_t pyobj_truthy(const KamiValue* v);
 
 [[noreturn]] void panic(const std::string& msg); // throws KamiError
 
