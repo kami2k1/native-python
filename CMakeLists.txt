@@ -28,8 +28,7 @@ add_library(kamirt STATIC
     runtime/src/collections.cpp
     runtime/src/ops.cpp
     runtime/src/objects.cpp
-    runtime/src/netio.cpp
-    runtime/src/kami_regex.cpp
+    runtime/src/syscalls.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
@@ -44,6 +43,7 @@ add_library(kamipy_core STATIC
     compiler/src/lexer.cpp
     compiler/src/parser.cpp
     compiler/src/sema.cpp
+    compiler/src/modules.cpp
     compiler/src/codegen.cpp
     compiler/src/driver.cpp
 )
@@ -54,6 +54,14 @@ target_link_libraries(kamipy PRIVATE kamipy_core)
 
 # kamipy expects libkamirt.a next to its own binary
 add_dependencies(kamipy kamirt)
+
+# ---- Python standard library ----
+# stdlib/*.py is compiled from source by kamipy on every "import", so it must
+# travel with the binary. In a build tree kamipy finds ../stdlib on its own; the
+# install layout puts it under lib/kamipy/stdlib (see stdlib_search_dirs()).
+install(TARGETS kamipy RUNTIME DESTINATION bin)
+install(TARGETS kamirt ARCHIVE DESTINATION bin)
+install(DIRECTORY stdlib/ DESTINATION lib/kamipy/stdlib FILES_MATCHING PATTERN "*.py")
 
 # ---- tests ----
 enable_testing()
@@ -70,3 +78,10 @@ add_test(NAME integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_tests.sh
                  $<TARGET_FILE:kamipy>)
 set_tests_properties(integration PROPERTIES TIMEOUT 600)
+
+# Same programs, but the GC collects before every allocation: an unrooted value
+# fails immediately and reproducibly instead of corrupting the heap later.
+add_test(NAME gc_stress
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_gc_stress.sh
+                 $<TARGET_FILE:kamipy>)
+set_tests_properties(gc_stress PROPERTIES TIMEOUT 1800)

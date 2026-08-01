@@ -1,0 +1,35 @@
+{"name": "kami", "nums": [1, 2, 3], "nested": {"ok": true, "x": null}, "pi": 3.5}
+kami 3 True 3.5
+[1, "two", true, null, 2.5]
+{} []
+{"a": 2, "b": 1}
+{
+  "a": [
+    1,
+    {
+      "b": 2
+    }
+  ]
+}
+{"q": "he said \"hi\"\n\ttab"}
+Aé
+-450.0
+[1, 2]
+decode error caught
+a/b/c
+/tmp/x.txt
+z.txt /x/y
+.gz True
+a/c/d
+True False
+True True False
+True
+True
+42
+['note.txt']
+['renamed.txt']
+False
+True fallback
+oserror caught
+0123456789 52
+Hello Wide World

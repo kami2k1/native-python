@@ -37,7 +37,6 @@ enum KamiTag : int64_t {
     KT_OBJECT = 10,
     KT_SET = 11,
     KT_FILE = 12,
-    KT_SOCKET = 13,
 };
 
 enum KamiBinOp : int64_t {

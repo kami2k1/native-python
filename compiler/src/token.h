@@ -38,8 +38,11 @@ struct Token {
 
 struct CompileError : std::runtime_error {
     int line;
+    std::string file; // empty = the file being compiled; set for stdlib modules
     CompileError(int line_, const std::string& msg)
         : std::runtime_error(msg), line(line_) {}
+    CompileError(int line_, const std::string& msg, std::string file_)
+        : std::runtime_error(msg), line(line_), file(std::move(file_)) {}
 };
 
 const char* tok_name(Tok t);

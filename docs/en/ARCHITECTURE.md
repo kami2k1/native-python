@@ -337,19 +337,67 @@ KIR ──codegen──▶ LLVM IR ──llc/TargetMachine──▶ .o (x86-64 o
 
 ---
 
-## 9. Import system (PHASE 10 — design)
+## 9. Import system and the standard library
 
-**Static imports**, no dynamic runtime importing:
+**Static imports**, no dynamic runtime importing — and, since v0.6.0, one firm rule:
+
+> **Translate, don't rewrite.** The compiler's job is to translate Python source
+> into native code, not to reimplement Python's libraries in C++.
 
 ```
-import math
-   │ resolve: stdlib first, then files next to main.py
-   ▼ compile module (recursively; cycles detected → error)
-   ▼ each module → its own LLVM module / object, symbols prefixed kami_mod_<name>_
-   ▼ link everything into one executable
+import re
+   │ resolve: <input dir>/re.py, then $KAMIPY_STDLIB or <kamipy>/../stdlib/re.py
+   ▼ lex + parse the module's own Python source
+   ▼ recurse into its imports (dependencies first; cycles → error)
+   ▼ rename module-level names into a namespace:  match → re__match
+   ▼ splice the statements in front of the main body → one AST → one LLVM module
 ```
 
-The stdlib (`math`, `json`, `filesystem`, `time`, `random`) is written in C++ inside `libkamirt` and exposed through a symbol table so the semantic analyzer knows function signatures.
+So `re`, `json`, `logging`, `os`, `os.path`, `socket`, `requests` and `string` are
+**Python files under `stdlib/`**. They are compiled exactly like user code: a
+program that imports `re` gets a native, statically linked regex engine because
+the engine's Python source was translated, not because C++ code was linked in.
+
+### 9.1 Namespaces without module objects
+
+The language has no runtime module object, so the bundler gives each module a
+compile-time namespace by renaming its module-level bindings:
+
+| In `stdlib/re.py` | After bundling | Referenced as |
+|---|---|---|
+| `def match(...)`  | `def re__match(...)` | `re.match(...)` |
+| `class Pattern`   | `class re__Pattern`  | `re.Pattern` |
+| `_cache = {}`     | `re___cache = {}`    | (module-private) |
+| in `stdlib/os/path.py`: `def join` | `def os_path__join` | `os.path.join(...)` |
+
+The renamer is scope-aware: a function-local name (or a parameter) shadows a
+module-level one and is left untouched, while `global x` re-exposes the
+namespaced global. Because `.` cannot appear in a Python identifier, a program's
+own names can never collide with a module's internals — `def match()` in user
+code and `re.match` coexist. Sema resolves `re.match` / `from re import match as m`
+through the same table, and diagnostics are translated back (`re.findall() takes
+3 argument(s)`, never `re__findall`). Each module's AST lines are shifted into
+their own range so an error inside translated source is reported as
+`stdlib/re.py:57: error: ...`.
+
+### 9.2 What stays native, and why
+
+Only two kinds of C++ remain in `libkamirt`:
+
+1. **The Value model and the GC** — the language itself: tagged values, strings,
+   lists, dicts, sets, objects, operators, mark & sweep (§5, §6).
+2. **C-ABI bindings to the OS** (`runtime/src/syscalls.cpp`, module `_kami`) —
+   one-line forwards to libc: `open/read/write/close/lseek`, `stat/mkdir/rmdir/
+   unlink/rename/getcwd/chdir`, `opendir/readdir`, `socket/connect/bind/listen/
+   accept/send/recv/setsockopt`, `getenv/system/getpid/localtime`.
+
+The dividing line: *if it cannot be written in Python because it needs a struct
+the language cannot express (`sockaddr`, `struct stat`, `DIR*`), it is a binding;
+otherwise it is Python.* `socket.py` is a Python class holding an integer file
+descriptor; `requests.py` speaks HTTP/1.1 over that class; `logging.py` renders
+records and writes them with `_kami.fd_write`. `math`, `time`, `random` and
+`threading` remain native because they *are* direct libm / libc / `std::thread`
+bindings.
 
 ---
 
@@ -436,3 +484,45 @@ The v0.1 implementation (see `CHANGELOG.md`, v0.1.0) intentionally deviates from
 3. **Threading uses a GIL model** like CPython: every runtime call holds one global lock; `sleep/join` release it while blocked. Key optimization: while a program has not spawned any thread, the lock is **skipped entirely** (the flag flips permanently at the first spawn — a race-free transition because exactly one thread exists at that moment and it holds the real lock). Result: ~2× faster single-threaded code, still-correct multithreading.
 4. **Codegen emits textual LLVM IR (`.ll`) and invokes `clang++`** as the backend + linker driver (via `fork/execvp`, never through a shell). Simple, robust across LLVM versions, and still a genuine LLVM pipeline. In-process `TargetMachine` is a future optimization.
 5. **The AST uses `unique_ptr` (RAII)** instead of an arena — a compiler-performance detail with no semantic impact.
+
+---
+
+## 16. v0.6.0: "translate, don't rewrite" (as-built)
+
+v0.3–v0.5 grew a C++ implementation of the standard library inside the runtime:
+`runtime/src/netio.cpp` held a JSON parser, a logging formatter, `os`/`os.path`
+wrappers over `std::filesystem`, a socket object model and an HTTP client that
+shelled out to `curl`; `runtime/src/kami_regex.cpp` held a hand-written regex
+engine. Both files are gone.
+
+| | before (v0.5) | after (v0.6) |
+|---|---|---|
+| stdlib implementation | ~1 500 lines of C++ in the runtime | ~1 800 lines of Python in `stdlib/` |
+| `re` | hand-written C++ engine | `stdlib/re.py`, backtracking with an explicit continuation chain |
+| `requests` | `fork` + `curl` subprocess | `stdlib/requests.py` speaking HTTP/1.1 over `stdlib/socket.py` |
+| `socket` | `KT_SOCKET` heap type + C++ methods | Python class over an integer fd |
+| `json`, `logging`, `os`, `os.path`, `string` | C++ builtin ids | Python modules |
+| module namespaces | flat splice (`utils.f` → `f`) | renamed namespace (`re.match` → `re__match`) |
+| runtime tags | `KT_SOCKET` | removed |
+| hello-world binary | 306 KB | 199 KB |
+
+Consequences worth knowing:
+
+- **Correctness improved.** Two bugs disappeared with the C++ they lived in: a
+  heap corruption in the old `re.findall` GC rooting, and the old `re`'s
+  divergence from CPython. The Python engine is checked byte-for-byte against
+  CPython in CI.
+- **A GC bug was found and fixed.** Allocation-heavy Python exposed a rooting
+  order violation in the runtime: `out->tag = KT_STR` was written *before*
+  `str_new()`, so a collection triggered by that very allocation would follow the
+  slot's stale payload as a pointer. All such sites now allocate first and
+  publish afterwards (`put_str`), and `KAMIPY_GC_STRESS=1` (collect before every
+  allocation) is a CI test.
+- **Regex is slower.** `re.findall(r"\d+", ...)` over 400 KB of text takes ~0.9 s
+  versus ~0.06 s for the deleted C++ engine — the honest price of running the
+  same algorithm the same way CPython does. Native compilation still puts it in
+  the same league as CPython's C engine for small inputs, and the matcher has a
+  single-character fast path plus a first-atom scan filter.
+- **HTTPS is not supported** by `requests`. The old client inherited TLS from
+  `curl`; a Python client needs a TLS library binding, which does not exist yet,
+  so `https://` raises a clear error instead of silently downgrading.

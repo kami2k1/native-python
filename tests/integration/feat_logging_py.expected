@@ -1,0 +1,9 @@
+INFO|root|plain message
+INFO|root|queue has 3 items (42.50% done)
+WARNING|root|careful: disk almost full
+ERROR|root|failed with code 7
+CRITICAL|root|meltdown
+INFO|app|hello from app
+ERROR|app|still visible
+WARNING DEBUG
+False

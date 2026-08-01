@@ -93,13 +93,6 @@ struct KamiFile {
     bool closed;
 };
 
-struct KamiSocket {
-    ObjHeader h;
-    int64_t fd;
-    bool closed;
-    double timeout; // seconds; <0 = blocking
-};
-
 // Runtime error used for Python-level exceptions (try/except).
 struct KamiError {
     std::string msg;
@@ -156,16 +149,24 @@ void map_set(KamiMap* m, const KamiValue* k, const KamiValue* v); // lock held
 bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out);     // lock held
 bool map_del(KamiMap* m, const KamiValue* k);                     // lock held
 uint64_t value_hash(const KamiValue* v);
+
+// Publishing a fresh heap object into a Value must happen AFTER the allocation.
+// `out` is usually a registered GC root (a frame slot, a global, a list item):
+// if it were tagged KT_STR while `p` still held the previous payload — often a
+// small integer — a collection triggered by the allocation itself would follow
+// that payload as a pointer. Allocate, then tag.
+inline void put_str(KamiValue* out, const char* data, int64_t len) {
+    KamiStr* s = str_new(data, len);
+    out->tag = KT_STR;
+    out->p = s;
+}
+inline void put_str(KamiValue* out, const std::string& s) {
+    put_str(out, s.data(), (int64_t)s.size());
+}
 bool value_eq(const KamiValue* a, const KamiValue* b);
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
 
 std::string format_float(double d);
-std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs);
-void json_loads(KamiValue* out, const std::string& text);          // lock held
-std::string json_dumps(const KamiValue* v);                        // lock held
-KamiClassObj* internal_class(const char* name);                    // lock held
-void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
-                   const std::string& m, KamiValue** argv, int64_t nargs);
 std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);

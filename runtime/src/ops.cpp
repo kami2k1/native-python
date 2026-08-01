@@ -119,8 +119,7 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
             KamiStr* x = (KamiStr*)a->p;
             std::string s;
             for (int64_t i = 0; i < b->i; i++) s.append(x->data, (size_t)x->len);
-            out->tag = KT_STR;
-            out->p = str_new(s.data(), (int64_t)s.size());
+            put_str(out, s.data(), (int64_t)s.size());
             return;
         }
         panic(std::string("unsupported operand types for *: '") + type_name(a->tag) +
@@ -603,8 +602,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 for (char& c : sv)
                     c = m == "upper" ? (char)toupper((unsigned char)c)
                                      : (char)tolower((unsigned char)c);
-                out->tag = KT_STR;
-                out->p = str_new(sv.data(), (int64_t)sv.size());
+                put_str(out, sv.data(), (int64_t)sv.size());
                 return;
             }
             if ((m == "strip" || m == "lstrip" || m == "rstrip") && nargs == 0) {
@@ -614,8 +612,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 std::string r = b == std::string::npos || e == std::string::npos
                                     ? ""
                                     : sv.substr(b, e - b + 1);
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if (m == "capitalize" && nargs == 0) {
@@ -623,8 +620,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 for (size_t k = 0; k < r.size(); k++)
                     r[k] = k == 0 ? (char)toupper((unsigned char)r[k])
                                   : (char)tolower((unsigned char)r[k]);
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if (m == "title" && nargs == 0) {
@@ -639,8 +635,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                         start = true;
                     }
                 }
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if ((m == "isupper" || m == "islower" || m == "isspace") && nargs == 0) {
@@ -669,8 +664,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 }
                 while ((int64_t)(sign.size() + r.size()) < w) r = "0" + r;
                 r = sign + r;
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if (m == "split" && nargs <= 1) {
@@ -685,8 +679,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                         size_t b = i;
                         while (i < sv.size() && !isspace((unsigned char)sv[i])) i++;
                         if (i > b) {
-                            tmp.tag = KT_STR;
-                            tmp.p = str_new(sv.data() + b, (int64_t)(i - b));
+                            put_str(&tmp, sv.data() + b, (int64_t)(i - b));
                             list_push(r, &tmp);
                         }
                     }
@@ -700,8 +693,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                         size_t f = sv.find(ss, pos);
                         std::string piece =
                             f == std::string::npos ? sv.substr(pos) : sv.substr(pos, f - pos);
-                        tmp.tag = KT_STR;
-                        tmp.p = str_new(piece.data(), (int64_t)piece.size());
+                        put_str(&tmp, piece.data(), (int64_t)piece.size());
                         list_push(r, &tmp);
                         if (f == std::string::npos) break;
                         pos = f + ss.size();
@@ -719,8 +711,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                     KamiStr* it = (KamiStr*)l->items[i].p;
                     r.append(it->data, (size_t)it->len);
                 }
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if (m == "replace" && nargs == 2) {
@@ -742,8 +733,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                     r += sb;
                     pos = f + sa.size();
                 }
-                out->tag = KT_STR;
-                out->p = str_new(r.data(), (int64_t)r.size());
+                put_str(out, r.data(), (int64_t)r.size());
                 return;
             }
             if ((m == "startswith" || m == "endswith") && nargs == 1) {
@@ -858,9 +848,6 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                 out->tag = KT_NONE; out->i = 0;
                 return;
             }
-        } else if (o.tag == KT_SOCKET) {
-            socket_method(lk, out, obj, m, argv, nargs);
-            return;
         } else if (o.tag == KT_FILE) {
             KamiFile* f = (KamiFile*)o.p;
             FILE* fp = (FILE*)f->fp;
@@ -877,8 +864,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                     size_t got;
                     while ((got = fread(buf, 1, sizeof buf, fp)) > 0) data.append(buf, got);
                 }
-                out->tag = KT_STR;
-                out->p = str_new(data.data(), (int64_t)data.size());
+                put_str(out, data.data(), (int64_t)data.size());
                 return;
             }
             if (m == "readline" && nargs == 0) {
@@ -888,8 +874,7 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
                     line += (char)c;
                     if (c == '\n') break;
                 }
-                out->tag = KT_STR;
-                out->p = str_new(line.data(), (int64_t)line.size());
+                put_str(out, line.data(), (int64_t)line.size());
                 return;
             }
             if (m == "readlines" && nargs == 0) {
@@ -919,66 +904,6 @@ void kami_method(KamiValue* out, KamiValue* obj, const char* name, KamiValue** a
             }
         } else if (o.tag == KT_OBJECT) {
             KamiInstance* in = (KamiInstance*)o.p;
-            const char* cn = in->cls->name;
-            if (strcmp(cn, "Match") == 0) {
-                KamiValue gv;
-                auto it = in->fields->find("__groups__");
-                if (it == in->fields->end()) panic("bad Match object");
-                gv = it->second;
-                KamiList* groups = (KamiList*)gv.p;
-                auto grp = [&](int64_t idx) -> KamiList* {
-                    if (idx < 0 || idx >= groups->len)
-                        panic("no such group " + std::to_string(idx));
-                    return (KamiList*)groups->items[idx].p;
-                };
-                if (m == "group") {
-                    int64_t idx = nargs == 0 ? 0 : (argv[0]->tag == KT_INT ? argv[0]->i : 0);
-                    KamiList* tri = grp(idx);
-                    if (tri->items[0].i < 0) { out->tag = KT_NONE; out->i = 0; }
-                    else *out = tri->items[2];
-                    return;
-                }
-                if (m == "groups" && nargs == 0) {
-                    KamiList* r = list_new(groups->len);
-                    out->tag = KT_LIST; out->p = r;
-                    for (int64_t i = 1; i < groups->len; i++) {
-                        KamiList* tri = (KamiList*)groups->items[i].p;
-                        if (tri->items[0].i < 0) {
-                            KamiValue none{KT_NONE, {0}};
-                            r->items[r->len++] = none;
-                        } else {
-                            r->items[r->len++] = tri->items[2];
-                        }
-                    }
-                    return;
-                }
-                if ((m == "start" || m == "end") && nargs <= 1) {
-                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
-                    KamiList* tri = grp(idx);
-                    out->tag = KT_INT;
-                    out->i = tri->items[m == "start" ? 0 : 1].i;
-                    return;
-                }
-                if (m == "span" && nargs <= 1) {
-                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
-                    KamiList* tri = grp(idx);
-                    KamiList* r = list_new(2);
-                    r->items[0] = tri->items[0];
-                    r->items[1] = tri->items[1];
-                    r->len = 2;
-                    out->tag = KT_LIST; out->p = r;
-                    return;
-                }
-                panic(std::string("Match object has no method '") + m + "'");
-            }
-            if (strcmp(cn, "Response") == 0 && m == "json" && nargs == 0) {
-                auto it = in->fields->find("text");
-                if (it == in->fields->end() || it->second.tag != KT_STR)
-                    panic("Response has no text to decode");
-                KamiStr* t = (KamiStr*)it->second.p;
-                json_loads(out, std::string(t->data, (size_t)t->len));
-                return;
-            }
             KamiValue* mv = nullptr;
             bool bound = false;
             auto it = in->fields->find(m);

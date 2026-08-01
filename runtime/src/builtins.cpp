@@ -12,10 +12,8 @@
 
 namespace kami {
 
-bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
-                    KamiValue** argv, int64_t nargs);
-void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
-                   const std::string& m, KamiValue** argv, int64_t nargs);
+bool dispatch_syscall(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
+                      KamiValue** argv, int64_t nargs);
 
 static double arg_num(KamiValue* v, const char* fn) {
     if (v->tag == KT_INT || v->tag == KT_BOOL) return (double)v->i;
@@ -264,11 +262,10 @@ static void builtin_join(std::unique_lock<std::recursive_mutex>& lk, KamiValue* 
 // ---- conversions ----
 static void builtin_str(KamiValue* out, KamiValue* v) {
     std::string s = value_str(v);
-    out->tag = KT_STR;
-    out->p = str_new(s.data(), (int64_t)s.size());
+    put_str(out, s.data(), (int64_t)s.size());
 }
 
-static void builtin_int(KamiValue* out, KamiValue* v) {
+static void builtin_int(KamiValue* out, KamiValue* v, int base) {
     switch (v->tag) {
     case KT_BOOL:
     case KT_INT: set_int(out, v->i); return;
@@ -276,7 +273,7 @@ static void builtin_int(KamiValue* out, KamiValue* v) {
     case KT_STR: {
         KamiStr* s = (KamiStr*)v->p;
         char* end = nullptr;
-        long long r = strtoll(s->data, &end, 10);
+        long long r = strtoll(s->data, &end, base);
         while (end && *end == ' ') end++;
         if (end == s->data || (end && *end != '\0'))
             panic(std::string("invalid literal for int(): '") + s->data + "'");
@@ -332,7 +329,16 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         }
     }
     case KB_STR: check_arity(nargs, 1, 1, "str"); builtin_str(out, argv[0]); return;
-    case KB_INT: check_arity(nargs, 1, 1, "int"); builtin_int(out, argv[0]); return;
+    case KB_INT: {
+        check_arity(nargs, 1, 2, "int");
+        int base = 10;
+        if (nargs == 2) {
+            base = (int)arg_int(argv[1], "int");
+            if (base != 0 && (base < 2 || base > 36)) panic("int() base must be 0 or 2..36");
+        }
+        builtin_int(out, argv[0], base);
+        return;
+    }
     case KB_FLOAT: check_arity(nargs, 1, 1, "float"); builtin_float(out, argv[0]); return;
     case KB_ABS: {
         check_arity(nargs, 1, 1, "abs");
@@ -380,15 +386,13 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_CHR: {
         check_arity(nargs, 1, 1, "chr");
         char c = (char)arg_int(argv[0], "chr");
-        out->tag = KT_STR;
-        out->p = str_new(&c, 1);
+        put_str(out, &c, 1);
         return;
     }
     case KB_TYPE: {
         check_arity(nargs, 1, 1, "type");
         const char* n = type_name(argv[0]->tag);
-        out->tag = KT_STR;
-        out->p = str_new(n, (int64_t)strlen(n));
+        put_str(out, n, (int64_t)strlen(n));
         return;
     }
     case KB_RANGE: {
@@ -577,8 +581,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             KamiStr* s = (KamiStr*)v->p;
             for (int64_t i = 0; i < s->len; i++) {
                 KamiValue ch;
-                ch.tag = KT_STR;
-                ch.p = str_new(s->data + i, 1);
+                put_str(&ch, s->data + i, 1);
                 push_pair(i, &ch);
             }
         } else {
@@ -645,8 +648,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         lk.lock();
         if (!line.empty() && line.back() == '\r') line.pop_back();
         (void)got;
-        out->tag = KT_STR;
-        out->p = str_new(line.data(), (int64_t)line.size());
+        put_str(out, line.data(), (int64_t)line.size());
         return;
     }
     case KB_POW: {
@@ -691,8 +693,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         std::string r = neg ? "-" : "";
         r += id == KB_BIN ? "0b" : id == KB_HEX ? "0x" : "0o";
         for (size_t i = digits.size(); i-- > 0;) r += digits[i];
-        out->tag = KT_STR;
-        out->p = str_new(r.data(), (int64_t)r.size());
+        put_str(out, r.data(), (int64_t)r.size());
         return;
     }
     case KB_LIST:
@@ -709,8 +710,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             KamiStr* s2 = (KamiStr*)argv[0]->p;
             for (int64_t i = 0; i < s2->len; i++) {
                 KamiValue ch;
-                ch.tag = KT_STR;
-                ch.p = str_new(s2->data + i, 1);
+                put_str(&ch, s2->data + i, 1);
                 list_push(r, &ch);
             }
         } else {
@@ -772,8 +772,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             spec.assign(s2->data, (size_t)s2->len);
         }
         std::string r = format_value(argv[0], spec);
-        out->tag = KT_STR;
-        out->p = str_new(r.data(), (int64_t)r.size());
+        put_str(out, r.data(), (int64_t)r.size());
         return;
     }
     case KB_NOOP: {
@@ -792,8 +791,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         out->p = r;
         for (int64_t i = 0; i < g_argc; i++) {
             KamiValue v;
-            v.tag = KT_STR;
-            v.p = str_new(g_argv[i], (int64_t)strlen(g_argv[i]));
+            put_str(&v, g_argv[i], (int64_t)strlen(g_argv[i]));
             list_push(r, &v);
         }
         return;
@@ -921,8 +919,38 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         set_none(out);
         return;
     }
+    // ---- map / filter (eager: they return lists) ----
+    case KB_MAP:
+    case KB_FILTER: {
+        const char* fn = id == KB_MAP ? "map" : "filter";
+        check_arity(nargs, 2, 2, fn);
+        KamiValue fnv = *argv[0];
+        KamiValue seq;
+        as_list_pinned(&seq, argv[1]);
+        KamiList* src = (KamiList*)seq.p;
+        KamiList* r = list_new(src->len);
+        out->tag = KT_LIST;
+        out->p = r; // rooted by the caller
+        for (int64_t i = 0; i < src->len; i++) {
+            KamiValue res;
+            KamiValue* a1[1] = {&src->items[i]};
+            if (id == KB_MAP && fnv.tag == KT_NONE) {
+                res = src->items[i];
+            } else {
+                call_user(lk, &fnv, &res, a1, 1);
+                src = (KamiList*)seq.p; // re-read: the GC may have moved on
+                r = (KamiList*)out->p;
+            }
+            if (id == KB_MAP) list_push(r, &res);
+            else if (kami_truthy(&res)) list_push(r, &src->items[i]);
+        }
+        unpin_scratch(&seq);
+        return;
+    }
+    case KB_KWARGS_UNSUPPORTED:
+        panic("keyword arguments are not supported on this call");
     default:
-        if (dispatch_netio(lk, id, out, argv, nargs)) return;
+        if (dispatch_syscall(lk, id, out, argv, nargs)) return;
         panic("unknown builtin id " + std::to_string(id));
     }
 }

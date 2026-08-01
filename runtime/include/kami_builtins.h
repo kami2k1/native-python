@@ -65,23 +65,17 @@ enum KamiBuiltinId : int64_t {
     KB_OPEN,
     KB_WITH_ENTER,
     KB_WITH_EXIT,
-    // os / os.path
-    KB_OS_GETCWD, KB_OS_LISTDIR, KB_OS_REMOVE, KB_OS_MKDIR, KB_OS_MAKEDIRS,
-    KB_OS_RMDIR, KB_OS_RENAME, KB_OS_SYSTEM, KB_OS_GETENV,
-    KB_OSP_EXISTS, KB_OSP_ISFILE, KB_OSP_ISDIR, KB_OSP_JOIN, KB_OSP_BASENAME,
-    KB_OSP_DIRNAME, KB_OSP_GETSIZE, KB_OSP_ABSPATH,
-    // logging (level encoded as first arg by sema)
-    KB_LOG_BASICCONFIG, KB_LOG_LOG,
-    // json
-    KB_JSON_LOADS, KB_JSON_DUMPS,
-    // socket
-    KB_SOCKET_SOCKET,
-    // requests
-    KB_REQUESTS_GET, KB_REQUESTS_POST,
     // functional
     KB_MAP, KB_FILTER,
-    // re
-    KB_RE_MATCH, KB_RE_SEARCH, KB_RE_FULLMATCH, KB_RE_FINDALL, KB_RE_SUB, KB_RE_SPLIT,
+    // ---- module _kami: thin C-ABI bindings to libc / the OS ----------------
+    // The Python standard library (stdlib/*.py) is compiled from source and
+    // reaches the operating system exclusively through these primitives.
+    KB_SYS_FD_OPEN, KB_SYS_FD_READ, KB_SYS_FD_WRITE, KB_SYS_FD_CLOSE, KB_SYS_FD_SEEK,
+    KB_SYS_STAT, KB_SYS_FILESIZE, KB_SYS_LISTDIR, KB_SYS_MKDIR, KB_SYS_RMDIR,
+    KB_SYS_UNLINK, KB_SYS_RENAME, KB_SYS_GETCWD, KB_SYS_CHDIR, KB_SYS_GETENV,
+    KB_SYS_SYSTEM, KB_SYS_GETPID, KB_SYS_ERRMSG, KB_SYS_PLATFORM, KB_SYS_LOCALTIME,
+    KB_SOCK_OPEN, KB_SOCK_CONNECT, KB_SOCK_BIND, KB_SOCK_LISTEN, KB_SOCK_ACCEPT,
+    KB_SOCK_SEND, KB_SOCK_RECV, KB_SOCK_CLOSE, KB_SOCK_TIMEOUT,
     // diagnostics
     KB_KWARGS_UNSUPPORTED,
     KB__COUNT
