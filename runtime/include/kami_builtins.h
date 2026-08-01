@@ -70,18 +70,10 @@ enum KamiBuiltinId : int64_t {
     KB_OS_RMDIR, KB_OS_RENAME, KB_OS_SYSTEM, KB_OS_GETENV,
     KB_OSP_EXISTS, KB_OSP_ISFILE, KB_OSP_ISDIR, KB_OSP_JOIN, KB_OSP_BASENAME,
     KB_OSP_DIRNAME, KB_OSP_GETSIZE, KB_OSP_ABSPATH,
-    // logging (level encoded as first arg by sema)
-    KB_LOG_BASICCONFIG, KB_LOG_LOG,
-    // json
-    KB_JSON_LOADS, KB_JSON_DUMPS,
-    // socket
+    // socket (json / logging / re / requests are Python: see runtime/pylib/)
     KB_SOCKET_SOCKET,
-    // requests
-    KB_REQUESTS_GET, KB_REQUESTS_POST,
     // functional
     KB_MAP, KB_FILTER,
-    // re
-    KB_RE_MATCH, KB_RE_SEARCH, KB_RE_FULLMATCH, KB_RE_FINDALL, KB_RE_SUB, KB_RE_SPLIT,
     // math (v0.5.1 additions)
     KB_MATH_FACTORIAL, KB_MATH_GCD, KB_MATH_ISQRT, KB_MATH_HYPOT, KB_MATH_LOG2,
     KB_MATH_LOG10, KB_MATH_ATAN, KB_MATH_ASIN, KB_MATH_ACOS, KB_MATH_ATAN2,
@@ -95,6 +87,14 @@ enum KamiBuiltinId : int64_t {
     // sys (argv already exists as KB_SYS_ARGV)
     // time (additions)
     KB_TIME_MONOTONIC, KB_TIME_PERF_COUNTER,
+    // core (v0.6.0)
+    KB_REPR, KB_CALLABLE,
+    // threading.Lock / threading.RLock: native OS mutexes
+    KB_THREAD_LOCK, KB_THREAD_RLOCK,
+    // sys: the process' standard streams as file objects
+    KB_SYS_STDOUT, KB_SYS_STDERR,
+    // time: calendar bindings (libc localtime/gmtime/strftime)
+    KB_TIME_LOCALTIME, KB_TIME_GMTIME, KB_TIME_STRFTIME,
     // diagnostics
     KB_KWARGS_UNSUPPORTED,
     // raw C-ABI primitives (runtime/src/syscalls.cpp) — the landing pads for

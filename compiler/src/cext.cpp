@@ -75,13 +75,11 @@ const Modules& cext_modules() {
         m["_math"] = math;
         m["cmath"] = {}; // recognised but empty: complex math is not modelled
 
-        // ---- _json ----------------------------------------------------------
-        m["_json"] = {
-            {"loads", prim(KB_JSON_LOADS, 1, 1)},
-            {"dumps", prim(KB_JSON_DUMPS, 1, 3)},
-            {"scanstring", prim(KB_JSON_LOADS, 1, 3)},
-            {"encode_basestring_ascii", prim(KB_JSON_DUMPS, 1, 1)},
-        };
+        // No _json entry: `json` is a pure-Python module (runtime/pylib/json.py),
+        // so CPython's C accelerator has nothing to bind to. Leaving `_json`
+        // unknown is deliberate — every stdlib importer wraps it in
+        // `try: from _json import ... except ImportError: pass` and takes the
+        // pure-Python path, which is the one we compile.
 
         // ---- _os / posix / nt ------------------------------------------------
         Table os = {

@@ -1,0 +1,22 @@
+enter 0
+exit 0
+enter 1
+exit 1
+enter 2
+exit 2
+enter for0
+exit for0
+enter for1
+exit for1
+enter boom
+exit boom
+caught after exit
+file says: iteration 2
+counter: 8000
+exact: True
+locked before: False
+acquire: True
+locked after: True
+locked released: False
+rlock reentrant ok
+done

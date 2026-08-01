@@ -361,6 +361,147 @@ std::vector<ResolvedModule> resolve_module(const std::string& dotted, const Impo
     return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// Symbol mangling for library modules
+// ---------------------------------------------------------------------------
+// A bundled module's statements are spliced into the program, so its top-level
+// names land in the same global namespace as the user's. For a *library* module
+// that is unacceptable: `logging.py` defines `error`, `info` and `root`, and any
+// program that happens to assign to `error` would silently overwrite the
+// library. So every top-level binding of a library module is renamed with a
+// module prefix ("re" -> std_re_Pattern, std_re_search, ...) and sema maps
+// `re.search` back onto the mangled symbol. Project files keep the flat
+// namespace, which is what makes `from utils import helper` work unchanged.
+
+namespace {
+
+void collect_bindings(const std::vector<StmtPtr>& body, std::set<std::string>& out) {
+    for (const auto& sp : body) {
+        Stmt* s = sp.get();
+        switch (s->kind) {
+        case StmtKind::FuncDef:
+        case StmtKind::ClassDef: out.insert(s->name); break;
+        case StmtKind::Assign:
+            if (!s->name.empty()) out.insert(s->name);
+            break;
+        case StmtKind::MultiAssign:
+            for (auto& t : s->targets)
+                if (t->kind == ExprKind::Name) out.insert(t->sval);
+            break;
+        case StmtKind::For:
+            for (auto& p : s->params) out.insert(p);
+            break;
+        default: break;
+        }
+        // Module-level control flow can bind names too (`if X: A = 1`).
+        if (s->kind == StmtKind::If || s->kind == StmtKind::While ||
+            s->kind == StmtKind::For || s->kind == StmtKind::Try ||
+            s->kind == StmtKind::With) {
+            collect_bindings(s->body, out);
+            collect_bindings(s->orelse, out);
+            collect_bindings(s->final_body, out);
+            for (auto& h : s->handlers) collect_bindings(h.body, out);
+        }
+    }
+}
+
+struct Mangler {
+    const std::set<std::string>& names;
+    const std::string& prefix;
+
+    void rename(std::string& n) const {
+        if (names.count(n)) n = prefix + n;
+    }
+
+    void expr(Expr* e) const {
+        if (!e) return;
+        // Attribute and method names are *not* renamed: `m.group()` must keep
+        // calling `group`, because methods are dispatched by name at runtime.
+        if (e->kind == ExprKind::Name) rename(e->sval);
+        for (auto& p : e->params) rename(p);
+        expr(e->a.get());
+        expr(e->b.get());
+        expr(e->c.get());
+        for (auto& a : e->args) expr(a.get());
+        for (auto& kv : e->kwargs) expr(kv.second.get());
+        for (auto& pr : e->pairs) {
+            expr(pr.first.get());
+            expr(pr.second.get());
+        }
+        for (auto& c : e->clauses) {
+            for (auto& t : c.targets) rename(t);
+            expr(c.iter.get());
+            for (auto& cond : c.conds) expr(cond.get());
+        }
+    }
+
+    void stmts(std::vector<StmtPtr>& body, bool in_class = false) const {
+        for (auto& sp : body) stmt(sp.get(), in_class);
+    }
+
+    void stmt(Stmt* s, bool in_class = false) const {
+        if (!s) return;
+        switch (s->kind) {
+        case StmtKind::Import:
+        case StmtKind::FromImport: return; // module paths are not identifiers
+        case StmtKind::FuncDef:
+            // A method keeps its own name; only module-level functions are
+            // mangled.
+            if (!in_class) rename(s->name);
+            break;
+        case StmtKind::ClassDef:
+            rename(s->name);
+            rename(s->alias); // base class
+            break;
+        case StmtKind::Assign:
+        case StmtKind::For:
+        case StmtKind::Global: rename(s->name); break;
+        default: break;
+        }
+        if (s->kind == StmtKind::For || s->kind == StmtKind::Global ||
+            s->kind == StmtKind::FuncDef)
+            for (auto& p : s->params) rename(p);
+        expr(s->e1.get());
+        expr(s->e2.get());
+        expr(s->e3.get());
+        for (auto& d : s->defaults) expr(d.get());
+        for (auto& d : s->decorators) expr(d.get());
+        for (auto& t : s->targets) expr(t.get());
+        for (auto& v : s->values) expr(v.get());
+        stmts(s->body, s->kind == StmtKind::ClassDef);
+        stmts(s->orelse);
+        stmts(s->final_body);
+        for (auto& h : s->handlers) {
+            rename(h.as_name);
+            stmts(h.body);
+        }
+    }
+};
+
+} // namespace
+
+// Prefix for a library module: "re" -> "std_re_", "os.path" -> "std_os_path_".
+std::string library_prefix(const std::string& dotted) {
+    std::string prefix = "std_" + dotted + "_";
+    for (char& ch : prefix)
+        if (ch == '.') ch = '_';
+    return prefix;
+}
+
+void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix) {
+    std::set<std::string> names;
+    collect_bindings(body, names);
+    // Dunders such as __all__ are provided or ignored by the compiler.
+    for (auto it = names.begin(); it != names.end();) {
+        if (it->size() > 4 && it->compare(0, 2, "__") == 0) it = names.erase(it);
+        else ++it;
+    }
+    if (names.empty()) return;
+    Mangler m{names, prefix};
+    m.stmts(body);
+}
+
 // ---------------------------------------------------------------------------
 // Bundling
 // ---------------------------------------------------------------------------
@@ -473,6 +614,13 @@ struct Bundler {
                 fprintf(stderr, "kamipy: import %s <- %s (%s)\n", name.c_str(),
                         found.path.string().c_str(), origin_name(found.origin));
             process(sub.body); // dependencies of the dependency come first
+            if (found.origin != ModuleOrigin::Project) {
+                // Library code shares the program's global namespace, so keep
+                // its top-level names out of the user's way.
+                std::string prefix = library_prefix(name);
+                mangle_module(sub.body, prefix);
+                mod.module_prefix[name] = prefix;
+            }
             for (auto& sp : sub.body) {
                 if (is_main_guard(sp.get())) continue; // not the main program
                 prelude.push_back(std::move(sp));
@@ -491,6 +639,16 @@ struct Bundler {
 } // namespace
 
 void bundle_imported_modules(Module& mod, const ImportPolicy& pol) {
+    // What the shipped pylib has to offer, so sema can name it when an import
+    // cannot be resolved at all.
+    std::error_code ec;
+    for (const fs::path& dir : pol.pylib_dirs) {
+        for (const fs::path& p : list_dir(dir)) {
+            if (p.extension() == ".py") mod.stdlib_available.insert(p.stem().string());
+            else if (fs::exists(p / "__init__.py", ec))
+                mod.stdlib_available.insert(p.filename().string());
+        }
+    }
     Bundler b(mod, pol);
     b.process(mod.body);
     if (b.prelude.empty()) return;

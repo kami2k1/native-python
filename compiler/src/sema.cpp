@@ -41,6 +41,7 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"exit", {KB_SYS_EXIT, 0, 1}}, {"quit", {KB_SYS_EXIT, 0, 1}},
         {"set", {KB_SET, 0, 1}}, {"open", {KB_OPEN, 1, 2}},
         {"map", {KB_MAP, 2, 2}}, {"filter", {KB_FILTER, 2, 2}},
+        {"repr", {KB_REPR, 1, 1}}, {"callable", {KB_CALLABLE, 1, 1}},
     };
     return b;
 }
@@ -65,7 +66,10 @@ modules() {
               {"isinf", {KB_MATH_ISINF, 1, 1}}}},
             {"time", {{"time", {KB_TIME_TIME, 0, 0}}, {"sleep", {KB_TIME_SLEEP, 1, 1}},
                       {"monotonic", {KB_TIME_MONOTONIC, 0, 0}},
-                      {"perf_counter", {KB_TIME_PERF_COUNTER, 0, 0}}}},
+                      {"perf_counter", {KB_TIME_PERF_COUNTER, 0, 0}},
+                      {"localtime", {KB_TIME_LOCALTIME, 0, 1}},
+                      {"gmtime", {KB_TIME_GMTIME, 0, 1}},
+                      {"strftime", {KB_TIME_STRFTIME, 1, 2}}}},
             {"random",
              {{"random", {KB_RANDOM_RANDOM, 0, 0}},
               {"randint", {KB_RANDOM_RANDINT, 2, 2}},
@@ -77,11 +81,11 @@ modules() {
               {"sample", {KB_RANDOM_SAMPLE, 2, 2}},
               {"choices", {KB_RANDOM_CHOICES, 1, 2}}}},
             {"threading",
-             {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}}}},
+             {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}},
+              {"Lock", {KB_THREAD_LOCK, 0, 0}}, {"RLock", {KB_THREAD_RLOCK, 0, 0}}}},
             {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
             {"doctest", {{"testmod", {KB_NOOP, 0, 2}}}},
             {"string", {}},
-            {"logging", {}},
             {"os",
              {{"getcwd", {KB_OS_GETCWD, 0, 0}}, {"listdir", {KB_OS_LISTDIR, 0, 1}},
               {"remove", {KB_OS_REMOVE, 1, 1}}, {"unlink", {KB_OS_REMOVE, 1, 1}},
@@ -98,15 +102,7 @@ modules() {
               {"expanduser", {KB_OSP_EXPANDUSER, 1, 1}},
               {"splitext", {KB_OSP_SPLITEXT, 1, 1}}, {"split", {KB_OSP_SPLIT, 1, 1}},
               {"isabs", {KB_OSP_ISABS, 1, 1}}}},
-            {"json",
-             {{"loads", {KB_JSON_LOADS, 1, 1}}, {"dumps", {KB_JSON_DUMPS, 1, 3}}}},
             {"socket", {{"socket", {KB_SOCKET_SOCKET, 0, 2}}}},
-            {"requests",
-             {{"get", {KB_REQUESTS_GET, 1, 3}}, {"post", {KB_REQUESTS_POST, 1, 4}}}},
-            {"re",
-             {{"match", {KB_RE_MATCH, 2, 3}}, {"search", {KB_RE_SEARCH, 2, 3}},
-              {"fullmatch", {KB_RE_FULLMATCH, 2, 3}}, {"findall", {KB_RE_FINDALL, 2, 2}},
-              {"sub", {KB_RE_SUB, 3, 4}}, {"split", {KB_RE_SPLIT, 2, 3}}}},
         };
     return m;
 }
@@ -188,14 +184,6 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
         if (attr == "SOL_SOCKET") { out = {2, 0, "", 1}; return true; }
         if (attr == "SO_REUSEADDR") { out = {2, 0, "", 2}; return true; }
     }
-    if (mod == "logging") {
-        if (attr == "DEBUG") { out = {2, 0, "", 10}; return true; }
-        if (attr == "INFO") { out = {2, 0, "", 20}; return true; }
-        if (attr == "WARNING" || attr == "WARN") { out = {2, 0, "", 30}; return true; }
-        if (attr == "ERROR") { out = {2, 0, "", 40}; return true; }
-        if (attr == "CRITICAL" || attr == "FATAL") { out = {2, 0, "", 50}; return true; }
-        if (attr == "NOTSET") { out = {2, 0, "", 0}; return true; }
-    }
     if (mod == "string") {
         if (attr == "ascii_lowercase") { out = {1, 0, "abcdefghijklmnopqrstuvwxyz", 0}; return true; }
         if (attr == "ascii_uppercase") { out = {1, 0, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0}; return true; }
@@ -222,16 +210,6 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
     return false;
 }
 
-// Modules that are neither native, nor in the project, nor found in any Python
-// installation on this machine.
-static std::string unknown_module_msg(const std::string& name) {
-    return "unknown module '" + name +
-           "' (built in: math, time, random, threading, sys, os, json, socket, requests, "
-           "logging, string, doctest, re — or put '" + name +
-           ".py' next to your input file; `kamipy paths` lists every directory searched, "
-           "including the auto-discovered Python installations)";
-}
-
 struct FuncEntry {
     Stmt* def;
     int index;
@@ -253,6 +231,8 @@ struct Sema {
     std::unordered_map<std::string, BuiltinSig> from_imports;  // name → builtin
     std::unordered_map<std::string, ModConst> from_consts;     // name → const value
     std::unordered_map<std::string, std::string> user_imports; // alias → bundled local module
+    // `from re import search` on a mangled pylib module: alias → mangled global.
+    std::unordered_map<std::string, std::string> bundled_names;
 
     // ---- C-ABI binding state (see cext.h) ----
     std::unordered_map<std::string, CPrimitive> from_natives; // `from _math import sqrt`
@@ -327,12 +307,40 @@ struct Sema {
         return idx;
     }
 
+    // Symbol prefix of a bundled module ("" for local .py files, which share
+    // the program's flat namespace).
+    const std::string& module_prefix(const std::string& modname) const {
+        static const std::string none;
+        auto it = mod.module_prefix.find(modname);
+        return it == mod.module_prefix.end() ? none : it->second;
+    }
+
     int64_t local_slot(const std::string& name) {
         auto it = locals.find(name);
         if (it != locals.end()) return it->second;
         int64_t idx = (int64_t)locals.size();
         locals.emplace(name, idx);
         return idx;
+    }
+
+    // A module that is neither native, nor in the project, nor found in the
+    // shipped pylib or any Python installation on this machine. Say what *is*
+    // importable, and what to do about a third-party package.
+    std::string unknown_module_msg(const std::string& modname) const {
+        std::set<std::string> avail;
+        for (auto& [name, _] : modules())
+            if (name.find('.') == std::string::npos) avail.insert(name);
+        for (auto& name : mod.stdlib_available) avail.insert(name);
+        std::string list;
+        for (auto& name : avail) list += (list.empty() ? "" : ", ") + name;
+        return "unknown module '" + modname + "'\n" +
+               "  available: " + list + "\n" +
+               "  to use a pure-Python package, put its source (" + modname +
+               ".py, or " + modname + "/__init__.py) next to your input file and it "
+               "will be compiled in ('kamipy paths' lists every directory searched, "
+               "including the auto-discovered Python installations);\n"
+               "  packages that need a CPython C extension (pyautogui, numpy, PIL, "
+               "flask, ...) cannot be compiled ahead of time yet.";
     }
 
     void register_import(Stmt* s) {
@@ -380,11 +388,14 @@ struct Sema {
         }
         if (noop_module(modname)) return; // names are annotation-only
         if (mod.user_modules.count(modname)) {
-            // Bundled local module: its top-level names are already globals in
-            // this module. Plain "from utils import helper" needs no mapping;
-            // "as" renames are not supported yet (would need a rename pass).
+            // Bundled module: its top-level names are already globals in this
+            // program. A mangled pylib module needs an alias entry; for a local
+            // .py file the name is already correct, so only plain (non-"as")
+            // imports work there.
+            const std::string& pfx = module_prefix(modname);
             for (auto& [n, alias] : s->import_names) {
-                if (alias != n)
+                if (!pfx.empty()) bundled_names[alias] = pfx + n;
+                else if (alias != n)
                     err(s->line, "'from " + modname + " import " + n + " as " + alias +
                                      "' — 'as' renames are not supported for bundled "
                                      "local modules yet; use the original name");
@@ -587,7 +598,20 @@ struct Sema {
         s->target_idx = idx;
     }
 
+    // `from json import dumps` where json is a mangled pylib module: rewrite the
+    // alias onto the module's real (prefixed) global. Returns true if renamed.
+    bool rebind_bundled(std::string& name) const {
+        if (bundled_names.empty()) return false;
+        auto bn = bundled_names.find(name);
+        if (bn == bundled_names.end()) return false;
+        if (cur_func && locals.count(name) && !global_decls.count(name)) return false;
+        if (globals.count(name)) return false;
+        name = bn->second;
+        return true;
+    }
+
     void resolve_name(Expr* e) {
+        rebind_bundled(e->sval);
         const std::string& n = e->sval;
         if (cur_func && !global_decls.count(n)) {
             auto it = locals.find(n);
@@ -645,7 +669,7 @@ struct Sema {
         if (cur_func && locals.count(n) && !global_decls.count(n)) return true;
         return globals.count(n) || funcs.count(n) || classes.count(n) ||
                builtins().count(n) || from_imports.count(n) || from_consts.count(n) ||
-               imports.count(n) || user_imports.count(n);
+               imports.count(n) || user_imports.count(n) || bundled_names.count(n);
     }
 
     // Rewrites call kwargs/defaults into plain positional args when the callee
@@ -654,6 +678,19 @@ struct Sema {
         size_t nparams = def->params.size() - (skip_self ? 1 : 0);
         size_t ndefaults = def->defaults.size();
         size_t first_param = skip_self ? 1 : 0;
+        if (def->vararg) {
+            // `def f(a, b, *rest)`: the fixed parameters must all be supplied
+            // positionally; everything after them is handed to the callee as-is
+            // and packed into `rest` by the prologue.
+            size_t nfixed = nparams - 1;
+            if (!e->kwargs.empty())
+                err(e->line, def->name + "() does not accept keyword arguments (it uses *" +
+                                 def->params.back() + ")");
+            if (e->args.size() < nfixed)
+                err(e->line, def->name + "() missing required argument '" +
+                                 def->params[first_param + e->args.size()] + "'");
+            return;
+        }
         std::vector<ExprPtr> final_args(nparams);
         if (e->args.size() > nparams)
             err(e->line, def->name + "() takes " + std::to_string(nparams) +
@@ -746,62 +783,6 @@ struct Sema {
         return c;
     }
 
-    // logging.<method>(...) → KB_LOG_LOG / KB_LOG_BASICCONFIG builtin calls.
-    static int64_t logging_level(const std::string& m) {
-        if (m == "debug") return 10;
-        if (m == "info") return 20;
-        if (m == "warning" || m == "warn") return 30;
-        if (m == "error" || m == "exception") return 40;
-        if (m == "critical" || m == "fatal") return 50;
-        return -1;
-    }
-
-    bool rewrite_logging(Expr* e) {
-        const std::string& m = e->sval;
-        if (m == "basicConfig") {
-            // extract level= and format= from kwargs; ignore the rest
-            ExprPtr level, format;
-            for (auto& [kw, val] : e->kwargs) {
-                if (kw == "level") level = std::move(val);
-                else if (kw == "format") format = std::move(val);
-                // filename/datefmt/etc: accepted and ignored
-            }
-            e->kwargs.clear();
-            e->args.clear();
-            auto none = [&]() {
-                auto n = std::make_unique<Expr>();
-                n->kind = ExprKind::NoneLit;
-                n->line = e->line;
-                return n;
-            };
-            e->args.push_back(level ? std::move(level) : none());
-            e->args.push_back(format ? std::move(format) : none());
-            for (auto& a : e->args) resolve_expr(a.get());
-            become_builtin_call(e, "logging.basicConfig", KB_LOG_BASICCONFIG);
-            return true;
-        }
-        int64_t lv = logging_level(m);
-        if (lv < 0) return false; // getLogger etc: fall through (error later)
-        if (!e->kwargs.empty()) {
-            for (auto& [kw, v] : e->kwargs)
-                if (kw != "exc_info") // logging.exception passes exc_info implicitly
-                    err(e->line, "logging." + m + "() does not accept keyword '" + kw + "'");
-            e->kwargs.clear();
-        }
-        // prepend the level as the first positional argument
-        std::vector<ExprPtr> na;
-        auto lvl = std::make_unique<Expr>();
-        lvl->kind = ExprKind::IntLit;
-        lvl->line = e->line;
-        lvl->ival = lv;
-        na.push_back(std::move(lvl));
-        for (auto& a : e->args) na.push_back(std::move(a));
-        e->args = std::move(na);
-        for (auto& a : e->args) resolve_expr(a.get());
-        become_builtin_call(e, "logging.log", KB_LOG_LOG);
-        return true;
-    }
-
     // ---- C-ABI lowering ----------------------------------------------------
 
     // Remember a C function so codegen can `declare` it and the driver can pass
@@ -892,52 +873,12 @@ struct Sema {
         e->a = std::move(callee);
     }
 
-    // requests.get(url, timeout=..) / requests.post(url, json=.., data=.., timeout=..)
+    // doctest.testmod(verbose=...) is the only remaining module call that must
+    // swallow keyword arguments; everything else now lives in pylib/ as Python.
     bool rewrite_module_kwargs(Expr* e, const std::string& mod, const std::string& fn) {
         if (mod == "doctest" && fn == "testmod") {
-            // no-op function: accept and discard any kwargs (verbose=, ...)
             e->kwargs.clear();
             e->args.clear();
-            return true;
-        }
-        if (mod == "requests" && fn == "get") {
-            ExprPtr timeout;
-            for (auto& [kw, v] : e->kwargs) {
-                if (kw == "timeout") timeout = std::move(v);
-                else if (kw == "headers" || kw == "params" || kw == "verify") continue;
-                else return false;
-            }
-            e->kwargs.clear();
-            if (e->args.size() < 2) e->args.resize(2);
-            if (timeout) e->args[1] = std::move(timeout);
-            for (auto& a : e->args)
-                if (!a) {
-                    a = std::make_unique<Expr>();
-                    a->kind = ExprKind::NoneLit;
-                    a->line = e->line;
-                }
-            for (auto& a : e->args) resolve_expr(a.get());
-            return true;
-        }
-        if (mod == "requests" && fn == "post") {
-            ExprPtr payload, timeout;
-            for (auto& [kw, v] : e->kwargs) {
-                if (kw == "json" || kw == "data") payload = std::move(v);
-                else if (kw == "timeout") timeout = std::move(v);
-                else if (kw == "headers" || kw == "verify") continue;
-                else return false;
-            }
-            e->kwargs.clear();
-            if (e->args.size() < 3) e->args.resize(3);
-            if (payload) e->args[1] = std::move(payload);
-            if (timeout) e->args[2] = std::move(timeout);
-            for (auto& a : e->args)
-                if (!a) {
-                    a = std::make_unique<Expr>();
-                    a->kind = ExprKind::NoneLit;
-                    a->line = e->line;
-                }
-            for (auto& a : e->args) resolve_expr(a.get());
             return true;
         }
         return false;
@@ -1036,7 +977,7 @@ struct Sema {
             // (bundled modules share the program's global namespace).
             if (e->a->kind == ExprKind::Name && user_imports.count(e->a->sval) &&
                 !name_shadowed(e->a->sval)) {
-                std::string attr = e->sval;
+                std::string attr = module_prefix(user_imports.at(e->a->sval)) + e->sval;
                 e->kind = ExprKind::Name;
                 e->sval = attr;
                 e->a.reset();
@@ -1064,15 +1005,21 @@ struct Sema {
                     e->a.reset();
                     return;
                 }
-                if (modname == "sys" && e->sval == "argv") {
-                    // sys.argv → zero-arg builtin call
+                // sys.argv / sys.stdout / sys.stderr are computed values, not
+                // constants: rewrite the attribute into a zero-argument builtin
+                // call so codegen goes through the normal call path.
+                int64_t zero_arg = -1;
+                if (modname == "sys" && e->sval == "argv") zero_arg = KB_SYS_ARGV;
+                else if (modname == "sys" && e->sval == "stdout") zero_arg = KB_SYS_STDOUT;
+                else if (modname == "sys" && e->sval == "stderr") zero_arg = KB_SYS_STDERR;
+                if (zero_arg >= 0) {
                     e->kind = ExprKind::Call;
                     auto callee = std::make_unique<Expr>();
                     callee->kind = ExprKind::Name;
                     callee->line = e->line;
-                    callee->sval = "sys.argv";
+                    callee->sval = "sys." + e->sval;
                     callee->res = Res::BuiltinFunc;
-                    callee->res_idx = KB_SYS_ARGV;
+                    callee->res_idx = zero_arg;
                     e->a = std::move(callee);
                     e->sval.clear();
                     return;
@@ -1108,6 +1055,7 @@ struct Sema {
                 for (auto& kv : e->kwargs) resolve_expr(kv.second.get());
             };
             if (callee->kind == ExprKind::Name) {
+                rebind_bundled(callee->sval);
                 const std::string& n = callee->sval;
                 bool local_shadow = cur_func && locals.count(n) && !global_decls.count(n);
                 if (!local_shadow) {
@@ -1181,17 +1129,12 @@ struct Sema {
                 auto callee = std::make_unique<Expr>();
                 callee->kind = ExprKind::Name;
                 callee->line = e->line;
-                callee->sval = e->sval;
+                callee->sval = module_prefix(user_imports.at(e->a->sval)) + e->sval;
                 e->kind = ExprKind::Call;
                 e->a = std::move(callee);
                 e->sval.clear();
                 resolve_expr(e);
                 return;
-            }
-            // logging.<level>(...) and logging.basicConfig(...) — special forms.
-            if (e->a->kind == ExprKind::Name && imports.count(e->a->sval) &&
-                imports.at(e->a->sval) == "logging" && !name_shadowed(e->a->sval)) {
-                if (rewrite_logging(e)) return;
             }
             // os.path.<fn>(...) — nested-module call: base is Attr(os, "path").
             if (e->a->kind == ExprKind::Attr && e->a->a->kind == ExprKind::Name &&

@@ -8,10 +8,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <mutex>
 #include <random>
 
 namespace kami {
 
+bool dispatch_oslayer(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
+                      KamiValue** argv, int64_t nargs);
 bool dispatch_syscalls(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
                        KamiValue** argv, int64_t nargs);
 void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
@@ -188,6 +192,34 @@ static void call_user(std::unique_lock<std::recursive_mutex>& lk, const KamiValu
     lk.lock();
 }
 
+// print(x) / str(x) / repr(x) on an instance of a Python class must go through
+// its __str__ / __repr__, exactly like CPython. The dunder is user code, so the
+// runtime lock has to be released around the call.
+static std::string display(std::unique_lock<std::recursive_mutex>& lk, KamiValue* v,
+                           bool want_repr) {
+    if (v->tag == KT_OBJECT) {
+        KamiInstance* in = (KamiInstance*)v->p;
+        KamiValue* found = class_lookup(in->cls, want_repr ? "__repr__" : "__str__");
+        if (!found && !want_repr) found = class_lookup(in->cls, "__repr__");
+        if (found) {
+            KamiValue scratch[3];
+            scratch[0] = *found; // the method
+            scratch[1] = *v;     // self
+            scratch[2] = KamiValue{KT_NONE, {0}};
+            g_pins.push_back({scratch, 3});
+            KamiValue* args[1] = {&scratch[1]};
+            lk.unlock();
+            kami_call_value(&scratch[2], &scratch[0], args, 1);
+            lk.lock();
+            std::string text = value_str(&scratch[2]);
+            for (size_t i = g_pins.size(); i-- > 0;)
+                if (g_pins[i].first == scratch) { g_pins.erase(g_pins.begin() + (long)i); break; }
+            return text;
+        }
+    }
+    return want_repr ? value_repr(v) : value_str(v);
+}
+
 static void set_float(KamiValue* out, double d) { out->tag = KT_FLOAT; out->f = d; }
 static void set_int(KamiValue* out, int64_t i) { out->tag = KT_INT; out->i = i; }
 static void set_none(KamiValue* out) { out->tag = KT_NONE; out->i = 0; }
@@ -341,7 +373,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         std::string line;
         for (int64_t i = 0; i < nargs; i++) {
             if (i) line += " ";
-            line += value_str(argv[i]);
+            line += display(lk, argv[i], false);
         }
         line += "\n";
         fwrite(line.data(), 1, line.size(), stdout);
@@ -356,10 +388,29 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         case KT_LIST: set_int(out, ((KamiList*)v->p)->len); return;
         case KT_MAP:
         case KT_SET: set_int(out, ((KamiMap*)v->p)->count); return;
+        case KT_OBJECT: {
+            // len(obj) → obj.__len__(), like CPython.
+            KamiInstance* in = (KamiInstance*)v->p;
+            if (KamiValue* mv = class_lookup(in->cls, "__len__")) {
+                KamiValue fnv = *mv;
+                KamiValue* a2[1] = {v};
+                call_user(lk, &fnv, out, a2, 1);
+                if (out->tag != KT_INT && out->tag != KT_BOOL)
+                    panic("__len__() should return an int");
+                return;
+            }
+            panic(std::string("object of type '") + in->cls->name + "' has no len()");
+        }
         default: panic(std::string("object of type '") + type_name(v->tag) + "' has no len()");
         }
     }
-    case KB_STR: check_arity(nargs, 1, 1, "str"); builtin_str(out, argv[0]); return;
+    case KB_STR: {
+        check_arity(nargs, 1, 1, "str");
+        std::string text = display(lk, argv[0], false);
+        out->tag = KT_STR;
+        out->p = str_new(text.data(), (int64_t)text.size());
+        return;
+    }
     case KB_INT:
         check_arity(nargs, 1, 2, "int");
         if (nargs == 2) {
@@ -904,8 +955,14 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
                 ch.p = str_new(s2->data + i, 1);
                 list_push(r, &ch);
             }
+        } else if (argv[0]->tag == KT_MAP || argv[0]->tag == KT_SET) {
+            // list(dict) → its keys, list(set) → its members (Python semantics)
+            KamiValue seq;
+            kami_iter_prep(&seq, argv[0]);
+            KamiList* src = (KamiList*)seq.p;
+            for (int64_t i = 0; i < src->len; i++) list_push(r, &src->items[i]);
         } else {
-            panic("list() expected a list or str");
+            panic("list() expected an iterable");
         }
         return;
     }
@@ -989,6 +1046,113 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         }
         return;
     }
+    case KB_SYS_STDOUT:
+    case KB_SYS_STDERR: {
+        // The process' standard streams, exposed as ordinary file objects so
+        // that Python code (logging, ...) can write to them. Never closed.
+        check_arity(nargs, 0, 0, "sys.stdout");
+        KamiFile* f = (KamiFile*)gc_alloc(sizeof(KamiFile), KT_FILE);
+        f->fp = id == KB_SYS_STDOUT ? stdout : stderr;
+        f->closed = false;
+        f->no_close = true;
+        out->tag = KT_FILE;
+        out->p = f;
+        return;
+    }
+    case KB_THREAD_LOCK:
+    case KB_THREAD_RLOCK: {
+        check_arity(nargs, 0, 0, "threading.Lock");
+        KamiLock* l = (KamiLock*)gc_alloc(sizeof(KamiLock), KT_LOCK);
+        l->mtx = new std::recursive_timed_mutex();
+        l->reentrant = id == KB_THREAD_RLOCK;
+        l->depth = 0;
+        out->tag = KT_LOCK;
+        out->p = l;
+        return;
+    }
+    case KB_CALLABLE: {
+        check_arity(nargs, 1, 1, "callable");
+        int64_t t = argv[0]->tag;
+        out->tag = KT_BOOL;
+        out->i = t == KT_FUNC || t == KT_CLASS;
+        return;
+    }
+    case KB_REPR: {
+        check_arity(nargs, 1, 1, "repr");
+        std::string r = display(lk, argv[0], true);
+        out->tag = KT_STR;
+        out->p = str_new(r.data(), (int64_t)r.size());
+        return;
+    }
+    case KB_TIME_LOCALTIME:
+    case KB_TIME_GMTIME: {
+        // C-ABI binding to libc localtime/gmtime; returns a 9-element sequence
+        // laid out exactly like CPython's time.struct_time.
+        check_arity(nargs, 0, 1, "time.localtime");
+        time_t t = nargs == 1 ? (time_t)arg_num(argv[0], "time.localtime") : time(nullptr);
+        struct tm tmv{};
+#ifdef _WIN32
+        if (id == KB_TIME_LOCALTIME) localtime_s(&tmv, &t);
+        else gmtime_s(&tmv, &t);
+#else
+        if (id == KB_TIME_LOCALTIME) localtime_r(&t, &tmv);
+        else gmtime_r(&t, &tmv);
+#endif
+        int64_t f[9] = {tmv.tm_year + 1900,
+                        tmv.tm_mon + 1,
+                        tmv.tm_mday,
+                        tmv.tm_hour,
+                        tmv.tm_min,
+                        tmv.tm_sec,
+                        (tmv.tm_wday + 6) % 7, // Python: Monday == 0
+                        tmv.tm_yday + 1,
+                        tmv.tm_isdst > 0 ? 1 : (tmv.tm_isdst == 0 ? 0 : -1)};
+        KamiList* r = list_new(9);
+        out->tag = KT_LIST;
+        out->p = r;
+        for (int i = 0; i < 9; i++) {
+            KamiValue v;
+            v.tag = KT_INT;
+            v.i = f[i];
+            list_push(r, &v);
+        }
+        return;
+    }
+    case KB_TIME_STRFTIME: {
+        // C-ABI binding to libc strftime.
+        check_arity(nargs, 1, 2, "time.strftime");
+        if (argv[0]->tag != KT_STR) panic("time.strftime(): format must be a str");
+        KamiStr* fs = (KamiStr*)argv[0]->p;
+        std::string fmt(fs->data, (size_t)fs->len);
+        struct tm tmv{};
+        if (nargs == 2) {
+            if (argv[1]->tag != KT_LIST || ((KamiList*)argv[1]->p)->len < 9)
+                panic("time.strftime(): expected a 9-element time tuple");
+            KamiList* l = (KamiList*)argv[1]->p;
+            auto gi = [&](int i) { return (int)l->items[i].i; };
+            tmv.tm_year = gi(0) - 1900;
+            tmv.tm_mon = gi(1) - 1;
+            tmv.tm_mday = gi(2);
+            tmv.tm_hour = gi(3);
+            tmv.tm_min = gi(4);
+            tmv.tm_sec = gi(5);
+            tmv.tm_wday = (gi(6) + 1) % 7;
+            tmv.tm_yday = gi(7) - 1;
+            tmv.tm_isdst = gi(8);
+        } else {
+            time_t now = time(nullptr);
+#ifdef _WIN32
+            localtime_s(&tmv, &now);
+#else
+            localtime_r(&now, &tmv);
+#endif
+        }
+        char buf[512];
+        size_t n = strftime(buf, sizeof buf, fmt.c_str(), &tmv);
+        out->tag = KT_STR;
+        out->p = str_new(buf, (int64_t)n);
+        return;
+    }
     case KB_DIVMOD: {
         check_arity(nargs, 2, 2, "divmod");
         KamiValue q, r2;
@@ -1039,6 +1203,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         KamiFile* f = (KamiFile*)gc_alloc(sizeof(KamiFile), KT_FILE);
         f->fp = fp;
         f->closed = false;
+        f->no_close = false;
         out->tag = KT_FILE;
         out->p = f;
         return;
@@ -1059,15 +1224,25 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
                 }
             }
         }
+        if (argv[0]->tag == KT_LOCK) {
+            KamiLock* l = (KamiLock*)argv[0]->p;
+            lock_acquire(lk, l, -1.0);
+            *out = *argv[0];
+            return;
+        }
         *out = *argv[0];
         return;
     }
     case KB_WITH_EXIT: {
         check_arity(nargs, 1, 1, "with");
         set_none(out);
+        if (argv[0]->tag == KT_LOCK) {
+            lock_release((KamiLock*)argv[0]->p);
+            return;
+        }
         if (argv[0]->tag == KT_FILE) {
             KamiFile* f = (KamiFile*)argv[0]->p;
-            if (!f->closed) {
+            if (!f->closed && !f->no_close) {
                 fclose((FILE*)f->fp);
                 f->closed = true;
             }
@@ -1105,7 +1280,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         std::string line;
         for (int64_t i = 2; i < nargs; i++) {
             if (i > 2) line += sep;
-            line += value_str(argv[i]);
+            line += display(lk, argv[i], false);
         }
         line += end;
         fwrite(line.data(), 1, line.size(), stdout);
@@ -1113,6 +1288,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     default:
+        if (dispatch_oslayer(lk, id, out, argv, nargs)) return;
         if (dispatch_syscalls(lk, id, out, argv, nargs)) return;
         panic("unknown builtin id " + std::to_string(id));
     }
