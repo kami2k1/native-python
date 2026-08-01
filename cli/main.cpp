@@ -19,7 +19,9 @@ static void usage() {
             "KamiPython native compiler\n"
             "usage:\n"
             "  kamipy build <file.py> [-o <out>] [-O0|-O1|-O2] [--emit-llvm] [--emit-ast]\n"
+            "                         [--no-system-stdlib] [-v|--verbose]\n"
             "  kamipy run   <file.py>\n"
+            "  kamipy paths            show where imports are searched for\n"
             "  kamipy clean\n");
 }
 
@@ -34,6 +36,10 @@ int main(int argc, char** argv) {
             std::error_code ec;
             fs::remove_all(CACHE_DIR, ec);
             printf("cleaned %s\n", CACHE_DIR);
+            return 0;
+        }
+        if (cmd == "paths") {
+            fputs(describe_import_paths(argv[0]).c_str(), stdout);
             return 0;
         }
         if (cmd != "build" && cmd != "run") {
@@ -55,6 +61,8 @@ int main(int argc, char** argv) {
             else if (a == "-O2") opts.opt_level = 2;
             else if (a == "--emit-llvm") opts.emit_llvm = true;
             else if (a == "--emit-ast") opts.emit_ast = true;
+            else if (a == "--no-system-stdlib") opts.use_system_stdlib = false;
+            else if (a == "-v" || a == "--verbose") opts.verbose = true;
             else {
                 fprintf(stderr, "unknown option: %s\n", a.c_str());
                 return 2;

@@ -23,6 +23,7 @@ enum class ExprKind {
     Starred,    // *a inside a list/call display; a = inner
     SetComp,    // element a + clauses
     MapComp,    // pairs[0] = (key,val) + clauses
+    CCall,      // direct C-ABI call: sval = symbol, csig = signature, args = params
 };
 
 struct Expr;
@@ -47,6 +48,8 @@ struct Expr {
     int64_t ival = 0;          // IntLit / BoolLit
     double fval = 0.0;         // FloatLit
     std::string sval;          // StrLit / Name / Attr+MethodCall name
+
+    std::string csig;          // CCall: C-ABI signature, e.g. "dd" = double(double)
 
     int op = 0;                // Binary (KamiBinOp) / Unary (KamiUnOp) / BoolOp (0=and,1=or)
     ExprPtr a, b, c;           // operands
@@ -116,6 +119,13 @@ struct Stmt {
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
 };
 
+// A C function the compiled program calls directly (from a C extension mapping
+// or from ctypes/cffi). Collected by sema so codegen can `declare` it once.
+struct NativeDecl {
+    std::string symbol;
+    std::string csig; // see cext.h: first char = return type, rest = parameters
+};
+
 struct Module {
     std::vector<StmtPtr> body;         // module-level statements
     std::vector<Stmt*> functions;      // all FuncDefs incl. methods (borrowed)
@@ -126,15 +136,22 @@ struct Module {
     // driver ("import utils" → utils.py compiled in). Their top-level code is
     // spliced before the main body; sema maps "utils.x" to plain "x".
     std::set<std::string> user_modules;
-    // Symbol prefix applied to a bundled module's top-level names. Modules
-    // shipped in pylib/ are mangled ("re" → std_re_search) so that a stdlib
-    // helper can never be clobbered by a user global of the same name; local
-    // .py files next to the program keep the flat namespace.
+    // Subset of user_modules that came from the Python installation on this
+    // machine rather than the project or the shipped pylib.
+    std::set<std::string> system_modules;
+    // Symbol prefix applied to a bundled module's top-level names. Library
+    // modules (pylib/ or the system Python) are mangled ("re" → std_re_search)
+    // so a stdlib helper can never be clobbered by a user global of the same
+    // name; project .py files keep the flat namespace.
     std::map<std::string, std::string> module_prefix;
-    // Names of the Python stdlib modules the driver found in pylib/ — used to
-    // print a useful list when an import cannot be resolved.
+    // Library module names that were importable — used to print a useful list
+    // when an import cannot be resolved.
     std::set<std::string> stdlib_available;
     std::string source_path; // input file path (for __file__)
+
+    // C-ABI bindings discovered while analysing this module.
+    std::vector<NativeDecl> natives;   // unique (symbol, signature) pairs
+    std::set<std::string> link_libs;   // extra -l<name> flags for the linker
 };
 
 // S-expression dump for tests/debugging.

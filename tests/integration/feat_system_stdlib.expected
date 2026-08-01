@@ -1,0 +1,6 @@
+S_IFREG 32768
+isdir True
+filemode -rw-r--r--
+hsv->rgb 1.0 0.0 0.0
+rgb->yiq 0.3
+rgb->hls 0.666667 0.5 1.0

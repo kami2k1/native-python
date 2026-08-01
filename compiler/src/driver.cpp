@@ -2,15 +2,16 @@
 
 #include "codegen.h"
 #include "lexer.h"
+#include "modules.h"
 #include "parser.h"
 #include "sema.h"
 
 #include "../../runtime/include/kami_runtime.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <set>
 #include <sstream>
 #include <vector>
 
@@ -107,294 +108,47 @@ static std::string read_file(const std::string& path) {
     return ss.str();
 }
 
-// ---- local module bundling -------------------------------------------------
-// "import utils" where utils.py sits next to the input file: the module's
-// source is parsed and its top-level statements are spliced in front of the
-// main program (dependency-first), so the whole thing compiles into one
-// native executable. Sema then resolves "utils.x" as plain "x".
+// ---- import handling -------------------------------------------------------
+// The heavy lifting lives in modules.cpp; the driver's job is to describe *this
+// build* (where the input file is, where the shipped pylib is, whether the
+// system Python may be used) and then hand the module over.
 
-static void collect_import_names(Stmt* s, std::vector<std::string>& out) {
-    switch (s->kind) {
-    case StmtKind::Import:
-        out.push_back(s->name);
-        for (auto& extra : s->body) collect_import_names(extra.get(), out);
-        return;
-    case StmtKind::FromImport:
-        if (!s->name.empty()) out.push_back(s->name);
-        // `from . import a, b` — the imported names are sibling modules.
-        if (s->relative && s->name.empty())
-            for (auto& [n, alias] : s->import_names) out.push_back(n);
-        return;
-    default: break;
-    }
-    for (auto& c : s->body) collect_import_names(c.get(), out);
-    for (auto& c : s->orelse) collect_import_names(c.get(), out);
-    for (auto& h : s->handlers)
-        for (auto& c : h.body) collect_import_names(c.get(), out);
-    for (auto& c : s->final_body) collect_import_names(c.get(), out);
+static ImportPolicy import_policy(const fs::path& input, const std::string& argv0,
+                                  const BuildOptions& opts) {
+    ImportPolicy pol;
+    pol.project_dir = fs::absolute(input).parent_path();
+    pol.pylib_dirs = bundled_pylib_dirs(self_dir(argv0));
+    pol.use_system_python = opts.use_system_stdlib && !getenv("KAMIPY_NO_SYSTEM_STDLIB");
+    pol.verbose = opts.verbose;
+    return pol;
 }
 
-// True for the idiom  if __name__ == "__main__": ...  — bundled modules are
-// not the main program, so their guard blocks are dropped (CPython semantics).
-static bool is_main_guard(const Stmt* s) {
-    if (s->kind != StmtKind::If || !s->e1) return false;
-    const Expr* c = s->e1.get();
-    if (c->kind != ExprKind::Binary || c->op != KOP_EQ) return false;
-    const Expr* l = c->a.get();
-    const Expr* r = c->b.get();
-    auto is_name_dunder = [](const Expr* x) {
-        return x->kind == ExprKind::Name && x->sval == "__name__";
-    };
-    auto is_main_str = [](const Expr* x) {
-        return x->kind == ExprKind::StrLit && x->sval == "__main__";
-    };
-    return (is_name_dunder(l) && is_main_str(r)) || (is_name_dunder(r) && is_main_str(l));
+static std::string path_to_string(const fs::path& p) {
+#ifdef _WIN32
+    std::wstring ws = p.wstring();
+    if (ws.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], len, NULL, NULL);
+    return out;
+#else
+    return p.string();
+#endif
 }
 
-// ---- stdlib symbol mangling -------------------------------------------------
-// A bundled module's statements are spliced into the program, so its top-level
-// names land in the same global namespace as the user's. For modules shipped in
-// pylib/ that is unacceptable — `logging.py` defines `error`, `info`, `root`;
-// any program that happens to assign to `error` would silently overwrite the
-// library. So every top-level binding of a pylib module is renamed with a
-// module prefix ("re" → std_re_Pattern, std_re_search, ...), and sema maps
-// `re.search` back onto the mangled symbol.
-
-static void collect_bindings(const std::vector<StmtPtr>& body, std::set<std::string>& out) {
-    for (const auto& sp : body) {
-        Stmt* s = sp.get();
-        switch (s->kind) {
-        case StmtKind::FuncDef:
-        case StmtKind::ClassDef: out.insert(s->name); break;
-        case StmtKind::Assign:
-            if (!s->name.empty()) out.insert(s->name);
-            break;
-        case StmtKind::MultiAssign:
-            for (auto& t : s->targets)
-                if (t->kind == ExprKind::Name) out.insert(t->sval);
-            break;
-        case StmtKind::For:
-            for (auto& p : s->params) out.insert(p);
-            break;
-        default: break;
-        }
-        // Module-level control flow can bind names too (`if X: A = 1`).
-        if (s->kind == StmtKind::If || s->kind == StmtKind::While ||
-            s->kind == StmtKind::For || s->kind == StmtKind::Try ||
-            s->kind == StmtKind::With) {
-            collect_bindings(s->body, out);
-            collect_bindings(s->orelse, out);
-            collect_bindings(s->final_body, out);
-            for (auto& h : s->handlers) collect_bindings(h.body, out);
-        }
-    }
-}
-
-struct Mangler {
-    const std::set<std::string>& names;
-    const std::string& prefix;
-
-    void rename(std::string& n) const {
-        if (names.count(n)) n = prefix + n;
-    }
-
-    void expr(Expr* e) const {
-        if (!e) return;
-        // Attribute and method names are *not* renamed: `m.group()` must keep
-        // calling `group`. Only plain identifiers are module-level bindings.
-        if (e->kind == ExprKind::Name) rename(e->sval);
-        for (auto& p : e->params) rename(p);
-        expr(e->a.get());
-        expr(e->b.get());
-        expr(e->c.get());
-        for (auto& a : e->args) expr(a.get());
-        for (auto& [k, v] : e->kwargs) expr(v.get());
-        for (auto& [k, v] : e->pairs) {
-            expr(k.get());
-            expr(v.get());
-        }
-        for (auto& c : e->clauses) {
-            for (auto& t : c.targets) rename(t);
-            expr(c.iter.get());
-            for (auto& cond : c.conds) expr(cond.get());
-        }
-    }
-
-    void stmts(std::vector<StmtPtr>& body, bool in_class = false) const {
-        for (auto& sp : body) stmt(sp.get(), in_class);
-    }
-
-    void stmt(Stmt* s, bool in_class = false) const {
-        if (!s) return;
-        switch (s->kind) {
-        case StmtKind::Import:
-        case StmtKind::FromImport: return; // module paths are not identifiers
-        case StmtKind::FuncDef:
-            // A method keeps its own name — `m.group()` is dispatched by name at
-            // runtime. Only module-level functions are mangled.
-            if (!in_class) rename(s->name);
-            break;
-        case StmtKind::ClassDef:
-            rename(s->name);
-            rename(s->alias); // base class
-            break;
-        case StmtKind::Assign:
-        case StmtKind::For:
-        case StmtKind::Global: rename(s->name); break;
-        default: break;
-        }
-        if (s->kind == StmtKind::For || s->kind == StmtKind::Global ||
-            s->kind == StmtKind::FuncDef)
-            for (auto& p : s->params) rename(p);
-        expr(s->e1.get());
-        expr(s->e2.get());
-        expr(s->e3.get());
-        for (auto& d : s->defaults) expr(d.get());
-        for (auto& d : s->decorators) expr(d.get());
-        for (auto& t : s->targets) expr(t.get());
-        for (auto& v : s->values) expr(v.get());
-        stmts(s->body, s->kind == StmtKind::ClassDef);
-        stmts(s->orelse);
-        stmts(s->final_body);
-        for (auto& h : s->handlers) {
-            rename(h.as_name);
-            stmts(h.body);
-        }
-    }
-};
-
-static void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix) {
-    std::set<std::string> names;
-    collect_bindings(body, names);
-    // `__name__`, `__file__` and friends are provided by the compiler.
-    for (auto it = names.begin(); it != names.end();) {
-        if (it->size() > 4 && it->compare(0, 2, "__") == 0) it = names.erase(it);
-        else ++it;
-    }
-    if (names.empty()) return;
-    Mangler m{names, prefix};
-    m.stmts(body);
-}
-
-namespace {
-struct Bundler {
-    fs::path base_dir;
-    std::set<std::string> loading; // cycle guard
-    std::set<std::string> loaded;
-    std::map<std::string, std::string> prefixes; // module → symbol prefix
-    std::vector<StmtPtr> prelude;
-
-    // "pkg.mod" → base_dir/pkg/mod.py, falling back to a package directory
-    // (base_dir/pkg/mod/__init__.py) the way Python's import system does.
-    fs::path module_path(const std::string& name) const {
-        std::string rel = name;
-        for (char& ch : rel)
-            if (ch == '.') ch = '/';
-        std::error_code ec;
-        fs::path flat = base_dir / (rel + ".py");
-        if (fs::exists(flat, ec)) return flat;
-        fs::path pkg = base_dir / rel / "__init__.py";
-        if (fs::exists(pkg, ec)) return pkg;
-        return flat;
-    }
-
-    // Bundled standard-library modules are shipped as *real Python* in a
-    // pylib/ folder next to the kamipy binary (and in the source tree). This is
-    // the project's core idea: the library is translated as Python, compiled by
-    // the same pipeline — never reimplemented at the C++ layer.
-    fs::path stdlib_path(const std::string& name) const {
-        if (name.find('.') != std::string::npos) return {}; // no dotted stdlib yet
-        std::error_code ec;
-        for (const fs::path& dir : stdlib_dirs) {
-            fs::path cand = dir / (name + ".py");
-            if (fs::exists(cand, ec)) return cand;
-            fs::path pkg = dir / name / "__init__.py";
-            if (fs::exists(pkg, ec)) return pkg;
-        }
-        return {};
-    }
-
-    std::vector<fs::path> stdlib_dirs;
-
-    void process(std::vector<StmtPtr>& body) {
-        std::vector<std::string> names;
-        for (auto& sp : body) collect_import_names(sp.get(), names);
-        for (auto& n : names) load(n);
-    }
-
-    void load(const std::string& name) {
-        if (loaded.count(name)) return;
-        fs::path file = module_path(name);
-        std::error_code ec;
-        bool local = fs::exists(file, ec);
-        if (!local) {
-            // A local file shadows the bundled stdlib (Python semantics). Only
-            // fall back to the shipped pylib when no local file exists.
-            fs::path lib = stdlib_path(name);
-            if (lib.empty()) return; // truly unknown: sema reports it (or try/except)
-            file = lib;
-        } else if (known_builtin_module(name)) {
-            return; // native module and no local override
-        }
-        if (loading.count(name))
-            throw std::runtime_error("circular import between local modules involving '" +
-                                     name + "'");
-        loading.insert(name);
-        Module sub;
-        try {
-            sub = parse(lex(read_file(file.string())));
-        } catch (CompileError& e) {
-            throw std::runtime_error(file.string() + ":" + std::to_string(e.line) +
-                                     ": error: " + e.what());
-        }
-        process(sub.body); // dependencies of the dependency come first
-        if (!local) { // shipped stdlib: keep its symbols out of the user's way
-            std::string prefix = "std_" + name + "_";
-            for (char& ch : prefix)
-                if (ch == '.') ch = '_';
-            mangle_module(sub.body, prefix);
-            prefixes[name] = prefix;
-        }
-        for (auto& sp : sub.body) {
-            if (is_main_guard(sp.get())) continue; // not the main program
-            prelude.push_back(std::move(sp));
-        }
-        loading.erase(name);
-        loaded.insert(name);
-    }
-};
-} // namespace
-
-static void bundle_local_modules(Module& mod, const fs::path& input, const std::string& argv0) {
-    Bundler b;
-    b.base_dir = fs::absolute(input).parent_path();
-    // Where to find the shipped Python stdlib (pylib/). Checked in order:
-    //   <binary dir>/pylib, <binary dir>/../pylib, <source>/runtime/pylib,
-    //   $KAMIPY_PYLIB.
-    fs::path bindir = self_dir(argv0);
-    b.stdlib_dirs = {bindir / "pylib", bindir.parent_path() / "pylib",
-                     bindir / ".." / "runtime" / "pylib",
-                     bindir.parent_path() / "runtime" / "pylib"};
-    if (const char* env = getenv("KAMIPY_PYLIB")) b.stdlib_dirs.insert(b.stdlib_dirs.begin(), env);
-    // Record what pylib/ has to offer so sema can name it in error messages.
-    {
-        std::error_code ec;
-        for (const fs::path& dir : b.stdlib_dirs) {
-            if (!fs::is_directory(dir, ec)) continue;
-            for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
-                if (it->path().extension() == ".py")
-                    mod.stdlib_available.insert(it->path().stem().string());
-        }
-    }
-    b.process(mod.body);
-    if (b.loaded.empty()) return;
-    std::vector<StmtPtr> merged;
-    merged.reserve(b.prelude.size() + mod.body.size());
-    for (auto& sp : b.prelude) merged.push_back(std::move(sp));
-    for (auto& sp : mod.body) merged.push_back(std::move(sp));
-    mod.body = std::move(merged);
-    mod.user_modules = std::move(b.loaded);
-    mod.module_prefix = std::move(b.prefixes);
+// Where would `import X` look for a module right now? Printed by
+// `kamipy paths` so a broken setup can be diagnosed without guesswork.
+std::string describe_import_paths(const std::string& argv0) {
+    std::string out = "project directory: <alongside the input file>\n\nbundled pylib:\n";
+    std::error_code ec;
+    for (const fs::path& d : bundled_pylib_dirs(self_dir(argv0)))
+        out += "  " + path_to_string(d) + (fs::is_directory(d, ec) ? "" : "   (missing)") + "\n";
+    out += "\nsystem Python (auto-discovered):\n";
+    const auto& sys = find_system_python_stdlib();
+    if (sys.empty()) out += "  <none found — falling back to the bundled pylib>\n";
+    for (const fs::path& d : sys) out += "  " + path_to_string(d) + "\n";
+    return out;
 }
 
 std::string build(const BuildOptions& opts) {
@@ -402,7 +156,7 @@ std::string build(const BuildOptions& opts) {
 
     Module mod = parse(lex(src));
     mod.source_path = fs::absolute(opts.input).string();
-    bundle_local_modules(mod, opts.input, opts.argv0);
+    bundle_imported_modules(mod, import_policy(opts.input, opts.argv0, opts));
     analyze(mod);
     if (opts.emit_ast) {
         fputs(dump_module(mod).c_str(), stdout);
@@ -442,6 +196,21 @@ std::string build(const BuildOptions& opts) {
     cmd.push_back("-lws2_32");
     cmd.push_back("-lwinhttp");
 #endif
+    // Libraries the program's C-ABI bindings need (ctypes.CDLL("libm.so.6"),
+    // a C extension mapped onto ws2_32, ...). Duplicates are harmless.
+    for (const std::string& lib : mod.link_libs) {
+#ifndef _WIN32
+        if (lib == "m" || lib == "pthread") continue; // already on the command line
+#else
+        if (lib == "ws2_32" || lib == "m") continue;
+#endif
+        cmd.push_back("-l" + lib);
+    }
+    if (opts.verbose && !mod.link_libs.empty()) {
+        std::string libs;
+        for (const std::string& l : mod.link_libs) libs += " -l" + l;
+        fprintf(stderr, "kamipy: C-ABI link flags:%s\n", libs.c_str());
+    }
     // clang warns about override of module-less IR opt flags; keep output clean:
     cmd.push_back("-Wno-override-module");
     int rc = run_process(cmd);

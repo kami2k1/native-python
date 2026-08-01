@@ -63,7 +63,10 @@ kamipy clean                # xóa .kamipy-cache
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client, **`wrap_tls()`** → OpenSSL/SChannel, `settimeout`), **`requests`** (pure-Python HTTP/1.1: params/data/json/headers/auth, redirects, chunked, `Response.json()/raise_for_status()`, `Session`), **`json`**, **`re`**, **`logging`** — tất cả là Python trong `runtime/pylib/` |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
-| Modules | C-ABI bindings: `math time random threading sys os os.path socket string doctest`; **Python stdlib compiled from source** (`runtime/pylib/`): `re json logging requests itertools functools`; no-op `typing`/`__future__` |
+| Modules | C-ABI bindings: `math time random threading sys os os.path socket string doctest`; **Python stdlib compiled from source** (`runtime/pylib/`): `re json logging requests itertools functools`; **auto-discovered system Python stdlib** (compile source thật của CPython trên máy); no-op `typing`/`__future__` |
+| System Python | **`find_system_python_stdlib()`**: dò `KAMIPY_PYTHON_STDLIB` → `PYTHONHOME` → `PYTHONPATH` → interpreter trên `PATH` → Registry Windows (`HKCU`/`HKLM\Software\Python\PythonCore`) + `%LOCALAPPDATA%\Programs\Python\Python3*\Lib` + `C:\Python3*\Lib` + `C:\Program Files\Python3*\Lib` / `/usr/lib/python3.*` + `/usr/local/lib/python3.*` + pyenv + Homebrew. Thứ tự resolve: **project → native → system Python → pylib fallback**. `kamipy paths` để xem, `-v` để trace, `--no-system-stdlib` để tắt |
+| C extensions | `_math` `_os`/`posix`/`nt` `_socket` `_struct` `_json` `_time` `_random` → **C-ABI primitive** (`runtime/src/syscalls.cpp`) hoặc **lời gọi C trực tiếp** trong LLVM IR (`call double @sqrt(double)`); raw fd I/O `open/read/write/close/lseek`; `struct.pack/unpack/calcsize` |
+| ctypes / cffi | `ctypes.CDLL("libm.so.6")` + `restype`/`argtypes`, `cffi.FFI()` + `cdef()` + `dlopen()` → **native call** + **tự sinh cờ link** (`-lm`, `-lws2_32`, …); độ rộng kiểu C đúng chuẩn (`int` 32-bit, `long` theo LP64/LLP64, `float` ≠ `double`) |
 | Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`, relative `from .mod import x`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
 | Threading | Real OS threads with GIL-style lock (elided when single-threaded); **`threading.Lock`/`RLock`** = native mutexes usable with `with`; socket accept/recv and lock waits release the GIL |
@@ -140,6 +143,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Lexer / Parser / Sema / Codegen / Linker driver | ✅ implemented + tested |
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
-| Tests | ✅ 2 unit suites + 37 integration programs (threading, GC stress, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, closures/lambda/decorators, regex, comprehensions, dict-order, unpacking) |
+| Tests | ✅ 3 unit suites + 55 integration programs (threading + locks, GC stress, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets + TLS, closures/lambda/decorators, regex, JSON, logging, requests, comprehensions, dict-order, unpacking, C-ABI/ctypes/cffi, system-Python imports) |
 | CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
 | Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |

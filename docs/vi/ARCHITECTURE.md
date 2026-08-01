@@ -398,31 +398,100 @@ KIR ──codegen──▶ LLVM IR ──llc/TargetMachine──▶ .o (x86-64 o
 
 ---
 
-## 9. Import system (PHASE 10 — thiết kế)
+## 9. Hệ thống import (as built)
 
-**Static import**, không import động runtime:
+**Import tĩnh, không import động lúc chạy.** Mọi module chương trình import đều được
+compile vào cùng một executable: không `sys.modules`, không import hook, không `.pyc`.
+Toàn bộ phân hệ nằm ở `compiler/src/modules.cpp`.
+
+### 9.1 `import X` tìm ở đâu
 
 ```
-import math
-   │ resolve: stdlib trước, rồi file cạnh main.py
-   ▼ compile module (đệ quy, phát hiện cycle → lỗi)
-   ▼ mỗi module → một LLVM module / object riêng, symbol prefix kami_mod_<name>_
-   ▼ link tất cả vào một executable
+import X
+  1. project        X.py hoặc X/__init__.py cạnh file input
+  2. native         module runtime đã cài (math, os, json, socket, re, ...)
+  3. system Python  bản CPython dò được trên máy
+  4. bundled pylib  runtime/pylib/, ship cạnh binary kamipy
 ```
 
-Stdlib (`math`, `json`, `filesystem`, `time`, `random`) viết bằng C++ trong `libkamirt`, expose qua bảng symbol để semantic analyzer biết chữ ký hàm.
+File trong project **luôn** thắng, đúng semantics CPython. Module native được ưu tiên
+hơn source CPython là có chủ ý: `import json` nên tiếp tục là lời gọi primitive C-ABI
+chứ không kéo cả package `json/` vào. Còn lại thì đọc thẳng stdlib thật trên máy; thư
+mục `pylib/` đi kèm là **fallback** — dùng khi máy không có Python, hoặc khi source
+CPython của module đó dùng cú pháp compiler chưa nhận. Ứng viên nào **parse** thất bại
+thì rơi xuống ứng viên tiếp theo; chỉ khi hết lựa chọn driver mới cảnh báo và bỏ qua.
+
+Module được ghép vào chương trình chính theo thứ tự dependency-first, khối
+`if __name__ == "__main__":` bị bỏ, nên `utils.helper()` trở thành lời gọi `helper()`
+thông thường. Import vòng được phát hiện và báo lỗi.
+
+### 9.2 Dò môi trường Python hệ thống
+
+`find_system_python_stdlib()` trả về danh sách import root, tốt nhất trước, và cache
+kết quả. Hàm này **không** spawn process nào — chỉ đọc biến môi trường, Registry
+Windows và filesystem.
+
+| Thứ tự | Nguồn |
+|---|---|
+| 1 | `$KAMIPY_PYTHON_STDLIB` — ghi đè tường minh, phân tách `:`/`;` |
+| 2 | `$PYTHONHOME` → `<prefix>/Lib` (Windows) hoặc `<prefix>/lib/python3.*` |
+| 3 | Từng entry của `$PYTHONPATH`, dùng nguyên trạng |
+| 4 | `python3` / `python.exe` trên `$PATH` → prefix của nó (bắt được virtualenv, pyenv, conda) |
+| 5 | Windows: Registry `HKCU`/`HKLM\Software\Python\PythonCore` (kể cả `Wow6432Node`) → `InstallPath`; `%LOCALAPPDATA%\Programs\Python\Python3*\Lib`; `C:\Python3*\Lib`; `C:\Program Files[ (x86)]\Python3*\Lib` |
+| 5 | Unix: `/usr/lib/python3.*`, `/usr/local/lib/python3.*`, `/usr/lib64/...`, `/opt/homebrew/...`, `~/.pyenv/versions/*/lib/python3.*`, framework build macOS |
+
+Một thư mục chỉ được nhận nếu có "dấu vân tay" stdlib (`os.py`, `json/__init__.py`
+hoặc `types.py`), nhờ vậy một folder backup lạc không thể làm bẩn search path. Trong
+cùng một mức ưu tiên, Python mới hơn xếp trước.
+
+`kamipy paths` in toàn bộ danh sách; `kamipy build -v` báo từng resolve;
+`--no-system-stdlib` (hoặc `KAMIPY_NO_SYSTEM_STDLIB=1`) tắt auto-discovery.
+
+### 9.3 C extension và C ABI
+
+Stdlib CPython chỉ có một nửa là Python — nửa còn lại là C extension module.
+`compiler/src/cext.cpp` map từng thành viên của chúng sang một trong hai thứ:
+
+* một **runtime primitive** (`_json.loads` → `KB_JSON_LOADS`), hoặc
+* một **lời gọi C trực tiếp** sinh thẳng vào IR (`_math.sqrt` → `call double @sqrt(double)`).
+
+`runtime/src/syscalls.cpp` chứa các primitive không có cách diễn đạt tự nhiên bằng
+Python: I/O theo file descriptor (`open/read/write/close/lseek`), `gethostname`, và
+`struct.pack`/`unpack`/`calcsize`.
+
+`ctypes` và `cffi` được hiểu ở compile time, không phải runtime:
+
+```python
+lib = ctypes.CDLL("libm.so.6")     # → cờ link -lm, suy ra từ chính tên file
+lib.sqrt.restype = ctypes.c_double # → kiểu trả về
+lib.sqrt.argtypes = [ctypes.c_double]
+lib.sqrt(2.25)                     # → call double @sqrt(double 2.25)
+```
+
+Chữ ký được mang dưới dạng một chuỗi gọn: ký tự đầu là kiểu trả về, phần còn lại là
+tham số, và **mỗi độ rộng C có mã riêng** — `'l'` là `int` 32-bit của C, `'i'` là
+`long`/`size_t`/pointer 64-bit, `'f'` là `float`, `'d'` là `double`, `'s'` là
+`const char*`. Truyền i64 vào tham số `int` là undefined behaviour chứ không phải
+tiện tay, nên codegen sinh đúng `trunc`/`sext`/`fptrunc`/`fpext` quanh lời gọi. Đối số
+được unbox qua `kami_c_arg_i64/f64/cstr` nên sai kiểu là lỗi Python bắt được, không
+phải stack hỏng. Driver thu thập các thư viện những binding này cần rồi thêm
+`-l<name>` vào dòng lệnh clang.
 
 ---
 
 ## 10. CLI (PHASE 12 — thiết kế)
 
 ```
-kamipy build main.py [-o app] [-O0|-O2] [--emit-llvm] [--emit-kir]
-kamipy run   main.py        # build vào thư mục tạm rồi exec
-kamipy clean                # xóa .kamipy-cache/
+kamipy build <file.py> [-o app] [-O0|-O1|-O2] [--emit-llvm] [--emit-ast]
+                       [--no-system-stdlib] [-v|--verbose]
+kamipy run   <file.py>      # build vào .kamipy-cache/ rồi chạy
+kamipy paths                # mọi thư mục mà `import` sẽ tìm, theo thứ tự
+kamipy clean                # xoá .kamipy-cache/
 ```
 
-`--emit-llvm`/`--emit-kir` phục vụ debug và test golden-file.
+`--emit-llvm`/`--emit-ast` phục vụ debug và golden-file test. `paths` và `-v` có
+mặt để việc resolve import luôn chẩn đoán được, không phải đoán: `paths` trả lời
+"sẽ tìm ở đâu?", `-v` trả lời "thực tế tìm thấy ở đâu, và link với thư viện nào?".
 
 ---
 

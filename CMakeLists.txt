@@ -31,6 +31,7 @@ add_library(kamirt STATIC
     runtime/src/oslayer.cpp
     runtime/src/netsock.cpp
     runtime/src/builtins.cpp
+    runtime/src/syscalls.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
@@ -56,6 +57,8 @@ add_library(kamipy_core STATIC
     compiler/src/parser.cpp
     compiler/src/sema.cpp
     compiler/src/codegen.cpp
+    compiler/src/cext.cpp
+    compiler/src/modules.cpp
     compiler/src/driver.cpp
 )
 target_include_directories(kamipy_core PUBLIC compiler/src runtime/include)
@@ -94,6 +97,10 @@ add_test(NAME unit.lexer COMMAND test_lexer)
 add_executable(test_parser tests/unit/test_parser.cpp)
 target_link_libraries(test_parser PRIVATE kamipy_core)
 add_test(NAME unit.parser COMMAND test_parser)
+
+add_executable(test_cabi tests/unit/test_cabi.cpp)
+target_link_libraries(test_cabi PRIVATE kamipy_core)
+add_test(NAME unit.cabi COMMAND test_cabi)
 
 add_test(NAME integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_tests.sh

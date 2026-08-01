@@ -97,5 +97,10 @@ enum KamiBuiltinId : int64_t {
     KB_TIME_LOCALTIME, KB_TIME_GMTIME, KB_TIME_STRFTIME,
     // diagnostics
     KB_KWARGS_UNSUPPORTED,
+    // raw C-ABI primitives (runtime/src/syscalls.cpp) — the landing pads for
+    // CPython's C extension modules: posix/_os, _socket, _struct.
+    KB_SYS_OPEN, KB_SYS_READ, KB_SYS_WRITE, KB_SYS_CLOSE, KB_SYS_LSEEK,
+    KB_SYS_GETHOSTNAME,
+    KB_STRUCT_PACK, KB_STRUCT_UNPACK, KB_STRUCT_CALCSIZE,
     KB__COUNT
 };
