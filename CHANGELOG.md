@@ -36,6 +36,95 @@ Tests: 51 integration + 3 unit suites, tất cả PASS. Benchmarks chạy bằng
 
 ---
 
+## [v0.6.1] — 2026-08-01 — "Chỉ dịch, không tự viết": stdlib chuyển sang Python thật
+
+Đợt refactor lớn nhất từ đầu project. Nguyên tắc: **KamiPython là trình biên dịch, không
+phải là một bản cài lại thư viện chuẩn bằng C++.** Mọi thứ có logic/nghiệp vụ (regex, JSON,
+logging, HTTP) được viết bằng **Python thật** trong `runtime/pylib/` và được chính pipeline
+`lex → parse → sema → codegen → LLVM IR` dịch ra mã máy. C++ runtime chỉ còn giữ đúng ba
+việc: **Value model, GC, và binding C-ABI xuống syscall của OS.**
+
+### Removed — 1.400+ dòng C++ thủ công bị xoá
+| File bị xoá | Dòng | Thay bằng |
+|---|---|---|
+| `runtime/src/kami_regex.cpp` + `.h` | 411 | `runtime/pylib/re.py` (engine Python thuần) |
+| `runtime/src/http_client.cpp` | 562 | `runtime/pylib/requests.py` + `socket.wrap_tls()` |
+| `runtime/src/netio.cpp` (JSON + logging + HTTP shaping) | ~480 | `runtime/pylib/json.py`, `runtime/pylib/logging.py` |
+Phần còn lại của `netio.cpp` (os / os.path) tách thành `runtime/src/oslayer.cpp`; socket +
+TLS tách thành `runtime/src/netsock.cpp`. Các class C++ "nội bộ" `Match` và `Response` — trước
+đây được dựng tay trong runtime và dispatch method bằng `strcmp` — đã biến mất hoàn toàn.
+
+### Added — stdlib bằng Python (`runtime/pylib/`)
+- **`re`**: engine backtracking hai tầng (parser → VM). Hỗ trợ `. ^ $ [] () (?:) (?P<n>)
+  (?i) | * + ? {m,n}` (kèm biến thể non-greedy), `\d \D \w \W \s \S \b \B \A \Z`,
+  backreference `\1`, cờ `I/M/S/X`; API `compile/match/search/fullmatch/findall/finditer/
+  sub/subn/split/escape/purge`, `Match.group/groups/groupdict/start/end/span/expand`.
+  VM dùng **trail stack tường minh** nên không đệ quy — khớp được input dài (đã test 20 000
+  ký tự) và pattern bệnh lý (`(a*)*b`, `(|a)*b`) vẫn dừng.
+- **`json`**: `loads/load/dumps/dump` (+ `indent`, `sort_keys`), unicode escape & surrogate
+  pair, thông báo lỗi có vị trí ký tự.
+- **`logging`**: `basicConfig` (level/format/datefmt/stream/filename), `getLogger`, `Logger`,
+  `debug/info/warning/error/critical/exception/log`, `%(asctime)s %(levelname)s %(name)s
+  %(message)s %(levelno)s %(process)s`, ghi ra stderr như CPython.
+- **`requests`**: HTTP/1.1 thuần Python trên socket — parse URL, dựng request, đọc header,
+  giải mã `Transfer-Encoding: chunked`, theo redirect, `params=/data=/json=/headers=/auth=/
+  timeout=`, `Response.status_code/ok/text/content/headers/reason/url/history/json()/
+  raise_for_status()`, `Session`, `urlparse/quote/urlencode`.
+
+### Added — TLS là binding OS, không phải HTTP client tự chế
+- `socket.wrap_tls(host)`: đưa socket đã connect cho **TLS stack của hệ điều hành** —
+  OpenSSL trên POSIX, **SChannel** trên Windows (`secur32`/`crypt32`, không còn WinHTTP).
+  Đây chính là việc của module `ssl` trong CPython.
+- `socket.settimeout()` giờ **thật sự** đặt `SO_RCVTIMEO/SO_SNDTIMEO` (trước đây bị bỏ qua);
+  thêm `gettimeout`, `fileno`, `tls_available`.
+
+### Added — Name mangling cho module stdlib
+Module trong `pylib/` được bundle vào chương trình, nên tên top-level của nó từng dùng chung
+namespace toàn cục với code người dùng — `logging.py` định nghĩa `error`, `info`, `root`, và
+một biến `error = ...` của user sẽ ghi đè thư viện. Nay mỗi binding top-level được đổi tên
+theo module (`re.search` → `std_re_search`, `logging.info` → `std_logging_info`); sema map
+`mod.attr` và `from mod import x as y` về đúng symbol đã mangle. Tên method **không** bị đổi
+(`m.group()` vẫn là `group`).
+
+### Added — cú pháp & ngữ nghĩa
+- **Nối chuỗi ngầm qua f-string**: `f"{a}\n" "tail"` (lỗi `expected ')'` khi viết block
+  chuỗi nhiều dòng — hay gặp nhất trong code thật — đã hết).
+- **`*args`** trong `def`/method (kèm `min_arity` đúng, sema kiểm tra số tham số).
+- **Toán tử `%`** trên str: `"%s=%d" % (a, b)`, `"%(k)s" % {...}`, cờ/width/precision.
+- **`__str__` / `__repr__`** được `print()`, `str()`, `repr()`, f-string gọi đến.
+- **So sánh dict/set theo giá trị** (`{"a": 1} == {"a": 1}` trước đây trả `False`).
+- **`threading.Lock()` / `RLock()`**: mutex OS thật, `acquire(blocking, timeout)`, `release`,
+  `locked`, dùng được với `with`.
+- **`repr()`**, **`callable()`**, **`sys.stdout` / `sys.stderr`**, **`time.localtime` /
+  `gmtime` / `strftime`** (binding libc), **`dict.setdefault`**, **`list(dict)`**,
+  **`str.strip/lstrip/rstrip(chars)`**, **`splitlines`**, **`partition/rpartition`**,
+  **`find/index/rfind/rindex`** với cửa sổ start/end.
+- **Package cục bộ**: `import pkg` tìm cả `pkg/__init__.py`.
+
+### Fixed
+- **`with` bên trong vòng lặp/hàm không gọi `__exit__`.** Slot frame "persistent" của
+  `with` được cấp phát tại `temps_base + max_temps`, nhưng `max_temps` còn tăng sau đó nên
+  biến tạm ghi đè lên context manager. Nghĩa là `with open(...)` trong `while` **không bao
+  giờ đóng file**. Nay index slot được emit dưới dạng placeholder và patch ở `finish()`.
+- `kami_class_add_method` không khởi tạo `builtin_id`, nên gọi một method qua
+  `kami_call_value` nhảy vào bảng builtin với id rác (crash).
+- `sys.stdout`/`sys.stderr` không bị `close()` bởi GC hay `with`.
+- Thông báo lỗi import: liệt kê đúng module đang có (kể cả `pylib/`) và nói rõ phải làm gì
+  với package bên thứ ba (`pyautogui`, `numpy`, `flask` — cần C extension của CPython).
+
+### Notes
+- `re`/`json`/`logging`/`requests` giờ cần thư mục `pylib/` cạnh binary `kamipy`
+  (CMake copy tự động), hoặc source thật của CPython trên máy — xem cơ chế resolve
+  `project → native → system Python → pylib` của v0.6.0.
+- Không có OpenSSL khi build POSIX → `https://` báo `SSLError` rõ ràng, `http://` vẫn chạy.
+- v0.6.0 để `json`/`re`/`logging`/`requests` ở đường **native**; bản này bỏ các entry đó khỏi
+  bảng native, nên chúng resolve xuống `pylib/` (hoặc system Python) và được **compile từ
+  source Python**. Đồng thời v0.6.0 xoá `netio.cpp`/`http_client.cpp` nhưng `ops.cpp` vẫn tham
+  chiếu `socket_method`/`json_loads` khiến **mọi** chương trình fail ở bước link — bản này khôi
+  phục các primitive đó trong `oslayer.cpp`/`netsock.cpp` và sửa `ops.cpp`.
+
+---
+
 ## [v0.6.0] — 2026-08-01 — Tự động tìm Python hệ thống + gắn kết C-ABI (C extensions, ctypes/cffi)
 
 Trước bản này, `import X` chỉ tìm được `X.py` cạnh file input hoặc trong `runtime/pylib/`

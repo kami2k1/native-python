@@ -63,6 +63,8 @@ uint64_t value_hash(const KamiValue* v) {
     }
 }
 
+bool map_get(KamiMap* m, const KamiValue* k, KamiValue* out); // defined below
+
 bool value_eq(const KamiValue* a, const KamiValue* b) {
     // numeric cross-type equality
     if ((a->tag == KT_INT || a->tag == KT_BOOL) && (b->tag == KT_INT || b->tag == KT_BOOL))
@@ -86,7 +88,32 @@ bool value_eq(const KamiValue* a, const KamiValue* b) {
             if (!value_eq(&x->items[i], &y->items[i])) return false;
         return true;
     }
-    default: return a->p == b->p; // identity for maps/functions/threads
+    case KT_MAP: {
+        // Python compares dicts by content: same keys mapping to equal values.
+        KamiMap *x = (KamiMap*)a->p, *y = (KamiMap*)b->p;
+        if (x == y) return true;
+        if (x->count != y->count) return false;
+        for (int64_t i = 0; i < x->nentries; i++) {
+            if (!x->entries[i].used) continue;
+            KamiValue other;
+            if (!map_get(y, &x->entries[i].key, &other)) return false;
+            if (!value_eq(&x->entries[i].val, &other)) return false;
+        }
+        return true;
+    }
+    case KT_SET: {
+        // Sets are maps with None values: equal when the key sets match.
+        KamiMap *x = (KamiMap*)a->p, *y = (KamiMap*)b->p;
+        if (x == y) return true;
+        if (x->count != y->count) return false;
+        for (int64_t i = 0; i < x->nentries; i++) {
+            if (!x->entries[i].used) continue;
+            KamiValue other;
+            if (!map_get(y, &x->entries[i].key, &other)) return false;
+        }
+        return true;
+    }
+    default: return a->p == b->p; // identity for functions/threads/objects
     }
 }
 

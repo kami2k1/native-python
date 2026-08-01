@@ -53,6 +53,11 @@ std::vector<ResolvedModule> resolve_module(const std::string& dotted, const Impo
 // Records what came from where in mod.user_modules / mod.system_modules.
 void bundle_imported_modules(Module& mod, const ImportPolicy& pol);
 
+// Symbol prefix used for a library module's top-level names ("re" ->
+// "std_re_"), and the AST rename that applies it.
+std::string library_prefix(const std::string& dotted);
+void mangle_module(std::vector<StmtPtr>& body, const std::string& prefix);
+
 // Default pylib search path for a kamipy binary living in `bindir`.
 std::vector<std::filesystem::path> bundled_pylib_dirs(const std::filesystem::path& bindir);
 

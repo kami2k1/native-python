@@ -417,6 +417,52 @@ struct Lexer {
         push(Tok::RPAREN);
     }
 
+    // Looks ahead past whitespace / comments / line continuations for another
+    // string literal — Python's implicit concatenation (`"a" f"b" "c"`).
+    // Returns 0 (nothing), 1 (plain literal) or 2 (f-string). Consumes nothing.
+    int peek_string_literal() const {
+        size_t p = pos;
+        for (;;) {
+            if (p >= src.size()) return 0;
+            char c = src[p];
+            if (c == ' ' || c == '\t' || c == '\r') { p++; continue; }
+            if (c == '#') {
+                while (p < src.size() && src[p] != '\n') p++;
+                continue;
+            }
+            if (c == '\\') { // explicit line continuation
+                size_t q = p + 1;
+                if (q < src.size() && src[q] == '\r') q++;
+                if (q < src.size() && src[q] == '\n') { p = q + 1; continue; }
+                return 0;
+            }
+            if (c == '\n') {
+                if (paren_depth == 0) return 0; // the statement ends here
+                p++;
+                continue;
+            }
+            break;
+        }
+        size_t q = p;
+        bool fstr = false;
+        while (q < src.size() && q - p < 2) { // optional r/f/b prefix
+            char l = (char)tolower((unsigned char)src[q]);
+            if (l == 'r' || l == 'b') { q++; continue; }
+            if (l == 'f') { fstr = true; q++; continue; }
+            break;
+        }
+        if (q >= src.size() || (src[q] != '"' && src[q] != '\'')) return 0;
+        return fstr ? 2 : 1;
+    }
+
+    // Adjacent plain literals are merged by the parser, but an f-string has
+    // already been expanded into a token group here, so the pieces have to be
+    // joined with an explicit '+' instead.
+    void maybe_implicit_concat(bool was_fstring) {
+        int nxt = peek_string_literal();
+        if (nxt != 0 && (was_fstring || nxt == 2)) push(Tok::PLUS);
+    }
+
     // Handles a name; also detects string prefixes (r, f, b combinations).
     void lex_name() {
         size_t start = pos;
@@ -440,6 +486,7 @@ struct Lexer {
                 if (triple) pos += 2;
                 if (fstr) lex_fstring(quote, triple, raw);
                 else push(Tok::STRING, read_string_body(quote, triple, raw));
+                maybe_implicit_concat(fstr);
                 return;
             }
         }
@@ -509,6 +556,7 @@ struct Lexer {
                 bool triple = peek() == c && peek(1) == c;
                 if (triple) pos += 2;
                 push(Tok::STRING, read_string_body(c, triple, false));
+                maybe_implicit_concat(false);
                 continue;
             }
             if (isalpha((unsigned char)c) || c == '_') { lex_name(); continue; }

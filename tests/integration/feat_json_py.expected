@@ -1,0 +1,21 @@
+{"a": 1, "b": [1, 2.5, true, null], "c": "x\"y\n"}
+[1, [2, [3]]]
+{"a": 2, "z": 1}
+{
+  "a": [
+    1,
+    {
+      "b": 2
+    }
+  ]
+}
+"plain" 7 true null
+42 1.5 True True True [1, 2]
+Aé
+[1, [2, [3]]]
+-12 1000.0 [] {}
+True
+rejected {bad}
+rejected [1,
+rejected {"a" 1}
+rejected tru

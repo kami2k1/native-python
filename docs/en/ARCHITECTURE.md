@@ -99,6 +99,69 @@ KamiPython/
 - `kamipy` — the compiler CLI (links against LLVM).
 - `libkamirt.a` / `kamirt.lib` — runtime library with **no** LLVM dependency, statically linked into every produced executable.
 
+
+---
+
+## 3a. Where the standard library lives ("translate, don't rewrite")
+
+The compiler translates Python; it does **not** reimplement Python's library in C++. That rule
+draws a hard line through the tree:
+
+```
+runtime/pylib/*.py     the standard library, written in real Python and compiled
+                       by the same pipeline as the user's program
+                         re.py        backtracking regex engine (parser + VM)
+                         json.py      encoder / decoder
+                         logging.py   loggers, levels, %(...)s formatting
+                         requests.py  HTTP/1.1 over a socket
+                         itertools.py functools.py
+
+runtime/src/*.cpp      only what Python cannot express about itself
+                         value.cpp collections.cpp ops.cpp objects.cpp  value model
+                         gc.cpp                                        mark & sweep GC
+                         builtins.cpp                                  builtin dispatch
+                         oslayer.cpp   C-ABI bindings: files, dirs, env, processes
+                         netsock.cpp   C-ABI bindings: sockets + platform TLS
+```
+
+### Import resolution
+
+`import re` makes the driver look for a source file, in this order:
+
+1. `re.py` (or `re/__init__.py`) next to the input file — a local module always wins, as in
+   CPython;
+2. `pylib/re.py` next to the `kamipy` binary (override the search path with `$KAMIPY_PYLIB`);
+3. a built-in module table in sema — the C-ABI modules (`math`, `os`, `socket`, ...).
+
+A resolved source file is lexed and parsed, its own imports are resolved first, and its
+top-level statements are spliced in front of the program. The whole thing is then one AST, one
+`sema` pass, one LLVM module, one executable — there is no import machinery at runtime.
+
+### Symbol mangling
+
+Because a bundled module's statements are spliced into the program, its top-level names would
+otherwise share the global namespace with the user's. `logging.py` defines `error`, `info` and
+`root`; a program that writes `error = str(e)` would clobber the library. So every top-level
+binding of a `pylib/` module is renamed with a module prefix:
+
+| Source | Symbol |
+|---|---|
+| `re.search` | `std_re_search` |
+| `re.Pattern` | `std_re_Pattern` |
+| `logging.info` | `std_logging_info` |
+| `Match.group` (a method) | `group` — **not** renamed, methods dispatch by name |
+
+Sema rewrites `mod.attr` and `from mod import x as y` onto the mangled symbols. Local `.py`
+files next to the program keep the flat namespace, which is what makes `from utils import
+helper` work unchanged.
+
+### TLS
+
+`requests` needs TLS, and TLS is a service the operating system provides. `socket.wrap_tls(host)`
+hands a connected socket to the platform's own stack — OpenSSL on POSIX, SChannel on Windows —
+and every subsequent `send`/`recv` on that socket is encrypted. This is exactly the role
+CPython's `ssl` module plays: a thin binding, with the protocol logic above it in Python.
+
 ---
 
 ## 4. Compiler frontend design

@@ -1,0 +1,16 @@
+['https', 'host.example', 8443, '/a/b?q=1']
+['http', 'host', 80, '/']
+['https', 'host', 443, '/x']
+a%20b/c%3Fd
+a=1%202&b=x%26y
+status 200 OK True
+json {'ok': True, 'n': 42}
+header exact application/json
+header folded abc
+missing header -
+repr <Response [200]>
+raise_for_status returns None
+chunked body: hello world
+connect error raised
+bad scheme raised
+requests py ok

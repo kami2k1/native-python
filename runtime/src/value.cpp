@@ -21,6 +21,8 @@ const char* type_name(int64_t tag) {
     case KT_OBJECT: return "object";
     case KT_SET: return "set";
     case KT_FILE: return "file";
+    case KT_SOCKET: return "socket";
+    case KT_LOCK: return "lock";
     case KT_PYOBJ: return "pyobject";
     default: return "?";
     }
@@ -118,8 +120,31 @@ std::string value_str(const KamiValue* v) {
 }
 
 std::string value_repr(const KamiValue* v) {
-    if (v->tag == KT_STR) return "'" + value_str(v) + "'";
-    return value_str(v);
+    if (v->tag != KT_STR) return value_str(v);
+    // Python's repr(): quote and escape so that the result can be read back.
+    KamiStr* s = (KamiStr*)v->p;
+    bool has_single = memchr(s->data, '\'', (size_t)s->len) != nullptr;
+    bool has_double = memchr(s->data, '"', (size_t)s->len) != nullptr;
+    char q = (has_single && !has_double) ? '"' : '\'';
+    std::string out(1, q);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c == '\\') out += "\\\\";
+        else if (c == (unsigned char)q) { out += '\\'; out += (char)c; }
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20 || c == 0x7f) {
+            static const char* hex = "0123456789abcdef";
+            out += "\\x";
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        } else {
+            out += (char)c;
+        }
+    }
+    out += q;
+    return out;
 }
 
 } // namespace kami
@@ -210,6 +235,17 @@ void kami_make_list(KamiValue* out, KamiValue** items, int64_t n) {
     for (int64_t i = 0; i < n; i++) l->items[l->len++] = *items[i];
     out->tag = KT_LIST;
     out->p = l;
+}
+
+// `def f(a, *rest)` prologue: collect argv[first..nargs) into a fresh list and
+// store it in the `rest` slot (already a registered GC root).
+void kami_pack_varargs(KamiValue* out, KamiValue** argv, int64_t nargs, int64_t first) {
+    Lock lk(g_lock);
+    int64_t n = nargs > first ? nargs - first : 0;
+    KamiList* l = list_new(n > 4 ? n : 4);
+    out->tag = KT_LIST;
+    out->p = l; // root before anything else can allocate
+    for (int64_t i = 0; i < n; i++) l->items[l->len++] = *argv[first + i];
 }
 
 void kami_make_map(KamiValue* out) {

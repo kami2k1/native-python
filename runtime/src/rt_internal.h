@@ -98,6 +98,7 @@ struct KamiFile {
     ObjHeader h;
     void* fp; // FILE*
     bool closed;
+    bool no_close; // sys.stdout / sys.stderr: .close() must be a no-op
 };
 
 struct KamiPyObj {
@@ -110,6 +111,17 @@ struct KamiSocket {
     int64_t fd;
     bool closed;
     double timeout; // seconds; <0 = blocking
+    void* tls;      // TlsConn* once wrap_tls() ran (netsock.cpp), else null
+};
+
+// threading.Lock() / threading.RLock(): a real OS mutex, not a GIL trick. The
+// compiled program runs as native machine code, so Python-level locks have to
+// map onto the platform's own synchronisation primitives.
+struct KamiLock {
+    ObjHeader h;
+    void* mtx;      // std::recursive_timed_mutex*
+    bool reentrant;
+    int64_t depth;  // for locked()
 };
 
 // Runtime error used for Python-level exceptions (try/except).
@@ -202,15 +214,16 @@ struct PinGuard {
 
 std::string format_float(double d);
 std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs);
-void json_loads(KamiValue* out, const std::string& text);          // lock held
-std::string json_dumps(const KamiValue* v);                        // lock held
-KamiClassObj* internal_class(const char* name);                    // lock held
-// Native HTTP/HTTPS client (http_client.cpp) — call WITHOUT the lock held.
-// Returns false and sets `err` on transport failure (like requests raising).
-bool http_request(const std::string& method, const std::string& url,
-                  const std::string& body, const std::string& content_type,
-                  double timeout_sec, long& status_out, std::string& body_out,
-                  std::string& err);
+
+// Sockets and TLS (netsock.cpp): C-ABI bindings to the OS. All protocol logic
+// (HTTP, ...) lives in runtime/pylib/ as Python.
+bool socket_create(KamiValue* out);
+// threading.Lock: the GIL-style runtime lock must be dropped while blocking on
+// a user lock, otherwise the program would deadlock against itself.
+bool lock_acquire(std::unique_lock<std::recursive_mutex>& lk, KamiLock* l, double timeout);
+void lock_release(KamiLock* l);
+void lock_destroy(KamiLock* l);
+void socket_release(KamiSocket* s); // frees the TLS context, if any
 void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
                    const std::string& m, KamiValue** argv, int64_t nargs);
 std::string format_value(KamiValue* v, const std::string& spec); // format() spec

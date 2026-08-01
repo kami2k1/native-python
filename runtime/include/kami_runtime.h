@@ -38,7 +38,8 @@ enum KamiTag : int64_t {
     KT_SET = 11,
     KT_FILE = 12,
     KT_SOCKET = 13,
-    KT_PYOBJ = 14, // CPython object bridged through the embedded C-API layer
+    KT_LOCK = 14,  // threading.Lock
+    KT_PYOBJ = 15, // CPython object bridged through the embedded C-API layer
 };
 
 enum KamiBinOp : int64_t {
@@ -75,6 +76,8 @@ void kami_make_int(KamiValue* out, int64_t v);
 void kami_make_float(KamiValue* out, double v);
 void kami_make_str(KamiValue* out, const char* data, int64_t len);
 void kami_make_list(KamiValue* out, KamiValue** items, int64_t n);
+// `*args` prologue: packs argv[first..nargs) into a list stored in *out.
+void kami_pack_varargs(KamiValue* out, KamiValue** argv, int64_t nargs, int64_t first);
 void kami_make_map(KamiValue* out);
 void kami_make_builtin_func(KamiValue* out, int64_t builtin_id, const char* name);
 // Build a closure: copies ncap captured values (given as an array of slot

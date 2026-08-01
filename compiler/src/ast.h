@@ -1,6 +1,7 @@
 #pragma once
 #include "token.h"
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -195,6 +196,14 @@ struct Module {
     // Subset of user_modules that came from the Python installation on this
     // machine rather than the project or the shipped pylib.
     std::set<std::string> system_modules;
+    // Symbol prefix applied to a bundled module's top-level names. Library
+    // modules (pylib/ or the system Python) are mangled ("re" → std_re_search)
+    // so a stdlib helper can never be clobbered by a user global of the same
+    // name; project .py files keep the flat namespace.
+    std::map<std::string, std::string> module_prefix;
+    // Library module names that were importable — used to print a useful list
+    // when an import cannot be resolved.
+    std::set<std::string> stdlib_available;
     std::string source_path; // input file path (for __file__)
 
     // C-ABI bindings discovered while analysing this module.

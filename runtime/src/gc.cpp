@@ -165,9 +165,11 @@ void gc_collect() {
             }
             case KT_FILE: {
                 KamiFile* f = (KamiFile*)h;
-                if (!f->closed && f->fp) fclose((FILE*)f->fp);
+                if (!f->closed && !f->no_close && f->fp) fclose((FILE*)f->fp);
                 break;
             }
+            case KT_SOCKET: socket_release((KamiSocket*)h); break;
+            case KT_LOCK: lock_destroy((KamiLock*)h); break;
             case KT_FUNC: free(((KamiFuncObj*)h)->captures); break;
             case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;

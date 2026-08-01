@@ -1,0 +1,43 @@
+a><b
+a
+['aa', 'aaa', 'aaa']
+['ac', 'abc']
+True
+True
+True
+['foobaz', 'barbaz']
+abc
+['12', '34']
+['th', 'q', 'ck', 'br', 'wn', 'f', 'x']
+['a', '-', 'b', '-', 'c', '-']
+['1.2.3', '45']
+hi
+['one', 'three']
+['two', 'four']
+dog concat dog.
+['ab']
+['Hello', 'World']
+True
+True
+HELLO
+size 42 {'key': 'size', 'val': '42'}
+[0, 7] [0, 4] [5, 7] 2
+aa
+True
+['a', None, 'c'] True ['a', '!', 'c']
+host at me
+a#b#c3
+['f00 b00', 4]
+['a', 'b', 'c']
+['a', '1', 'b', '2', 'c']
+['a', 'b,c']
+a[X]b[X]
+[['a', 1], ['bb', 22]]
+(\w+):(\d+) 2
+a\.b\*c
+['1+1']
+aaab
+aab
+True
+20000
+20000

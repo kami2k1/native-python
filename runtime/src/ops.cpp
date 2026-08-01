@@ -22,6 +22,120 @@ static void num_result_int(KamiValue* out, int64_t v) { out->tag = KT_INT; out->
 static void num_result_float(KamiValue* out, double v) { out->tag = KT_FLOAT; out->f = v; }
 static void bool_result(KamiValue* out, bool b) { out->tag = KT_BOOL; out->i = b; }
 
+// ---------------- %-style string formatting ----------------
+std::string percent_format(const std::string& fmt, const KamiValue* args, int64_t nargs) {
+    std::string out;
+    int64_t ai = 0;
+    // "%(name)s" % {...}: a single mapping argument is looked up by key.
+    const KamiMap* mapping =
+        (nargs == 1 && args[0].tag == KT_MAP) ? (const KamiMap*)args[0].p : nullptr;
+    std::string cur_key;
+    auto next = [&]() -> const KamiValue* {
+        if (!cur_key.empty()) {
+            if (!mapping) panic("format requires a mapping");
+            for (int64_t k = 0; k < mapping->nentries; k++) {
+                if (!mapping->entries[k].used) continue;
+                const KamiValue& kk = mapping->entries[k].key;
+                if (kk.tag != KT_STR) continue;
+                KamiStr* ks = (KamiStr*)kk.p;
+                if ((size_t)ks->len == cur_key.size() &&
+                    memcmp(ks->data, cur_key.data(), cur_key.size()) == 0)
+                    return &mapping->entries[k].val;
+            }
+            panic("KeyError: '" + cur_key + "'");
+        }
+        if (ai >= nargs) panic("not enough arguments for format string");
+        return &args[ai++];
+    };
+    for (size_t i = 0; i < fmt.size(); i++) {
+        char c = fmt[i];
+        if (c != '%') {
+            out += c;
+            continue;
+        }
+        if (i + 1 >= fmt.size()) panic("incomplete format");
+        // parse %[(key)][flags][width][.prec]type
+        std::string key;
+        size_t j = i + 1;
+        if (j < fmt.size() && fmt[j] == '(') {
+            size_t close = fmt.find(')', j);
+            if (close == std::string::npos) panic("incomplete format key");
+            key = fmt.substr(j + 1, close - j - 1);
+            j = close + 1;
+        }
+        std::string spec;
+        while (j < fmt.size() && (isdigit((unsigned char)fmt[j]) || fmt[j] == '-' ||
+                                  fmt[j] == '+' || fmt[j] == '.' || fmt[j] == ' ' ||
+                                  fmt[j] == '0'))
+            spec += fmt[j++];
+        if (j >= fmt.size()) panic("incomplete format");
+        char t = fmt[j];
+        i = j;
+        cur_key = key;
+        char buf[128];
+        switch (t) {
+        case '%': out += '%'; break;
+        case 's':
+        case 'r': {
+            const KamiValue* v = next();
+            std::string s2 = t == 's' ? value_str(v) : value_repr(v);
+            if (!spec.empty()) {
+                std::string f2 = "%" + spec + "s";
+                std::vector<char> big(s2.size() + 64);
+                snprintf(big.data(), big.size(), f2.c_str(), s2.c_str());
+                out += big.data();
+            } else {
+                out += s2;
+            }
+            break;
+        }
+        case 'd':
+        case 'i': {
+            const KamiValue* v = next();
+            int64_t x;
+            if (v->tag == KT_INT || v->tag == KT_BOOL) x = v->i;
+            else if (v->tag == KT_FLOAT) x = (int64_t)v->f;
+            else panic("%d format: a number is required");
+            std::string f2 = "%" + spec + "lld";
+            snprintf(buf, sizeof buf, f2.c_str(), (long long)x);
+            out += buf;
+            break;
+        }
+        case 'x':
+        case 'X':
+        case 'o': {
+            const KamiValue* v = next();
+            if (v->tag != KT_INT && v->tag != KT_BOOL) panic("%x format: an int is required");
+            std::string f2 = "%" + spec + "ll";
+            f2 += t;
+            snprintf(buf, sizeof buf, f2.c_str(), (long long)v->i);
+            out += buf;
+            break;
+        }
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G': {
+            const KamiValue* v = next();
+            double d;
+            if (v->tag == KT_FLOAT) d = v->f;
+            else if (v->tag == KT_INT || v->tag == KT_BOOL) d = (double)v->i;
+            else panic("%f format: a number is required");
+            std::string f2 = "%" + spec;
+            f2 += t;
+            snprintf(buf, sizeof buf, f2.c_str(), d);
+            out += buf;
+            break;
+        }
+        default:
+            panic(std::string("unsupported format character '%") + t + "'");
+        }
+    }
+    return out;
+}
+
 static int compare(const KamiValue* a, const KamiValue* b, const char* opname) {
     if (is_num(a) && is_num(b)) {
         double x = as_num(a), y = as_num(b);
@@ -169,6 +283,21 @@ static void binop_impl(int64_t op, KamiValue* out, const KamiValue* a, const Kam
         }
         return;
     case KOP_MOD:
+        if (a->tag == KT_STR) {
+            // printf-style formatting: "%s=%d" % (name, n)
+            KamiStr* f = (KamiStr*)a->p;
+            std::string fmt(f->data, (size_t)f->len);
+            std::string res;
+            if (b->tag == KT_LIST) {
+                KamiList* l = (KamiList*)b->p;
+                res = percent_format(fmt, l->items, l->len);
+            } else {
+                res = percent_format(fmt, b, 1);
+            }
+            out->tag = KT_STR;
+            out->p = str_new(res.data(), (int64_t)res.size());
+            return;
+        }
         if (a->tag == KT_INT && b->tag == KT_INT) {
             if (b->i == 0) panic("integer modulo by zero");
             int64_t r = a->i % b->i;
@@ -846,15 +975,71 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                 out->p = str_new(sv.data(), (int64_t)sv.size());
                 return;
             }
-            if ((m == "strip" || m == "lstrip" || m == "rstrip") && nargs == 0) {
-                size_t b = m == "rstrip" ? 0 : sv.find_first_not_of(" \t\r\n");
+            if ((m == "strip" || m == "lstrip" || m == "rstrip") && nargs <= 1) {
+                std::string cut = " \t\r\n\f\v";
+                if (nargs == 1) {
+                    if (argv[0]->tag != KT_STR) panic(m + "() expects a str");
+                    KamiStr* cs = (KamiStr*)argv[0]->p;
+                    cut.assign(cs->data, (size_t)cs->len);
+                }
+                size_t b = m == "rstrip" ? 0 : sv.find_first_not_of(cut);
                 size_t e = m == "lstrip" ? (sv.empty() ? std::string::npos : sv.size() - 1)
-                                         : sv.find_last_not_of(" \t\r\n");
+                                         : sv.find_last_not_of(cut);
                 std::string r = b == std::string::npos || e == std::string::npos
                                     ? ""
                                     : sv.substr(b, e - b + 1);
                 out->tag = KT_STR;
                 out->p = str_new(r.data(), (int64_t)r.size());
+                return;
+            }
+            if (m == "splitlines" && nargs <= 1) {
+                bool keepends = nargs == 1 && kami_truthy(argv[0]);
+                KamiList* r = list_new(4);
+                out->tag = KT_LIST;
+                out->p = r; // root before allocating the pieces
+                size_t start = 0;
+                for (size_t k = 0; k <= sv.size(); k++) {
+                    if (k == sv.size()) {
+                        if (start < sv.size()) {
+                            KamiValue v{KT_STR, {0}};
+                            v.p = str_new(sv.data() + start, (int64_t)(k - start));
+                            list_push((KamiList*)out->p, &v);
+                        }
+                        break;
+                    }
+                    if (sv[k] != '\n') continue;
+                    size_t stop = keepends ? k + 1 : k;
+                    if (!keepends && stop > start && sv[stop - 1] == '\r') stop--;
+                    KamiValue v{KT_STR, {0}};
+                    v.p = str_new(sv.data() + start, (int64_t)(stop - start));
+                    list_push((KamiList*)out->p, &v);
+                    start = k + 1;
+                }
+                return;
+            }
+            if ((m == "partition" || m == "rpartition") && nargs == 1) {
+                if (argv[0]->tag != KT_STR) panic(m + "() expects a str separator");
+                KamiStr* ss = (KamiStr*)argv[0]->p;
+                std::string sep(ss->data, (size_t)ss->len);
+                if (sep.empty()) panic("empty separator");
+                size_t at = m == "partition" ? sv.find(sep) : sv.rfind(sep);
+                KamiList* r = list_new(3);
+                out->tag = KT_LIST;
+                out->p = r;
+                std::string parts[3];
+                if (at == std::string::npos) {
+                    if (m == "partition") parts[0] = sv;
+                    else parts[2] = sv;
+                } else {
+                    parts[0] = sv.substr(0, at);
+                    parts[1] = sep;
+                    parts[2] = sv.substr(at + sep.size());
+                }
+                for (int k = 0; k < 3; k++) {
+                    KamiValue v{KT_STR, {0}};
+                    v.p = str_new(parts[k].data(), (int64_t)parts[k].size());
+                    list_push((KamiList*)out->p, &v);
+                }
                 return;
             }
             if (m == "capitalize" && nargs == 0) {
@@ -998,12 +1183,26 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                 out->tag = KT_BOOL; out->i = r;
                 return;
             }
-            if (m == "find" && nargs == 1) {
-                if (argv[0]->tag != KT_STR) panic("str.find() expects a str");
+            if ((m == "find" || m == "index") && nargs >= 1 && nargs <= 3) {
+                if (argv[0]->tag != KT_STR) panic("str." + m + "() expects a str");
                 KamiStr* p = (KamiStr*)argv[0]->p;
-                size_t f = sv.find(std::string(p->data, (size_t)p->len));
+                // optional start/end window, like CPython
+                int64_t from = 0, to = (int64_t)sv.size();
+                if (nargs >= 2 && argv[1]->tag == KT_INT) from = argv[1]->i;
+                if (nargs >= 3 && argv[2]->tag == KT_INT) to = argv[2]->i;
+                if (from < 0) from += (int64_t)sv.size();
+                if (to < 0) to += (int64_t)sv.size();
+                if (from < 0) from = 0;
+                if (to > (int64_t)sv.size()) to = (int64_t)sv.size();
+                int64_t r = -1;
+                if (from <= to) {
+                    size_t f = sv.substr(0, (size_t)to)
+                                   .find(std::string(p->data, (size_t)p->len), (size_t)from);
+                    if (f != std::string::npos) r = (int64_t)f;
+                }
+                if (r < 0 && m == "index") panic("ValueError: substring not found");
                 out->tag = KT_INT;
-                out->i = f == std::string::npos ? -1 : (int64_t)f;
+                out->i = r;
                 return;
             }
             if (m == "count" && nargs == 1) {
@@ -1067,12 +1266,25 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                 out->i = (int64_t)f;
                 return;
             }
-            if (m == "rfind" && nargs == 1) {
-                if (argv[0]->tag != KT_STR) panic("str.rfind() expects a str");
+            if ((m == "rfind" || m == "rindex") && nargs >= 1 && nargs <= 3) {
+                if (argv[0]->tag != KT_STR) panic("str." + m + "() expects a str");
                 KamiStr* p = (KamiStr*)argv[0]->p;
-                size_t f = sv.rfind(std::string(p->data, (size_t)p->len));
+                int64_t from = 0, to = (int64_t)sv.size();
+                if (nargs >= 2 && argv[1]->tag == KT_INT) from = argv[1]->i;
+                if (nargs >= 3 && argv[2]->tag == KT_INT) to = argv[2]->i;
+                if (from < 0) from += (int64_t)sv.size();
+                if (to < 0) to += (int64_t)sv.size();
+                if (from < 0) from = 0;
+                if (to > (int64_t)sv.size()) to = (int64_t)sv.size();
+                int64_t r = -1;
+                if (from <= to) {
+                    std::string needle(p->data, (size_t)p->len);
+                    size_t f = sv.substr(0, (size_t)to).rfind(needle);
+                    if (f != std::string::npos && (int64_t)f >= from) r = (int64_t)f;
+                }
+                if (r < 0 && m == "rindex") panic("ValueError: substring not found");
                 out->tag = KT_INT;
-                out->i = f == std::string::npos ? -1 : (int64_t)f;
+                out->i = r;
                 return;
             }
             if ((m == "ljust" || m == "rjust" || m == "center") && nargs >= 1 && nargs <= 2) {
@@ -1187,6 +1399,14 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                     if (nargs == 2) *out = *argv[1];
                     else { out->tag = KT_NONE; out->i = 0; }
                 }
+                return;
+            }
+            if (m == "setdefault" && (nargs == 1 || nargs == 2)) {
+                if (map_get(mp, argv[0], out)) return;
+                KamiValue dflt{KT_NONE, {0}};
+                if (nargs == 2) dflt = *argv[1];
+                map_set(mp, argv[0], &dflt);
+                *out = dflt;
                 return;
             }
         } else if (o.tag == KT_SET) {
@@ -1317,6 +1537,41 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
         } else if (o.tag == KT_SOCKET) {
             socket_method(lk, out, obj, m, argv, nargs);
             return;
+        } else if (o.tag == KT_LOCK) {
+            KamiLock* l = (KamiLock*)o.p;
+            if (m == "acquire" && nargs <= 2) {
+                double tmo = -1.0;
+                bool blocking = nargs < 1 || kami_truthy(argv[0]);
+                if (nargs == 2) {
+                    if (argv[1]->tag == KT_FLOAT) tmo = argv[1]->f;
+                    else if (argv[1]->tag == KT_INT) tmo = (double)argv[1]->i;
+                }
+                if (!blocking) tmo = 0.0;
+                out->tag = KT_BOOL;
+                out->i = lock_acquire(lk, l, tmo);
+                return;
+            }
+            if (m == "release" && nargs == 0) {
+                lock_release(l);
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            if (m == "locked" && nargs == 0) {
+                out->tag = KT_BOOL;
+                out->i = l->depth > 0;
+                return;
+            }
+            if (m == "__enter__" && nargs == 0) {
+                lock_acquire(lk, l, -1.0);
+                *out = o;
+                return;
+            }
+            if (m == "__exit__") {
+                lock_release(l);
+                out->tag = KT_NONE; out->i = 0;
+                return;
+            }
+            panic("'lock' object has no method '" + m + "'");
         } else if (o.tag == KT_FILE) {
             KamiFile* f = (KamiFile*)o.p;
             FILE* fp = (FILE*)f->fp;
@@ -1366,7 +1621,7 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                 return;
             }
             if (m == "close" && nargs == 0) {
-                if (!f->closed) {
+                if (!f->closed && !f->no_close) {
                     fclose(fp);
                     f->closed = true;
                 }
@@ -1375,66 +1630,6 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             }
         } else if (o.tag == KT_OBJECT) {
             KamiInstance* in = (KamiInstance*)o.p;
-            const char* cn = in->cls->name;
-            if (strcmp(cn, "Match") == 0) {
-                KamiValue gv;
-                auto it = in->fields->find("__groups__");
-                if (it == in->fields->end()) panic("bad Match object");
-                gv = it->second;
-                KamiList* groups = (KamiList*)gv.p;
-                auto grp = [&](int64_t idx) -> KamiList* {
-                    if (idx < 0 || idx >= groups->len)
-                        panic("no such group " + std::to_string(idx));
-                    return (KamiList*)groups->items[idx].p;
-                };
-                if (m == "group") {
-                    int64_t idx = nargs == 0 ? 0 : (argv[0]->tag == KT_INT ? argv[0]->i : 0);
-                    KamiList* tri = grp(idx);
-                    if (tri->items[0].i < 0) { out->tag = KT_NONE; out->i = 0; }
-                    else *out = tri->items[2];
-                    return;
-                }
-                if (m == "groups" && nargs == 0) {
-                    KamiList* r = list_new(groups->len);
-                    out->tag = KT_LIST; out->p = r;
-                    for (int64_t i = 1; i < groups->len; i++) {
-                        KamiList* tri = (KamiList*)groups->items[i].p;
-                        if (tri->items[0].i < 0) {
-                            KamiValue none{KT_NONE, {0}};
-                            r->items[r->len++] = none;
-                        } else {
-                            r->items[r->len++] = tri->items[2];
-                        }
-                    }
-                    return;
-                }
-                if ((m == "start" || m == "end") && nargs <= 1) {
-                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
-                    KamiList* tri = grp(idx);
-                    out->tag = KT_INT;
-                    out->i = tri->items[m == "start" ? 0 : 1].i;
-                    return;
-                }
-                if (m == "span" && nargs <= 1) {
-                    int64_t idx = nargs == 1 && argv[0]->tag == KT_INT ? argv[0]->i : 0;
-                    KamiList* tri = grp(idx);
-                    KamiList* r = list_new(2);
-                    r->items[0] = tri->items[0];
-                    r->items[1] = tri->items[1];
-                    r->len = 2;
-                    out->tag = KT_LIST; out->p = r;
-                    return;
-                }
-                panic(std::string("Match object has no method '") + m + "'");
-            }
-            if (strcmp(cn, "Response") == 0 && m == "json" && nargs == 0) {
-                auto it = in->fields->find("text");
-                if (it == in->fields->end() || it->second.tag != KT_STR)
-                    panic("Response has no text to decode");
-                KamiStr* t = (KamiStr*)it->second.p;
-                json_loads(out, std::string(t->data, (size_t)t->len));
-                return;
-            }
             KamiValue* mv = nullptr;
             bool bound = false;
             auto it = in->fields->find(m);

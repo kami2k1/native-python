@@ -1,10 +1,40 @@
 // Classes, instances, attributes, and the exception machinery.
 #include "rt_internal.h"
 
+#include <chrono>
+#include <mutex>
+
 #include <cstdio>
 #include <cstdlib>
 
 namespace kami {
+
+// ---- threading.Lock -------------------------------------------------------
+bool lock_acquire(std::unique_lock<std::recursive_mutex>& lk, KamiLock* l, double timeout) {
+    auto* mtx = (std::recursive_timed_mutex*)l->mtx;
+    lk.unlock(); // never hold the runtime lock while blocking
+    bool got;
+    if (timeout < 0) {
+        mtx->lock();
+        got = true;
+    } else {
+        got = mtx->try_lock_for(std::chrono::milliseconds((long long)(timeout * 1000)));
+    }
+    lk.lock();
+    if (got) l->depth++;
+    return got;
+}
+
+void lock_release(KamiLock* l) {
+    if (l->depth <= 0) panic("RuntimeError: release unlocked lock");
+    l->depth--;
+    ((std::recursive_timed_mutex*)l->mtx)->unlock();
+}
+
+void lock_destroy(KamiLock* l) {
+    delete (std::recursive_timed_mutex*)l->mtx;
+    l->mtx = nullptr;
+}
 
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name) {
     while (c) {
@@ -46,7 +76,7 @@ void kami_class_add_method(int64_t cls_gidx, const char* name, void* fnptr,
     f->fn = fnptr;
     f->min_arity = min_arity;
     f->arity = arity;
-    f->builtin_id = -1;
+    f->builtin_id = -1; // a compiled method, not a builtin
     f->captures = nullptr;
     f->ncaptures = 0;
     f->kwonly = kwonly;

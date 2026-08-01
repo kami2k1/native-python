@@ -125,19 +125,28 @@ struct FnGen {
         return t;
     }
 
-    // Reserve a frame slot that will not be reused when temp_top is reset.
+    // Reserve a frame slot that survives temp_top resets (used by `with` to keep
+    // the context manager alive across the outlined body).
+    //
+    // These slots live above the temp window, but `max_temps` is only final once
+    // the whole function has been generated — so the index cannot be computed
+    // here. Emitting a placeholder that finish() patches keeps persistent slots
+    // and temporaries from ever aliasing. (They did before, which is why
+    // `with` inside a loop used to lose its context manager and never run
+    // __exit__.)
+    static const int PERSISTENT_BASE = 1 << 20;
     int persistent_top = 0;
-    int alloc_slot_persistent() {
-        // grow temps_base region by pinning above current max; simplest: use a
-        // dedicated counter beyond the temp window.
-        int t = temps_base + max_temps + persistent_top;
-        persistent_top++;
-        return t;
+    int alloc_slot_persistent() { return PERSISTENT_BASE + persistent_top++; }
+
+    std::string slot_index(int slot) const {
+        if (slot >= PERSISTENT_BASE)
+            return "@@PSLOT" + std::to_string(slot - PERSISTENT_BASE) + "@@";
+        return std::to_string(slot);
     }
 
     std::string slot_ptr(int slot) {
         std::string p = r();
-        emit(p + " = getelementptr inbounds %kv, ptr %frame, i64 " + std::to_string(slot));
+        emit(p + " = getelementptr inbounds %kv, ptr %frame, i64 " + slot_index(slot));
         return p;
     }
 
@@ -1892,6 +1901,20 @@ struct FnGen {
         }
     }
 
+    // Replaces every @@PSLOTn@@ placeholder with the real frame index, now that
+    // the temp window has its final size.
+    void patch_pslots(std::string& ir) const {
+        for (int k = 0; k < persistent_top; k++) {
+            std::string needle = "@@PSLOT" + std::to_string(k) + "@@";
+            std::string repl = std::to_string(temps_base + max_temps + k);
+            size_t p = 0;
+            while ((p = ir.find(needle, p)) != std::string::npos) {
+                ir.replace(p, needle.size(), repl);
+                p += repl.size();
+            }
+        }
+    }
+
     // ---- whole function ----
     std::string finish(const std::string& fn_name, bool has_try) {
         (void)has_try;
@@ -1920,6 +1943,8 @@ struct FnGen {
             extras.replace(p, needle.size(), repl);
             p += repl.size();
         }
+        patch_pslots(extras);
+        patch_pslots(out);
         return extras + out;
     }
 };
@@ -1941,6 +1966,7 @@ declare void @kami_make_int(ptr, i64)
 declare void @kami_make_float(ptr, double)
 declare void @kami_make_str(ptr, ptr, i64)
 declare void @kami_make_list(ptr, ptr, i64)
+declare void @kami_pack_varargs(ptr, ptr, i64, i64)
 declare void @kami_make_map(ptr)
 declare void @kami_make_builtin_func(ptr, i64, ptr)
 declare void @kami_make_closure(ptr, ptr, i64, i64, ptr, ptr, i64, i64, i64, ptr)
