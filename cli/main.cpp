@@ -71,8 +71,9 @@ int main(int argc, char** argv) {
         if (!opts.emit_ast) printf("built %s\n", exe.c_str());
         return 0;
     } catch (const CompileError& e) {
-        fprintf(stderr, "%s:%d: error: %s\n",
-                argc > 2 ? argv[2] : "<input>", e.line, e.what());
+        const char* file = !e.file.empty() ? e.file.c_str()
+                                           : (argc > 2 ? argv[2] : "<input>");
+        fprintf(stderr, "%s:%d: error: %s\n", file, e.line, e.what());
         return 1;
     } catch (const std::exception& e) {
         fprintf(stderr, "kamipy: error: %s\n", e.what());

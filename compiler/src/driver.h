@@ -21,4 +21,8 @@ int run_process(const std::vector<std::string>& args);
 
 std::string find_runtime_lib(const std::string& argv0);
 
+// Directory holding the running kamipy binary (asks the OS; argv0 is only a
+// fallback). Used to locate both libkamirt and the Python stdlib.
+std::string executable_dir(const std::string& argv0);
+
 } // namespace kami

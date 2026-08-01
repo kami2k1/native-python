@@ -156,8 +156,7 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
             for (int64_t i = b; i < e2; i += stp) r += s->data[i];
         else
             for (int64_t i = b; i > e2; i += stp) r += s->data[i];
-        out->tag = KT_STR;
-        out->p = str_new(r.data(), (int64_t)r.size());
+        put_str(out, r.data(), (int64_t)r.size());
         return;
     }
     KamiList* src = (KamiList*)o.p;

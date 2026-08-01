@@ -1,6 +1,7 @@
 #pragma once
 #include "token.h"
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -112,17 +113,29 @@ struct Stmt {
     int ncaptures = 0;               // Raise: 0=expr,1=bare,2=typed (name in 'name', arg in e1)
 };
 
+// A .py module (stdlib or next to the input file) whose source was translated
+// into this program by the bundler. Its top-level statements are spliced before
+// the main body and every module-level name it binds was renamed to
+// "<prefix><name>", giving the module a real namespace: sema maps "re.match" to
+// the global "re__match".
+struct BundledModule {
+    std::string path;              // source file that was translated
+    std::string prefix;            // "re__", "os_path__", ...
+    std::set<std::string> exports; // module-level names, original spelling
+    // Every line number of this module's AST is shifted into its own range so a
+    // diagnostic can be traced back to "stdlib/re.py:57" after splicing.
+    int line_offset = 0;
+};
+
 struct Module {
     std::vector<StmtPtr> body;         // module-level statements
     std::vector<Stmt*> functions;      // all FuncDefs incl. methods (borrowed)
     std::vector<Stmt*> classes;        // all ClassDefs (borrowed)
     std::vector<StmtPtr> synth;        // synthetic functions (lambdas), owned
     int64_t nglobals = 0;
-    // Local .py modules whose source was bundled into this module by the
-    // driver ("import utils" → utils.py compiled in). Their top-level code is
-    // spliced before the main body; sema maps "utils.x" to plain "x".
-    std::set<std::string> user_modules;
-    std::string source_path; // input file path (for __file__)
+    std::map<std::string, BundledModule> bundled; // module name → namespace info
+    std::vector<std::string> search_path;          // where imports were looked for
+    std::string source_path;                       // input file path (for __file__)
 };
 
 // S-expression dump for tests/debugging.

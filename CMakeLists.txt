@@ -28,26 +28,13 @@ add_library(kamirt STATIC
     runtime/src/collections.cpp
     runtime/src/ops.cpp
     runtime/src/objects.cpp
-    runtime/src/netio.cpp
-    runtime/src/http_client.cpp
-    runtime/src/kami_regex.cpp
+    runtime/src/syscalls.cpp
     runtime/src/builtins.cpp
 )
 target_include_directories(kamirt PUBLIC runtime/include)
 target_link_libraries(kamirt PUBLIC Threads::Threads)
 if(WIN32)
-    # winhttp: native HTTP/HTTPS client for `requests` (TLS via SChannel)
-    target_link_libraries(kamirt PUBLIC ws2_32 winhttp)
-else()
-    # OpenSSL (optional): TLS for https:// in the native `requests` client.
-    # Plain http:// works without it.
-    find_package(OpenSSL QUIET)
-    if(OpenSSL_FOUND)
-        target_compile_definitions(kamirt PRIVATE KAMI_HAVE_OPENSSL)
-        target_link_libraries(kamirt PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-    else()
-        message(STATUS "OpenSSL not found — requests will support http:// only")
-    endif()
+    target_link_libraries(kamirt PUBLIC ws2_32)
 endif()
 target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
 
@@ -56,6 +43,7 @@ add_library(kamipy_core STATIC
     compiler/src/lexer.cpp
     compiler/src/parser.cpp
     compiler/src/sema.cpp
+    compiler/src/modules.cpp
     compiler/src/codegen.cpp
     compiler/src/driver.cpp
 )
@@ -72,14 +60,19 @@ target_link_libraries(kamipy PRIVATE kamipy_core)
 # kamipy expects libkamirt.a next to its own binary
 add_dependencies(kamipy kamirt)
 
-# Ship the pure-Python standard library (itertools, functools, ...) next to the
-# kamipy binary so the driver can bundle it on import. The library is Python —
-# compiled by the same pipeline, never reimplemented in C++.
+# ---- Python standard library ----
+# stdlib/*.py is translated from source by kamipy on every "import", so it has to
+# travel with the binary: copy it next to kamipy after every build (this also
+# covers multi-config generators, where the binary lands in build/<Config>/), and
+# install it under lib/kamipy/stdlib. See stdlib_search_dirs().
 add_custom_command(TARGET kamipy POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/runtime/pylib
-            $<TARGET_FILE_DIR:kamipy>/pylib
-    COMMENT "Copying Python stdlib (pylib/) next to kamipy")
+            ${CMAKE_CURRENT_SOURCE_DIR}/stdlib $<TARGET_FILE_DIR:kamipy>/stdlib
+    COMMENT "Copying the Python standard library (stdlib/) next to kamipy")
+
+install(TARGETS kamipy RUNTIME DESTINATION bin)
+install(TARGETS kamirt ARCHIVE DESTINATION bin)
+install(DIRECTORY stdlib/ DESTINATION lib/kamipy/stdlib FILES_MATCHING PATTERN "*.py")
 
 # ---- tests ----
 enable_testing()
@@ -96,3 +89,12 @@ add_test(NAME integration
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_tests.sh
                  $<TARGET_FILE:kamipy>)
 set_tests_properties(integration PROPERTIES TIMEOUT 600)
+
+# The same programs, but with the GC collecting before every allocation: a value
+# that is not reachable from a registered root fails immediately and
+# reproducibly instead of corrupting the heap much later.
+add_test(NAME integration.gc_stress
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_tests.sh
+                 $<TARGET_FILE:kamipy>)
+set_tests_properties(integration.gc_stress PROPERTIES
+                     TIMEOUT 900 ENVIRONMENT "KAMIPY_GC_STRESS=1")

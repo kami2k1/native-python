@@ -173,8 +173,16 @@ void gc_collect() {
     if (g_gc_threshold < (1u << 20)) g_gc_threshold = 1 << 20;
 }
 
+// KAMIPY_GC_STRESS=1 collects before every allocation: any value that is not
+// reachable from a registered root becomes an immediate, reproducible failure
+// instead of a rare crash. Used by the test suite.
+static bool gc_stress() {
+    static bool on = getenv("KAMIPY_GC_STRESS") != nullptr;
+    return on;
+}
+
 void* gc_alloc(uint64_t size, uint32_t type) {
-    if (g_bytes_since_gc > g_gc_threshold) gc_collect();
+    if (gc_stress() || g_bytes_since_gc > g_gc_threshold) gc_collect();
     ObjHeader* h = (ObjHeader*)calloc(1, size);
     if (!h) panic("out of memory");
     h->type = type;

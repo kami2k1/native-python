@@ -2,6 +2,7 @@
 
 #include "codegen.h"
 #include "lexer.h"
+#include "modules.h"
 #include "parser.h"
 #include "sema.h"
 
@@ -10,7 +11,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <set>
 #include <sstream>
 #include <vector>
 
@@ -78,6 +78,8 @@ static fs::path self_dir(const std::string& argv0) {
     return fs::current_path();
 }
 
+std::string executable_dir(const std::string& argv0) { return self_dir(argv0).string(); }
+
 std::string find_runtime_lib(const std::string& argv0) {
     if (const char* env = getenv("KAMIPY_RT_LIB")) {
         if (fs::exists(env)) return env;
@@ -107,156 +109,24 @@ static std::string read_file(const std::string& path) {
     return ss.str();
 }
 
-// ---- local module bundling -------------------------------------------------
-// "import utils" where utils.py sits next to the input file: the module's
-// source is parsed and its top-level statements are spliced in front of the
-// main program (dependency-first), so the whole thing compiles into one
-// native executable. Sema then resolves "utils.x" as plain "x".
-
-static void collect_import_names(Stmt* s, std::vector<std::string>& out) {
-    switch (s->kind) {
-    case StmtKind::Import:
-        out.push_back(s->name);
-        for (auto& extra : s->body) collect_import_names(extra.get(), out);
-        return;
-    case StmtKind::FromImport:
-        if (!s->name.empty()) out.push_back(s->name);
-        // `from . import a, b` — the imported names are sibling modules.
-        if (s->relative && s->name.empty())
-            for (auto& [n, alias] : s->import_names) out.push_back(n);
-        return;
-    default: break;
-    }
-    for (auto& c : s->body) collect_import_names(c.get(), out);
-    for (auto& c : s->orelse) collect_import_names(c.get(), out);
-    for (auto& h : s->handlers)
-        for (auto& c : h.body) collect_import_names(c.get(), out);
-    for (auto& c : s->final_body) collect_import_names(c.get(), out);
-}
-
-// True for the idiom  if __name__ == "__main__": ...  — bundled modules are
-// not the main program, so their guard blocks are dropped (CPython semantics).
-static bool is_main_guard(const Stmt* s) {
-    if (s->kind != StmtKind::If || !s->e1) return false;
-    const Expr* c = s->e1.get();
-    if (c->kind != ExprKind::Binary || c->op != KOP_EQ) return false;
-    const Expr* l = c->a.get();
-    const Expr* r = c->b.get();
-    auto is_name_dunder = [](const Expr* x) {
-        return x->kind == ExprKind::Name && x->sval == "__name__";
-    };
-    auto is_main_str = [](const Expr* x) {
-        return x->kind == ExprKind::StrLit && x->sval == "__main__";
-    };
-    return (is_name_dunder(l) && is_main_str(r)) || (is_name_dunder(r) && is_main_str(l));
-}
-
-namespace {
-struct Bundler {
-    fs::path base_dir;
-    std::set<std::string> loading; // cycle guard
-    std::set<std::string> loaded;
-    std::vector<StmtPtr> prelude;
-
-    // "pkg.mod" → base_dir/pkg/mod.py
-    fs::path module_path(const std::string& name) const {
-        std::string rel = name;
-        for (char& ch : rel)
-            if (ch == '.') ch = '/';
-        return base_dir / (rel + ".py");
-    }
-
-    // Bundled standard-library modules are shipped as *real Python* in a
-    // pylib/ folder next to the kamipy binary (and in the source tree). This is
-    // the project's core idea: the library is translated as Python, compiled by
-    // the same pipeline — never reimplemented at the C++ layer.
-    fs::path stdlib_path(const std::string& name) const {
-        if (name.find('.') != std::string::npos) return {}; // no dotted stdlib yet
-        std::error_code ec;
-        for (const fs::path& dir : stdlib_dirs) {
-            fs::path cand = dir / (name + ".py");
-            if (fs::exists(cand, ec)) return cand;
-        }
-        return {};
-    }
-
-    std::vector<fs::path> stdlib_dirs;
-
-    void process(std::vector<StmtPtr>& body) {
-        std::vector<std::string> names;
-        for (auto& sp : body) collect_import_names(sp.get(), names);
-        for (auto& n : names) load(n);
-    }
-
-    void load(const std::string& name) {
-        if (loaded.count(name)) return;
-        fs::path file = module_path(name);
-        std::error_code ec;
-        bool local = fs::exists(file, ec);
-        if (!local) {
-            // A local file shadows the bundled stdlib (Python semantics). Only
-            // fall back to the shipped pylib when no local file exists.
-            fs::path lib = stdlib_path(name);
-            if (lib.empty()) return; // truly unknown: sema reports it (or try/except)
-            file = lib;
-        } else if (known_builtin_module(name)) {
-            return; // native module and no local override
-        }
-        if (loading.count(name))
-            throw std::runtime_error("circular import between local modules involving '" +
-                                     name + "'");
-        loading.insert(name);
-        Module sub;
-        try {
-            sub = parse(lex(read_file(file.string())));
-        } catch (CompileError& e) {
-            throw std::runtime_error(file.string() + ":" + std::to_string(e.line) +
-                                     ": error: " + e.what());
-        }
-        process(sub.body); // dependencies of the dependency come first
-        for (auto& sp : sub.body) {
-            if (is_main_guard(sp.get())) continue; // not the main program
-            prelude.push_back(std::move(sp));
-        }
-        loading.erase(name);
-        loaded.insert(name);
-    }
-};
-} // namespace
-
-static void bundle_local_modules(Module& mod, const fs::path& input, const std::string& argv0) {
-    Bundler b;
-    b.base_dir = fs::absolute(input).parent_path();
-    // Where to find the shipped Python stdlib (pylib/). Checked in order:
-    //   <binary dir>/pylib, <binary dir>/../pylib, <source>/runtime/pylib,
-    //   $KAMIPY_PYLIB.
-    fs::path bindir = self_dir(argv0);
-    b.stdlib_dirs = {bindir / "pylib", bindir.parent_path() / "pylib",
-                     bindir / ".." / "runtime" / "pylib",
-                     bindir.parent_path() / "runtime" / "pylib"};
-    if (const char* env = getenv("KAMIPY_PYLIB")) b.stdlib_dirs.insert(b.stdlib_dirs.begin(), env);
-    b.process(mod.body);
-    if (b.loaded.empty()) return;
-    std::vector<StmtPtr> merged;
-    merged.reserve(b.prelude.size() + mod.body.size());
-    for (auto& sp : b.prelude) merged.push_back(std::move(sp));
-    for (auto& sp : mod.body) merged.push_back(std::move(sp));
-    mod.body = std::move(merged);
-    mod.user_modules = std::move(b.loaded);
-}
-
 std::string build(const BuildOptions& opts) {
     std::string src = read_file(opts.input);
 
     Module mod = parse(lex(src));
     mod.source_path = fs::absolute(opts.input).string();
-    bundle_local_modules(mod, opts.input, opts.argv0);
-    analyze(mod);
-    if (opts.emit_ast) {
-        fputs(dump_module(mod).c_str(), stdout);
-        return "";
+    bundle_modules(mod, opts.input, opts.argv0);
+    std::string ir;
+    try {
+        analyze(mod);
+        if (opts.emit_ast) {
+            fputs(dump_module(mod).c_str(), stdout);
+            return "";
+        }
+        ir = codegen(mod, opts.input);
+    } catch (const CompileError& e) {
+        // The error may sit in a translated stdlib module: report its own file.
+        throw locate_error(mod, e);
     }
-    std::string ir = codegen(mod, opts.input);
 
     fs::path out = opts.output.empty() ? fs::path(opts.input).stem() : fs::path(opts.output);
 #ifdef _WIN32

@@ -337,19 +337,65 @@ KIR ──codegen──▶ LLVM IR ──llc/TargetMachine──▶ .o (x86-64 o
 
 ---
 
-## 9. Import system (PHASE 10 — thiết kế)
+## 9. Import system và standard library
 
-**Static import**, không import động runtime:
+**Static import**, không import động runtime — và từ v0.6.0 thêm một nguyên tắc bất di bất dịch:
+
+> **Chỉ dịch, không tự viết lại.** Việc của compiler là *dịch* mã Python thành mã native,
+> không phải viết lại thư viện Python bằng C++.
 
 ```
-import math
-   │ resolve: stdlib trước, rồi file cạnh main.py
-   ▼ compile module (đệ quy, phát hiện cycle → lỗi)
-   ▼ mỗi module → một LLVM module / object riêng, symbol prefix kami_mod_<name>_
-   ▼ link tất cả vào một executable
+import re
+   │ resolve: <thư mục input>/re.py, rồi $KAMIPY_STDLIB hoặc <kamipy>/../stdlib/re.py
+   ▼ lex + parse chính file Python của module
+   ▼ đệ quy vào import của nó (dependency trước; cycle → lỗi)
+   ▼ đổi tên các binding cấp module thành namespace:  match → re__match
+   ▼ ghép statement vào trước thân chương trình → một AST → một LLVM module
 ```
 
-Stdlib (`math`, `json`, `filesystem`, `time`, `random`) viết bằng C++ trong `libkamirt`, expose qua bảng symbol để semantic analyzer biết chữ ký hàm.
+Nhờ vậy `re`, `json`, `logging`, `os`, `os.path`, `socket`, `requests`, `string` đều là
+**file Python trong `stdlib/`**, được biên dịch y như code người dùng: chương trình
+`import re` có regex engine native tĩnh vì *mã Python của engine đã được dịch*, chứ
+không phải vì link thêm code C++.
+
+### 9.1 Namespace mà không cần module object
+
+Ngôn ngữ không có module object lúc runtime, nên bundler tạo namespace ở compile-time
+bằng cách đổi tên các binding cấp module:
+
+| Trong `stdlib/re.py` | Sau khi bundle | Gọi bằng |
+|---|---|---|
+| `def match(...)` | `def re__match(...)` | `re.match(...)` |
+| `class Pattern` | `class re__Pattern` | `re.Pattern` |
+| `_cache = {}` | `re___cache = {}` | (riêng của module) |
+| trong `stdlib/os/path.py`: `def join` | `def os_path__join` | `os.path.join(...)` |
+
+Bộ đổi tên hiểu scope: tên local (hoặc tham số) của hàm che tên cấp module và **không**
+bị đổi, còn `global x` thì trỏ lại global đã namespace hoá. Vì `.` không thể xuất hiện
+trong identifier Python, tên của chương trình không bao giờ đụng nội bộ module — user
+viết `def match()` vẫn dùng được `re.match`. Sema resolve `re.match` /
+`from re import match as m` qua cùng một bảng, và thông báo lỗi được dịch ngược
+(`re.findall() takes 3 argument(s)`, không bao giờ hiện `re__findall`). Số dòng AST của
+mỗi module được dịch sang một khoảng riêng nên lỗi trong mã đã dịch báo đúng
+`stdlib/re.py:57: error: ...`.
+
+### 9.2 Phần nào còn là C++, và vì sao
+
+`libkamirt` chỉ còn hai loại C++:
+
+1. **Value model + GC** — bản thân ngôn ngữ: tagged value, string, list, dict, set,
+   object, toán tử, mark & sweep (§5, §6).
+2. **C-ABI binding tới OS** (`runtime/src/syscalls.cpp`, module `_kami`) — forward một
+   dòng tới libc: `open/read/write/close/lseek`, `stat/mkdir/rmdir/unlink/rename/
+   getcwd/chdir`, `opendir/readdir`, `socket/connect/bind/listen/accept/send/recv/
+   setsockopt`, `getenv/system/getpid/localtime`.
+
+Ranh giới: *nếu không viết được bằng Python vì cần một struct ngôn ngữ không diễn đạt
+được (`sockaddr`, `struct stat`, `DIR*`) thì đó là binding; còn lại là Python.*
+`socket.py` là class Python giữ một fd integer; `requests.py` nói HTTP/1.1 qua class đó;
+`logging.py` render record rồi ghi bằng `_kami.fd_write`. `math`, `time`, `random`,
+`threading` vẫn native vì bản thân chúng *là* binding trực tiếp tới libm / libc /
+`std::thread`.
 
 ---
 
@@ -436,3 +482,45 @@ Bản triển khai v0.1 (xem `CHANGELOG.md` mục v0.1.0) có các khác biệt 
 3. **Threading theo mô hình GIL** như CPython: mọi runtime call giữ một global lock; `sleep/join` nhả lock khi block. Tối ưu quan trọng: khi chương trình chưa spawn thread nào, lock được **bỏ qua hoàn toàn** (flag bật vĩnh viễn tại lần spawn đầu — chuyển trạng thái an toàn vì lúc đó chỉ có đúng một thread và nó đang giữ lock thật). Kết quả: single-thread nhanh gấp ~2 lần, đa luồng vẫn đúng.
 4. **Codegen phát textual LLVM IR (`.ll`) rồi gọi `clang++`** làm backend + linker driver (qua `fork/execvp`, không qua shell). Đơn giản, không phụ thuộc phiên bản thư viện LLVM C++, vẫn là pipeline LLVM thực thụ. In-process `TargetMachine` là tối ưu tương lai.
 5. **AST dùng `unique_ptr` (RAII)** thay arena — thay đổi hiệu năng compiler, không đổi ngữ nghĩa.
+
+---
+
+## 16. v0.6.0: "chỉ dịch, không tự viết" (as-built)
+
+v0.3–v0.5.1 đã dựng một bản stdlib bằng C++ ngay trong runtime: `runtime/src/netio.cpp`
+chứa JSON parser, formatter cho logging, wrapper `os`/`os.path` trên `std::filesystem`,
+model socket và một HTTP client gọi `curl`; `runtime/src/kami_regex.cpp` chứa regex
+engine tự viết; `runtime/src/http_client.cpp` thay lời gọi `curl` bằng 562 dòng
+WinHTTP/OpenSSL. Cả ba file đã bị xoá.
+
+| | trước (v0.5) | sau (v0.6) |
+|---|---|---|
+| stdlib | ~2.100 dòng C++ trong runtime | ~2.100 dòng Python trong `stdlib/` |
+| `re` | engine C++ tự viết | `stdlib/re.py`, backtracking bằng chuỗi continuation tường minh |
+| `requests` | subprocess `curl` (v0.3–v0.5), rồi 562 dòng C++ trên WinHTTP/OpenSSL (v0.5.1) | `stdlib/requests.py` nói HTTP/1.1 qua `stdlib/socket.py` |
+| `socket` | heap type `KT_SOCKET` + method C++ | class Python trên một fd integer |
+| `json`, `logging`, `os`, `os.path`, `string` | builtin id trong C++ | module Python |
+| namespace module | splice phẳng (`utils.f` → `f`) | namespace đổi tên (`re.match` → `re__match`) |
+| tag runtime | `KT_SOCKET` | đã bỏ |
+| binary hello-world | 365 KB | 225 KB |
+
+Những hệ quả cần biết:
+
+- **Đúng đắn hơn.** Hai bug biến mất cùng đoạn C++ chứa chúng: heap corruption trong
+  GC-rooting của `re.findall` cũ, và việc engine cũ lệch ngữ nghĩa so với CPython.
+  Engine Python được so khớp từng byte với CPython trong CI.
+- **Tìm và sửa được một bug GC.** Mã Python cấp phát nhiều đã phơi ra một vi phạm thứ tự
+  rooting trong runtime: `out->tag = KT_STR` được ghi *trước* `str_new()`, nên một lần
+  collect do chính lần cấp phát đó kích hoạt sẽ đi theo payload cũ của slot như một con
+  trỏ. Mọi vị trí như vậy giờ cấp phát trước rồi mới publish (`put_str`), và
+  `KAMIPY_GC_STRESS=1` (collect trước mỗi lần cấp phát) chạy lại toàn bộ suite integration
+  trong CI. Cũng nhờ công tắc đó mà tìm ra hai bug rooting nữa: `set("chuỗi")` truyền một
+  slot chưa root hoá cho `kami_iter_prep` (hàm này cấp phát một object mỗi ký tự), và
+  `as_list_pinned()` đăng ký pin *sau* khi vật chất hoá list.
+- **Regex chậm hơn.** `re.findall(r"\d+", ...)` trên chuỗi 8 KB, lặp 50 lần, mất ~0,69 s
+  so với ~0,04 s của engine C++ đã xoá — giá phải trả trung thực khi chạy cùng một thuật toán
+  theo cùng cách CPython làm. Bản native vẫn ngang tầm engine C của CPython với input
+  nhỏ, và matcher có fast-path một ký tự cùng bộ lọc quét theo atom đầu.
+- **`requests` chưa hỗ trợ HTTPS.** Client cũ thừa hưởng TLS từ `curl`; client Python cần
+  binding tới một thư viện TLS, hiện chưa có, nên `https://` báo lỗi rõ ràng thay vì
+  âm thầm hạ cấp.

@@ -1,0 +1,9 @@
+200 True OK
+application/json
+/status
+200 7 ok
+https guarded
+scheme guarded
+connection error raised
+True
+http ok

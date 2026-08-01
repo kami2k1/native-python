@@ -4,6 +4,121 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.6.0] — 2026-08-01 — "Chỉ dịch, không tự viết": stdlib bằng Python + C-ABI syscalls
+
+Refactor kiến trúc lớn. Nguyên tắc: **compiler dịch mã Python ra native, không viết lại
+thư viện Python bằng C++.** / A large architectural refactor around one rule: **the
+compiler translates Python source into native code; it does not reimplement Python's
+libraries in C++.**
+
+### Removed — mã C++ thủ công mô phỏng module cấp cao
+- **Xoá `runtime/src/netio.cpp`** (1.100 dòng): JSON parser/serializer, formatter của
+  `logging`, wrapper `os`/`os.path` trên `std::filesystem`, HTTP client gọi subprocess
+  `curl`, `Response`/`Match` "internal class", `percent_format`.
+- **Xoá `runtime/src/kami_regex.cpp` + `kami_regex.h`** (410 dòng): regex engine tự viết.
+- **Xoá `runtime/src/http_client.cpp`** (562 dòng, thêm ở v0.5.1): HTTP client C++ trên
+  WinHTTP/OpenSSL. Thay bằng `stdlib/requests.py` nói HTTP/1.1 bằng Python trên
+  `stdlib/socket.py` (để lại: chưa có TLS → `https://` báo lỗi rõ ràng).
+- **Xoá kiểu heap `KT_SOCKET`** và toàn bộ `socket_method` trong `ops.cpp`; xoá nhánh
+  hardcode `Match`/`Response` trong `kami_method`.
+- Xoá 27 builtin id của `os/os.path/logging/json/socket/requests/re` và các hàm rewrite
+  riêng trong sema (`rewrite_logging`, `rewrite_module_kwargs`, ca đặc biệt `os.path`).
+- Xoá file rác ở gốc repo: `test.txt`, `result.csv`, `min_cost.txt`.
+
+### Added — standard library viết bằng Python (`stdlib/*.py`, ~1.800 dòng)
+Được compiler dịch ra LLVM IR y như code người dùng:
+
+| Module | Nội dung |
+|---|---|
+| `stdlib/re.py` | Regex engine backtracking: parser ra cây list, matcher dùng **chuỗi continuation tường minh** (không cần closure), fast-path một ký tự, lọc quét theo atom đầu, cache pattern. `match/search/fullmatch/findall/finditer/sub/split/escape/compile`, group + backref, cờ `I/M/S`, lớp `Match`/`Pattern` |
+| `stdlib/json.py` | `loads/dumps/load/dump` + `indent=`, `sort_keys=`, escape `\uXXXX` (kể cả surrogate pair) |
+| `stdlib/logging.py` | Level, `basicConfig(level/format/datefmt/filename)`, `getLogger`, `Logger`, `%`-format (uỷ quyền phần số cho builtin `format()`), `%(asctime)s` |
+| `stdlib/os.py`, `stdlib/os/path.py` | `getcwd/chdir/listdir/mkdir/makedirs/rmdir/remove/rename/system/getenv/getpid/read/write/close/lseek` · `join/split/basename/dirname/splitext/normpath/abspath/isabs/exists/isfile/isdir/getsize/expanduser` |
+| `stdlib/socket.py` | Lớp `socket` Python trên một fd integer: `bind/listen/accept/connect/send/sendall/recv/recv_all/settimeout/fileno/close` |
+| `stdlib/requests.py` | HTTP/1.1 **viết bằng Python trên `socket.py`**: `get/post/put/delete/head/request`, `Response` (`status_code/ok/text/headers/json()/raise_for_status`), chunked transfer-encoding, `params=`, `json=` |
+| `stdlib/string.py` | Hằng số + `capwords` |
+| `stdlib/itertools.py`, `stdlib/functools.py` | Chuyển từ `runtime/pylib/` (v0.5.1) sang `stdlib/` — nay được namespace hoá như mọi module khác |
+
+`from X import *` cũng hoạt động đúng với module đã dịch: mọi tên cấp module được đưa vào
+scope dưới đúng tên gốc (trước đây là no-op).
+
+### Added — `_kami`: tầng C-ABI binding tới OS (`runtime/src/syscalls.cpp`)
+29 primitive, mỗi cái là một forward trực tiếp tới hàm C tiêu chuẩn — không có logic module:
+`fd_open/fd_read/fd_write/fd_close/fd_seek` (open/read/write/close/lseek),
+`stat/filesize/listdir/mkdir/rmdir/unlink/rename/getcwd/chdir` (stat/opendir/readdir/…),
+`getenv/system/getpid/errmsg/platform/localtime`,
+`sock_open/sock_connect/sock_bind/sock_listen/sock_accept/sock_send/sock_recv/sock_close/sock_timeout`
+(socket/connect/bind/listen/accept/send/recv/setsockopt). Các call blocking nhả GIL.
+
+Ranh giới rõ ràng: cần struct mà ngôn ngữ không diễn đạt được (`sockaddr`, `struct stat`,
+`DIR*`) → binding; còn lại → Python.
+
+### Added — import thật sự có namespace (`compiler/src/modules.cpp`)
+- Tầng import mới: tìm nguồn (`<thư mục input>` → `$KAMIPY_STDLIB` → `<kamipy>/../stdlib`),
+  parse, **đổi tên mọi binding cấp module thành namespace** (`match` trong `re.py` →
+  `re__match`), rồi ghép theo thứ tự dependency.
+- Bộ đổi tên hiểu scope: local/tham số che tên module (không đổi), `global x` trỏ lại
+  global đã namespace hoá, target của comprehension và lambda được xử lý đúng.
+- Nhờ đó **user code không còn xung đột với nội bộ module**: chương trình tự định nghĩa
+  `def match()`, `def get()`, `class Match` vẫn `import re`/`import requests` bình thường
+  (trước đây lỗi "function redefined"). Test mới `feat_module_ns.py`.
+- `from m import x as y` hoạt động với module Python; `os.path` là submodule thật.
+- **Chẩn đoán**: mỗi module chiếm một khoảng số dòng riêng nên lỗi trong mã đã dịch báo
+  đúng `stdlib/re.py:57: error: ...`; tên mangled được dịch ngược khi in ra
+  (`re.findall() takes 3 argument(s)`).
+- Thay `runtime/pylib/` + `$KAMIPY_PYLIB` (v0.5.1) bằng một cơ chế duy nhất: `stdlib/` +
+  `$KAMIPY_STDLIB`, copy cạnh binary sau mỗi lần build, `install()` vào
+  `lib/kamipy/stdlib/`.
+
+### Fixed — bug rooting của GC trong runtime (do stdlib Python phơi ra)
+`out->tag = KT_STR` được ghi **trước** `str_new()`: nếu chính lần cấp phát đó kích hoạt
+collect, GC thấy slot mang tag con trỏ nhưng payload vẫn là giá trị cũ (thường là int) và
+dereference rác → segfault/heap corruption. Sửa **24 vị trí** trong `ops.cpp`,
+`builtins.cpp`, `objects.cpp`, `syscalls.cpp` theo đúng thứ tự "cấp phát trước, publish
+sau" qua helper `put_str()`.
+- Thêm `KAMIPY_GC_STRESS=1`: collect trước **mỗi** lần cấp phát → giá trị không được root
+  hoá sẽ lỗi ngay lập tức, tái lập được. Thêm test CTest `integration.gc_stress`: chạy lại
+  **toàn bộ** 50 chương trình integration ở chế độ này.
+- Cùng cách đó tìm ra hai bug rooting nữa: `set("chuỗi")` truyền một slot **chưa root hoá**
+  cho `kami_iter_prep` (hàm này cấp phát một object cho mỗi ký tự), và `as_list_pinned()`
+  đăng ký pin **sau** khi vật chất hoá list. Cả hai nay pin trước rồi mới cấp phát.
+- Engine cũ crash `malloc(): unsorted double linked list corrupted` khi
+  `re.findall(r"(\w+)@(\w+)\.com", ...)` chạy lặp — bug này biến mất cùng đoạn C++.
+
+### Added — `int(x, base)`
+Builtin `int()` nhận base 2..36 (`int("ff", 16)`) như CPython.
+
+### Tests
+5 chương trình integration mới, output **so khớp từng byte với CPython** (trừ test HTTP
+dùng server/client nội bộ):
+`feat_re_engine.py` (regex: lazy/flags/backref/quantifier/compile/finditer/split),
+`feat_stdlib_py.py` (json indent/sort_keys/unicode + os/os.path/string + file system),
+`feat_logging_py.py` (level, `%`-format, `getLogger`, ghi ra file rồi đọc lại),
+`feat_http_py.py` (server HTTP viết bằng KamiPython + client `requests` của KamiPython
+trong cùng binary, GET/POST JSON/404/lỗi kết nối), `feat_module_ns.py` (namespace).
+Tổng: 42 integration + 2 unit + 1 GC-stress pass, ASan/UBSan clean.
+
+### Performance / kích thước
+| | v0.5.1 | v0.6.0 |
+|---|---|---|
+| binary hello-world | 365 KB | **225 KB** (−38%) |
+| `libkamirt.a` | 692 KB | **424 KB** (−39%) |
+| `re.findall(r"\d+")` trên 8 KB text ×50 | 42 ms (engine C++) | 687 ms (Python đã dịch; CPython chạy *cùng* engine: 765 ms; engine C của CPython: 20 ms) |
+| compile `import re` + 1 dòng | — | 0,55 s |
+
+Regex chậm hơn là giá phải trả trung thực của nguyên tắc "chỉ dịch"; đổi lại là ngữ nghĩa
+khớp CPython, không còn bug bộ nhớ, và stdlib sửa được bằng Python.
+
+### Breaking
+- `requests` **không còn hỗ trợ `https://`** (client cũ thừa hưởng TLS từ `curl`; client
+  Python cần binding TLS, chưa có) — nay báo lỗi rõ ràng thay vì âm thầm hạ cấp.
+- `socket.socket()` trả về **instance class Python** thay cho kiểu heap `KT_SOCKET`;
+  `s.accept()` trả `(conn, (host, port))` như CPython.
+- `logging.debug/info/...` nhận tối đa **4 tham số format** (chưa có `*args`).
+- Cần `stdlib/` đi kèm binary (build tree tự tìm `../stdlib`; hoặc đặt `$KAMIPY_STDLIB`).
+
+---
+
 ## [v0.5.1] — 2026-08-01 — `requests` native 100%: bỏ hẳn curl + Windows UX
 
 Theo đúng triết lý "dịch cả thư viện, không gọi process ngoài": `requests` được viết lại

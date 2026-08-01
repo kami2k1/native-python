@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Integration tests: compile every .py with kamipy, run the native binary,
 # and compare stdout with the .expected file.
+#
+# Set KAMIPY_GC_STRESS=1 in the environment to run the same programs with the GC
+# collecting before every allocation (see the integration.gc_stress test).
 set -u
 KAMIPY="$1"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
