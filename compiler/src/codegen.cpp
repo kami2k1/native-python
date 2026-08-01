@@ -62,7 +62,9 @@ struct StrTable {
 
 static bool stmts_have_try(const std::vector<StmtPtr>& body);
 static bool stmt_has_try(const Stmt* s) {
-    if (s->kind == StmtKind::Try) return true;
+    // `with` bodies are outlined exactly like try bodies: a `return` inside
+    // either propagates through the spill slot, so both must reserve it.
+    if (s->kind == StmtKind::Try || s->kind == StmtKind::With) return true;
     if (stmts_have_try(s->body) || stmts_have_try(s->orelse) ||
         stmts_have_try(s->final_body))
         return true;
@@ -85,7 +87,8 @@ static std::string join_params(const Stmt* f) {
     return s;
 }
 static int64_t func_flags(const Stmt* f) {
-    return (f->vararg.empty() ? 0 : 1) | (f->kwarg.empty() ? 0 : 2);
+    return (f->vararg.empty() ? 0 : 1) | (f->kwarg.empty() ? 0 : 2) |
+           (f->is_generator ? 4 : 0); // KFN_GENERATOR
 }
 static int64_t func_kwonly(const Stmt* f) {
     return f->kwonly >= 0 ? f->kwonly : (int64_t)f->params.size();
@@ -814,6 +817,15 @@ struct FnGen {
                 }
                 fill_argbuf(slots);
                 const Stmt* f = mod.functions[(size_t)callee->res_idx];
+                if (f->is_generator) {
+                    // Calling a generator function builds the generator object;
+                    // the body (@u_...) runs lazily inside the fiber.
+                    emit("call void @kami_gen_create(ptr " + slot_ptr(t) + ", ptr @u_" +
+                         f->alias + ", ptr %argbuf, i64 " + std::to_string(slots.size()) +
+                         ")");
+                    temp_top = save;
+                    return t;
+                }
                 emit("call void @u_" + f->alias + "(ptr " + slot_ptr(t) +
                      ", ptr %argbuf, i64 " + std::to_string(slots.size()) + ", ptr null)");
                 temp_top = save;
@@ -883,6 +895,33 @@ struct FnGen {
             return t;
         }
         case ExprKind::CCall: return gen_ccall(e);
+        case ExprKind::Yield: {
+            if (e->op == 1) { // yield from: drive the sub-iterable to exhaustion
+                gen_iteration(e->a.get(), [&](int elem) {
+                    int s2 = temp_top;
+                    int sent = alloc_temp();
+                    emit("call void @kami_gen_yield(ptr " + slot_ptr(sent) + ", ptr " +
+                         slot_ptr(elem) + ")");
+                    temp_top = s2;
+                }, nullptr, nullptr);
+                int t = alloc_temp();
+                emit("call void @kami_make_none(ptr " + slot_ptr(t) + ")");
+                return t;
+            }
+            int t = alloc_temp(); // receives the value passed to send()
+            int save = temp_top;
+            int v;
+            if (e->a) {
+                v = gen_expr(e->a.get());
+            } else {
+                v = alloc_temp();
+                emit("call void @kami_make_none(ptr " + slot_ptr(v) + ")");
+            }
+            emit("call void @kami_gen_yield(ptr " + slot_ptr(t) + ", ptr " + slot_ptr(v) +
+                 ")");
+            temp_top = save;
+            return t;
+        }
         case ExprKind::MethodCall: {
             int t = alloc_temp(); // before args: see Call above
             int save = temp_top;
@@ -1561,12 +1600,12 @@ struct FnGen {
             Ctx done = std::move(ctxs.back());
             ctxs.pop_back();
             extra_fns += "define internal i64 @" + done.fname +
-                         "(ptr %frame) {\nentry:\n  %argbuf = alloca ptr, i64 @@ARGBUF@@, "
-                         "align 8\n" +
+                         "(ptr %frame, ptr %captures) {\nentry:\n  %argbuf = alloca ptr, "
+                         "i64 @@ARGBUF@@, align 8\n" +
                          done.body + "}\n\n";
         }
         std::string code = r();
-        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame)");
+        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame, ptr %captures)");
         // __exit__ always
         std::vector<int> a2{ctx_slot};
         fill_argbuf(a2);
@@ -1679,13 +1718,13 @@ struct FnGen {
             Ctx done = std::move(ctxs.back());
             ctxs.pop_back();
             extra_fns += "define internal i64 @" + done.fname +
-                         "(ptr %frame) {\n" +
+                         "(ptr %frame, ptr %captures) {\n" +
                          "entry:\n  %argbuf = alloca ptr, i64 @@ARGBUF@@, align 8\n" +
                          done.body + "}\n\n";
         }
         // 2) protected call
         std::string code = r();
-        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame)");
+        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame, ptr %captures)");
         // 3) exception dispatch
         if (!s->handlers.empty()) {
             std::string isexc = r();
@@ -1852,16 +1891,39 @@ struct FnGen {
     void gen_prologue(const Stmt* f) {
         size_t nparams = f->params.size();
         size_t ndefaults = f->defaults.size();
+        // Branch to `Labsent` when %argv[i] is absent (i >= %nargs) or is the
+        // KT_MISSING marker a dynamic call passes for "fill the default";
+        // falls through into a fresh block when the argument is real.
+        auto arg_or = [&](size_t i, const std::string& Labsent) {
+            std::string have = r();
+            emit(have + " = icmp sgt i64 %nargs, " + std::to_string(i));
+            std::string Lchk = newlabel(), Lp = newlabel();
+            emit("br i1 " + have + ", label %" + Lchk + ", label %" + Labsent);
+            C().terminated = true;
+            start_block(Lchk);
+            std::string pi = r(), ai = r(), tag = r(), miss = r();
+            emit(pi + " = getelementptr inbounds ptr, ptr %argv, i64 " + std::to_string(i));
+            emit(ai + " = load ptr, ptr " + pi + ", align 8");
+            emit(tag + " = load i64, ptr " + ai + ", align 8");
+            emit(miss + " = icmp eq i64 " + tag + ", 98"); // KT_MISSING
+            emit("br i1 " + miss + ", label %" + Labsent + ", label %" + Lp);
+            C().terminated = true;
+            start_block(Lp);
+            return ai; // pointer to the caller's argument value
+        };
         for (size_t i = 0; i < nparams; i++) {
             bool has_default = i + ndefaults >= nparams;
             if (has_default && !f->defaults[i + ndefaults - nparams]) {
                 // "required keyword-only" hole: the argument must have been
                 // supplied (sema guarantees it for direct calls; dynamic calls
                 // that fail to provide it die with a clear message).
-                std::string have = r();
-                emit(have + " = icmp sgt i64 %nargs, " + std::to_string(i));
-                std::string Lp = newlabel(), Ld = newlabel();
-                emit("br i1 " + have + ", label %" + Lp + ", label %" + Ld);
+                std::string Ld = newlabel(), Lgo = newlabel();
+                std::string ai = arg_or(i, Ld);
+                std::string si = r();
+                emit(si + " = getelementptr inbounds %kv, ptr %frame, i64 " +
+                     std::to_string(i));
+                emit("call void @kami_copy(ptr " + si + ", ptr " + ai + ")");
+                emit("br label %" + Lgo);
                 C().terminated = true;
                 start_block(Ld);
                 emit("call void @kami_panic(ptr " +
@@ -1870,8 +1932,8 @@ struct FnGen {
                      ")");
                 emit("unreachable");
                 C().terminated = true;
-                start_block(Lp);
-                has_default = false; // fall through to the plain copy below
+                start_block(Lgo);
+                continue;
             }
             if (!has_default) {
                 std::string pi = r(), ai = r(), si = r();
@@ -1884,17 +1946,10 @@ struct FnGen {
                 continue;
             }
             const Expr* dflt = f->defaults[i + ndefaults - nparams].get();
-            std::string have = r();
-            emit(have + " = icmp sgt i64 %nargs, " + std::to_string(i));
-            std::string Lp = newlabel(), Ld = newlabel(), Ln = newlabel();
-            emit("br i1 " + have + ", label %" + Lp + ", label %" + Ld);
-            C().terminated = true;
-            start_block(Lp);
+            std::string Ld = newlabel(), Ln = newlabel();
+            std::string ai = arg_or(i, Ld);
             {
-                std::string pi = r(), ai = r(), si = r();
-                emit(pi + " = getelementptr inbounds ptr, ptr %argv, i64 " +
-                     std::to_string(i));
-                emit(ai + " = load ptr, ptr " + pi + ", align 8");
+                std::string si = r();
                 emit(si + " = getelementptr inbounds %kv, ptr %frame, i64 " +
                      std::to_string(i));
                 emit("call void @kami_copy(ptr " + si + ", ptr " + ai + ")");
@@ -2004,7 +2059,7 @@ declare void @kami_globals_init(i64)
 declare void @kami_global_get(ptr, i64)
 declare void @kami_global_set(i64, ptr)
 declare void @kami_global_make_func(i64, ptr, i64, i64, ptr, i64, i64, ptr)
-declare void @kami_global_make_class(i64, ptr, i64)
+declare void @kami_global_make_class(i64, ptr, i64, i64)
 declare void @kami_class_add_method(i64, ptr, ptr, i64, i64, i64, i64, ptr)
 declare void @kami_frame_push(ptr, i64)
 declare void @kami_frame_pop()
@@ -2047,11 +2102,13 @@ declare void @kami_iter_prep(ptr, ptr)
 declare i32 @kami_iter_cond(ptr, ptr)
 declare void @kami_iter_get(ptr, ptr, ptr)
 declare void @kami_unpack(ptr, ptr, i64, i64)
-declare i64 @kami_try(ptr, ptr)
+declare i64 @kami_try(ptr, ptr, ptr)
 declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
 declare void @kami_rethrow()
 declare void @kami_run_module(ptr)
+declare void @kami_gen_create(ptr, ptr, ptr, i64)
+declare void @kami_gen_yield(ptr, ptr)
 declare i64 @kami_c_arg_i64(ptr)
 declare double @kami_c_arg_f64(ptr)
 declare ptr @kami_c_arg_cstr(ptr)
@@ -2741,7 +2798,8 @@ std::string codegen(const Module& m, const std::string& source_name) {
                 if (c2->name == c->alias) parent = c2->global_idx;
         }
         main_fn += "  call void @kami_global_make_class(i64 " + std::to_string(c->global_idx) +
-                   ", ptr " + strtab.ref(si) + ", i64 " + std::to_string(parent) + ")\n";
+                   ", ptr " + strtab.ref(si) + ", i64 " + std::to_string(parent) + ", i64 " +
+                   std::to_string(c->is_exception ? 1 : 0) + ")\n";
         for (auto& msp : c->body) {
             if (msp->kind != StmtKind::FuncDef) continue;
             const Stmt* mth = msp.get();

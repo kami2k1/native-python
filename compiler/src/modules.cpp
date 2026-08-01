@@ -537,7 +537,12 @@ void collect_import_names(Stmt* s, std::vector<std::string>& out) {
         for (auto& extra : s->body) collect_import_names(extra.get(), out);
         return;
     case StmtKind::FromImport:
-        if (!s->name.empty()) out.push_back(s->name);
+        if (!s->name.empty()) {
+            out.push_back(s->name);
+            // `from pkg import sub` may name sibling MODULES, not symbols:
+            // offer the dotted candidates too (unresolvable ones are ignored).
+            for (auto& [n, alias] : s->import_names) out.push_back(s->name + "." + n);
+        }
         // `from . import a, b` — the imported names are sibling modules.
         if (s->relative && s->name.empty())
             for (auto& [n, alias] : s->import_names) out.push_back(n);
@@ -549,6 +554,92 @@ void collect_import_names(Stmt* s, std::vector<std::string>& out) {
     for (auto& h : s->handlers)
         for (auto& c : h.body) collect_import_names(c.get(), out);
     for (auto& c : s->final_body) collect_import_names(c.get(), out);
+}
+
+// The package that relative imports of module `dotted` (loaded from `path`)
+// resolve against: the module itself for a package __init__, its parent
+// otherwise ("concurrent.futures" for concurrent/futures/thread.py).
+std::string package_of(const std::string& dotted, const fs::path& path) {
+    if (path.filename() == "__init__.py") return dotted;
+    size_t dot = dotted.rfind('.');
+    return dot == std::string::npos ? std::string() : dotted.substr(0, dot);
+}
+
+// Rewrite single-dot relative imports into absolute ones so both the bundler
+// and sema see plain dotted module names:
+//   from .mod import X   →  from pkg.mod import X
+//   from . import a, b   →  from pkg import a, b
+void absolutize_relative_imports(std::vector<StmtPtr>& body, const std::string& pkg) {
+    for (auto& sp : body) {
+        Stmt* s = sp.get();
+        if (s->kind == StmtKind::FromImport && s->relative && !pkg.empty()) {
+            s->name = s->name.empty() ? pkg : pkg + "." + s->name;
+            s->relative = false;
+        }
+        absolutize_relative_imports(s->body, pkg);
+        absolutize_relative_imports(s->orelse, pkg);
+        absolutize_relative_imports(s->final_body, pkg);
+        for (auto& h : s->handlers) absolutize_relative_imports(h.body, pkg);
+    }
+}
+
+void collect_from_import_stmts(std::vector<StmtPtr>& body, std::vector<Stmt*>& out) {
+    for (auto& sp : body) {
+        Stmt* s = sp.get();
+        if (s->kind == StmtKind::FromImport && !s->name.empty() && !s->star)
+            out.push_back(s);
+        collect_from_import_stmts(s->body, out);
+        collect_from_import_stmts(s->orelse, out);
+        collect_from_import_stmts(s->final_body, out);
+        for (auto& h : s->handlers) collect_from_import_stmts(h.body, out);
+    }
+}
+
+// PEP 562 lazy loaders: CPython packages defer submodule imports with
+//     def __getattr__(name):
+//         if name == 'ThreadPoolExecutor':
+//             from .thread import ThreadPoolExecutor as te
+//             ...
+// An AOT compiler has no module-attribute hook, so the deferred imports are
+// hoisted to guarded top-level imports (try: from pkg.thread import ... )
+// and the function is dropped. Modules that fail to compile (e.g.
+// concurrent.futures.process → multiprocessing) are skipped like any other
+// guarded import; the rest become real, eagerly-bundled definitions.
+void hoist_lazy_getattr(Module& sub, const std::string& modname,
+                        std::map<std::string, std::string>& exports) {
+    for (size_t i = 0; i < sub.body.size(); i++) {
+        Stmt* s = sub.body[i].get();
+        if (s->kind != StmtKind::FuncDef || s->name != "__getattr__") continue;
+        std::vector<Stmt*> lazy;
+        collect_from_import_stmts(s->body, lazy);
+        std::vector<StmtPtr> hoisted;
+        for (Stmt* fi : lazy) {
+            auto imp = std::make_unique<Stmt>();
+            imp->kind = StmtKind::FromImport;
+            imp->line = fi->line;
+            imp->name = fi->name;
+            // bind under the ORIGINAL names — `as pe` aliases exist only for
+            // the function-local dance the hoisting replaces
+            for (auto& [n, alias] : fi->import_names) {
+                imp->import_names.emplace_back(n, n);
+                exports[modname + "." + n] = library_prefix(fi->name) + n;
+            }
+            auto guard = std::make_unique<Stmt>();
+            guard->kind = StmtKind::Try;
+            guard->line = fi->line;
+            guard->body.push_back(std::move(imp));
+            ExceptClause h;
+            auto pass = std::make_unique<Stmt>();
+            pass->kind = StmtKind::Pass;
+            pass->line = fi->line;
+            h.body.push_back(std::move(pass));
+            guard->handlers.push_back(std::move(h));
+            hoisted.push_back(std::move(guard));
+        }
+        sub.body.erase(sub.body.begin() + (long)i);
+        for (auto& g : hoisted) sub.body.insert(sub.body.begin() + (long)i++, std::move(g));
+        return;
+    }
 }
 
 // True for the idiom  if __name__ == "__main__": ...  — bundled modules are
@@ -596,9 +687,16 @@ struct Bundler {
         std::vector<ResolvedModule> cands = resolve_module(name, pol);
         if (cands.empty()) return;                                  // sema reports it
         if (cands.front().origin == ModuleOrigin::Native) return;    // runtime primitive
-        if (loading.count(name))
-            throw std::runtime_error("circular import between local modules involving '" + name +
-                                     "'");
+        if (loading.count(name)) {
+            // Library packages import their own submodules while the package
+            // __init__ is still loading (concurrent.futures ⇄ .thread): the
+            // names bind lazily at runtime, so the cycle is benign. Only
+            // project-file cycles are real errors.
+            if (cands.front().origin == ModuleOrigin::Project)
+                throw std::runtime_error(
+                    "circular import between local modules involving '" + name + "'");
+            return;
+        }
         loading.insert(name);
         // Try each source in turn. CPython's own sources use far more syntax
         // than we compile, so a parse failure is not fatal while a fallback
@@ -632,6 +730,15 @@ struct Bundler {
                             found.path.string().c_str(), e.line, e.what());
                 continue;
             }
+            // Relative imports become absolute against the module's package,
+            // and PEP 562 lazy loaders become guarded eager imports — both
+            // BEFORE resolvability checks and dependency loading.
+            {
+                std::string pkg = package_of(name, found.path);
+                absolutize_relative_imports(sub.body, pkg);
+                if (found.origin != ModuleOrigin::Project)
+                    hoist_lazy_getattr(sub, name, mod.module_exports);
+            }
             // A library copy is only usable when its own (unguarded) imports
             // resolve too — CPython packages use relative imports we cannot
             // bundle (json/__init__.py -> .decoder). Fall back while we can.
@@ -654,6 +761,17 @@ struct Bundler {
                 std::string prefix = library_prefix(name);
                 mangle_module(sub.body, prefix);
                 mod.module_prefix[name] = prefix;
+                // Record package re-exports: `from concurrent.futures._base
+                // import Future` at the top of a package __init__ makes
+                // `concurrent.futures.Future` refer to the _base symbol.
+                for (auto& sp : sub.body) {
+                    if (sp->kind != StmtKind::FromImport || sp->name.empty() || sp->star)
+                        continue;
+                    if (!mod.module_prefix.count(sp->name)) continue;
+                    for (auto& [n, alias] : sp->import_names)
+                        mod.module_exports[name + "." + alias] =
+                            mod.module_prefix[sp->name] + n;
+                }
             }
             for (auto& sp : sub.body) {
                 if (is_main_guard(sp.get())) continue; // not the main program
@@ -674,10 +792,64 @@ struct Bundler {
         for (auto& n : names) {
             if (mod.user_modules.count(n) || skipped.count(n)) continue;
             if (pyext_module_name(n)) continue; // CPython C-extension bridge
-            if (!resolve_module(n, pol).empty()) continue;
-            return false;
+            if (!probe(n)) return false;
         }
         return true;
+    }
+
+    // Dry-run: can module `name` (transitively) be bundled — i.e. does some
+    // candidate parse AND have (unguarded) imports that probe true as well?
+    // Without this, a package whose submodule fails deep in the chain
+    // (json/__init__ → json.encoder) would be committed and then break,
+    // instead of falling back to the next candidate (the bundled pylib).
+    std::map<std::string, int> probe_cache; // 1 ok, -1 bad
+    std::set<std::string> probing;          // cycles count as ok
+
+    bool probe(const std::string& name) {
+        if (mod.user_modules.count(name) || loading.count(name) || probing.count(name))
+            return true;
+        auto it = probe_cache.find(name);
+        if (it != probe_cache.end()) return it->second > 0;
+        probing.insert(name);
+        bool ok = probe_uncached(name);
+        probing.erase(name);
+        probe_cache[name] = ok ? 1 : -1;
+        return ok;
+    }
+
+    bool probe_uncached(const std::string& name) {
+        std::vector<ResolvedModule> cands = resolve_module(name, pol);
+        if (cands.empty()) return false;
+        for (const ResolvedModule& cand : cands) {
+            if (cand.origin == ModuleOrigin::Native) return true;
+            Module sub;
+            try {
+                sub = parse(lex(read_source(cand.path)));
+            } catch (CompileError&) {
+                continue; // try the next candidate
+            } catch (std::exception&) {
+                continue;
+            }
+            std::string pkg = package_of(name, cand.path);
+            absolutize_relative_imports(sub.body, pkg);
+            if (cand.origin != ModuleOrigin::Project) {
+                std::map<std::string, std::string> scratch_exports;
+                hoist_lazy_getattr(sub, name, scratch_exports);
+            }
+            std::vector<std::string> names;
+            for (auto& sp : sub.body) collect_unguarded_import_names(sp.get(), names);
+            bool deps_ok = true;
+            for (auto& n : names) {
+                if (n == name) continue;
+                if (skipped.count(n) || pyext_module_name(n)) continue;
+                if (!probe(n)) {
+                    deps_ok = false;
+                    break;
+                }
+            }
+            if (deps_ok) return true;
+        }
+        return false;
     }
 
     std::set<std::string> skipped;

@@ -59,6 +59,17 @@ uint64_t value_hash(const KamiValue* v) {
             h = h * 1000003ull ^ value_hash(&l->items[i]);
         return h;
     }
+    case KT_THREAD:
+    case KT_OBJECT:
+    case KT_CLASS:
+    case KT_FUNC:
+    case KT_GEN:
+    case KT_SYNC:
+    case KT_LOCK: { // identity hash (CPython hashes these by id())
+        uint64_t x = (uint64_t)(uintptr_t)v->p;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+        return x;
+    }
     default: panic(std::string("unhashable type: '") + type_name(v->tag) + "'");
     }
 }

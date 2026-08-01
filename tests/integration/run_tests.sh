@@ -36,7 +36,7 @@ for py in "$DIR"/*.py; do
                 continue
             fi
             ;;
-        feat_system_stdlib)
+        feat_system_stdlib | feat_concurrent_futures)
             if [ "$HAVE_SYSTEM_PYTHON" = 0 ]; then
                 echo "SKIP: $base (no Python installation found)"
                 skipped=$((skipped + 1))

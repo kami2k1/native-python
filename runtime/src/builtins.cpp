@@ -231,8 +231,16 @@ static void set_str(KamiValue* out, const std::string& s) {
 
 // Materialize an iterable into a list value written to *out. The result is
 // pinned as a GC root until unpin_scratch() is called; callers must pair them.
-static void as_list_pinned(KamiValue* out, KamiValue* v) {
+static void as_list_pinned(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out,
+                           KamiValue* v) {
     if (v->tag == KT_LIST) { *out = *v; }
+    else if (v->tag == KT_GEN) {
+        // Run the generator to exhaustion WITHOUT the runtime lock: its body
+        // is user code that may block on other threads (futures, queues).
+        lk.unlock();
+        gen_drain_to_list(out, v);
+        lk.lock();
+    }
     else kami_iter_prep(out, v); // dict/set/str/file → list
     g_pins.push_back({out, 1});
 }
@@ -313,6 +321,46 @@ static void builtin_join(std::unique_lock<std::recursive_mutex>& lk, KamiValue* 
     lk.unlock(); // release the GIL while blocked, so the target thread can run
     td->th.join();
     lk.lock();
+}
+
+// t.start() for threading.Thread(target=..., args=...): same spawn machinery
+// as threading.spawn, target and arguments were stored at construction.
+void thread_start(KamiValue* out, KamiThreadObj* to) {
+    g_multithreaded.store(true, std::memory_order_seq_cst);
+    ThreadData* td = to->td;
+    if (td->started) panic("RuntimeError: threads can only be started once");
+    td->started = true;
+    if (td->target.tag != KT_FUNC) panic("Thread.start(): no callable target");
+    PinBlock pb;
+    pb.n = 1 + (int64_t)td->args.size();
+    pb.vals = (KamiValue*)malloc(sizeof(KamiValue) * (size_t)pb.n);
+    if (!pb.vals) panic("out of memory");
+    pb.vals[0] = td->target;
+    for (size_t i = 0; i < td->args.size(); i++) pb.vals[1 + i] = td->args[i];
+    g_pins.push_back({pb.vals, pb.n});
+    td->th = std::thread(thread_body, pb);
+    set_none(out);
+}
+
+bool thread_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
+                   const std::string& m, KamiValue** argv, int64_t nargs) {
+    KamiThreadObj* to = (KamiThreadObj*)obj->p;
+    if (m == "start" && nargs == 0) {
+        thread_start(out, to);
+        return true;
+    }
+    if (m == "join") {
+        KamiValue* a[1] = {obj};
+        builtin_join(lk, out, a, 1);
+        return true;
+    }
+    if (m == "is_alive" && nargs == 0) {
+        out->tag = KT_BOOL;
+        out->i = to->td->started && !to->td->joined;
+        return true;
+    }
+    (void)argv;
+    return false;
 }
 
 // ---- conversions ----
@@ -445,7 +493,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         // min(list) / max(list) form
         if (nargs == 1) {
             KamiValue mmv;
-            as_list_pinned(&mmv, argv[0]);
+            as_list_pinned(lk, &mmv, argv[0]);
             KamiList* l = (KamiList*)mmv.p;
             if (l->len == 0) { unpin_scratch(&mmv); panic(std::string(fn) + "() of empty sequence"); }
             KamiValue best = l->items[0];
@@ -465,6 +513,57 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             if (r.i) best = *argv[i];
         }
         *out = best;
+        return;
+    }
+    case KB_MIN_EX:
+    case KB_MAX_EX: {
+        // min/max(iterable, key|None, has_default, default) — kwargs form,
+        // rewritten by sema.
+        const char* fn = id == KB_MIN_EX ? "min" : "max";
+        check_arity(nargs, 4, 4, fn);
+        KamiValue key = *argv[1];
+        bool has_default = kami_truthy(argv[2]);
+        KamiValue mmv;
+        as_list_pinned(lk, &mmv, argv[0]);
+        KamiList* l = (KamiList*)mmv.p;
+        if (l->len == 0) {
+            unpin_scratch(&mmv);
+            if (has_default) {
+                *out = *argv[3];
+                return;
+            }
+            panic(std::string(fn) + "() of empty sequence");
+        }
+        KamiValue scratch[4]; // best, best_key, cur_key, none
+        scratch[0] = l->items[0];
+        scratch[1] = KamiValue{KT_NONE, {0}};
+        scratch[2] = KamiValue{KT_NONE, {0}};
+        scratch[3] = KamiValue{KT_NONE, {0}};
+        PinGuard pinb(scratch, 4);
+        auto keyed = [&](const KamiValue* v, KamiValue* kout) {
+            if (key.tag == KT_NONE) {
+                *kout = *v;
+                return;
+            }
+            KamiValue vv = *v;
+            KamiValue* a[1] = {&vv};
+            lk.unlock();
+            kami_call_value(kout, &key, a, 1);
+            lk.lock();
+        };
+        keyed(&scratch[0], &scratch[1]);
+        for (int64_t i = 1; i < l->len; i++) {
+            KamiValue item = l->items[i];
+            keyed(&item, &scratch[2]);
+            KamiValue r;
+            kami_binop(id == KB_MIN_EX ? KOP_LT : KOP_GT, &r, &scratch[2], &scratch[1]);
+            if (r.i) {
+                scratch[0] = l->items[i];
+                scratch[1] = scratch[2];
+            }
+        }
+        unpin_scratch(&mmv);
+        *out = scratch[0];
         return;
     }
     case KB_ORD: {
@@ -641,7 +740,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_RANDOM_CHOICE: {
         check_arity(nargs, 1, 1, "random.choice");
         KamiValue seq;
-        as_list_pinned(&seq, argv[0]);
+        as_list_pinned(lk, &seq, argv[0]);
         KamiList* l = (KamiList*)seq.p;
         if (l->len == 0) { unpin_scratch(&seq); panic("random.choice() from empty sequence"); }
         *out = l->items[g_rng() % (uint64_t)l->len];
@@ -663,7 +762,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         check_arity(nargs, 2, 2, "random.sample");
         int64_t k = arg_int(argv[1], "random.sample");
         KamiValue seq;
-        as_list_pinned(&seq, argv[0]);
+        as_list_pinned(lk, &seq, argv[0]);
         KamiList* src = (KamiList*)seq.p;
         if (k < 0 || k > src->len) { unpin_scratch(&seq); panic("random.sample() larger than population"); }
         // partial Fisher-Yates on a copy
@@ -683,7 +782,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         check_arity(nargs, 1, 2, "random.choices");
         int64_t k = nargs == 2 ? arg_int(argv[1], "random.choices") : 1;
         KamiValue seq;
-        as_list_pinned(&seq, argv[0]);
+        as_list_pinned(lk, &seq, argv[0]);
         KamiList* l = (KamiList*)seq.p;
         if (l->len == 0) { unpin_scratch(&seq); panic("random.choices() from empty sequence"); }
         KamiList* r = list_new(k > 0 ? k : 1);
@@ -699,7 +798,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_SUM: {
         check_arity(nargs, 1, 2, "sum");
         KamiValue sumv;
-        as_list_pinned(&sumv, argv[0]);
+        as_list_pinned(lk, &sumv, argv[0]);
         KamiList* l = (KamiList*)sumv.p;
         KamiValue acc;
         if (nargs == 2) acc = *argv[1];
@@ -716,7 +815,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_SORTED: {
         check_arity(nargs, 1, 3, "sorted");
         KamiValue srcv;
-        as_list_pinned(&srcv, argv[0]);
+        as_list_pinned(lk, &srcv, argv[0]);
         argv[0] = &srcv;
         bool has_key = nargs >= 2 && argv[1]->tag != KT_NONE;
         bool reverse = nargs >= 3 && kami_truthy(argv[2]);
@@ -778,7 +877,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_REVERSED: {
         check_arity(nargs, 1, 1, "reversed");
         KamiValue revv;
-        as_list_pinned(&revv, argv[0]);
+        as_list_pinned(lk, &revv, argv[0]);
         KamiList* src = (KamiList*)revv.p;
         KamiList* r = list_new(src->len);
         out->tag = KT_LIST;
@@ -791,7 +890,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         check_arity(nargs, 1, 2, "enumerate");
         int64_t start = nargs == 2 ? arg_int(argv[1], "enumerate") : 0;
         KamiValue seqv;
-        as_list_pinned(&seqv, argv[0]); // any iterable → list
+        as_list_pinned(lk, &seqv, argv[0]); // any iterable → list
         KamiList* l = (KamiList*)seqv.p;
         KamiList* r = list_new(l->len > 4 ? l->len : 4);
         out->tag = KT_LIST;
@@ -811,25 +910,28 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     case KB_ZIP: {
-        check_arity(nargs, 2, 2, "zip");
-        if (argv[0]->tag != KT_LIST || argv[1]->tag != KT_LIST)
-            panic("zip() expects two lists");
-        KamiList* a = (KamiList*)argv[0]->p;
-        KamiList* b = (KamiList*)argv[1]->p;
-        int64_t n = a->len < b->len ? a->len : b->len;
+        check_arity(nargs, 1, 16, "zip");
+        // materialize every iterable (generators drain), then transpose
+        KamiValue seqs[16];
+        int64_t n = -1;
+        for (int64_t k = 0; k < nargs; k++) {
+            as_list_pinned(lk, &seqs[k], argv[k]);
+            int64_t len = ((KamiList*)seqs[k].p)->len;
+            if (n < 0 || len < n) n = len;
+        }
         KamiList* r = list_new(n > 4 ? n : 4);
         out->tag = KT_LIST;
         out->p = r;
         for (int64_t i = 0; i < n; i++) {
-            KamiList* pair = list_new(2);
-            pair->items[0] = a->items[i];
-            pair->items[1] = b->items[i];
-            pair->len = 2;
+            KamiList* tup = list_new(nargs);
+            for (int64_t k = 0; k < nargs; k++)
+                tup->items[tup->len++] = ((KamiList*)seqs[k].p)->items[i];
             KamiValue pv;
             pv.tag = KT_LIST;
-            pv.p = pair;
+            pv.p = tup;
             list_push(r, &pv);
         }
+        for (int64_t k = nargs; k-- > 0;) unpin_scratch(&seqs[k]);
         return;
     }
     case KB_BOOL: {
@@ -901,7 +1003,7 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         const char* fn = id == KB_ALL ? "all" : "any";
         check_arity(nargs, 1, 1, fn);
         KamiValue allv;
-        as_list_pinned(&allv, argv[0]);
+        as_list_pinned(lk, &allv, argv[0]);
         KamiList* l = (KamiList*)allv.p;
         bool result = id == KB_ALL;
         for (int64_t i = 0; i < l->len; i++) {
@@ -961,6 +1063,10 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             kami_iter_prep(&seq, argv[0]);
             KamiList* src = (KamiList*)seq.p;
             for (int64_t i = 0; i < src->len; i++) list_push(r, &src->items[i]);
+        } else if (argv[0]->tag == KT_GEN) {
+            lk.unlock(); // the generator body is user code
+            gen_drain_to_list(out, argv[0]); // fresh list, replaces r
+            lk.lock();
         } else {
             panic("list() expected an iterable");
         }
@@ -1070,11 +1176,192 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         out->p = l;
         return;
     }
+    case KB_THREAD_CONDITION:
+        check_arity(nargs, 0, 1, "threading.Condition");
+        sync_make(out, 0, argv, nargs);
+        return;
+    case KB_THREAD_EVENT:
+        check_arity(nargs, 0, 0, "threading.Event");
+        sync_make(out, 1, argv, nargs);
+        return;
+    case KB_THREAD_SEMAPHORE:
+        check_arity(nargs, 0, 1, "threading.Semaphore");
+        sync_make(out, 2, argv, nargs);
+        return;
+    case KB_THREAD_THREAD:
+        thread_make(out, argv, nargs);
+        return;
+    case KB_THREAD_ATEXIT:
+        check_arity(nargs, 1, 9, "threading._register_atexit");
+        atexit_register(argv, nargs);
+        set_none(out);
+        return;
+    case KB_THREAD_CURRENT: { // enough for `current_thread().name` style logs
+        check_arity(nargs, 0, 0, "threading.current_thread");
+        out->tag = KT_STR;
+        out->p = str_new("Thread", 6);
+        return;
+    }
+    case KB_WEAKREF_REF: {
+        // Degraded weak reference: a callable that returns its referent (the
+        // reference is strong, so the death callback never fires — explicit
+        // shutdown()/with blocks manage lifetimes in compiled programs).
+        check_arity(nargs, 1, 2, "weakref.ref");
+        KamiFuncObj* f = (KamiFuncObj*)gc_alloc(sizeof(KamiFuncObj), KT_FUNC);
+        f->fn = nullptr;
+        f->min_arity = 0;
+        f->arity = 0;
+        f->builtin_id = KB_WEAKREF_CALL;
+        f->name = "weakref";
+        f->captures = (KamiValue*)malloc(sizeof(KamiValue));
+        f->captures[0] = *argv[0];
+        f->ncaptures = 1;
+        f->kwonly = 0;
+        f->flags = 0;
+        f->param_names = "";
+        out->tag = KT_FUNC;
+        out->p = f;
+        return;
+    }
+    case KB_NAMEDTUPLE: {
+        // collections.namedtuple(name, "a b" | ["a","b"]) → a factory class
+        check_arity(nargs, 2, 3, "collections.namedtuple");
+        if (argv[0]->tag != KT_STR) panic("namedtuple(): name must be a str");
+        auto* fields = new std::vector<std::string>();
+        if (argv[1]->tag == KT_STR) {
+            KamiStr* s = (KamiStr*)argv[1]->p;
+            std::string cur;
+            for (int64_t i = 0; i <= s->len; i++) {
+                char c = i < s->len ? s->data[i] : ' ';
+                if (c == ' ' || c == ',' || c == '\t' || c == '\n') {
+                    if (!cur.empty()) fields->push_back(cur);
+                    cur.clear();
+                } else {
+                    cur += c;
+                }
+            }
+        } else if (argv[1]->tag == KT_LIST) {
+            KamiList* l = (KamiList*)argv[1]->p;
+            for (int64_t i = 0; i < l->len; i++) {
+                if (l->items[i].tag != KT_STR) panic("namedtuple(): field names must be str");
+                KamiStr* s = (KamiStr*)l->items[i].p;
+                fields->push_back(std::string(s->data, (size_t)s->len));
+            }
+        } else {
+            panic("namedtuple(): field names must be a str or a list of str");
+        }
+        KamiClassObj* c = (KamiClassObj*)gc_alloc(sizeof(KamiClassObj), KT_CLASS);
+        KamiStr* nm = (KamiStr*)argv[0]->p;
+        char* cname = (char*)malloc((size_t)nm->len + 1); // class names are
+        memcpy(cname, nm->data, (size_t)nm->len);         // static strings
+        cname[nm->len] = '\0';                            // elsewhere
+        c->name = cname;
+        c->parent = nullptr;
+        c->members = new std::unordered_map<std::string, KamiValue>();
+        c->nt_fields = fields;
+        out->tag = KT_CLASS;
+        out->p = c;
+        return;
+    }
+    case KB_DEQUE: { // collections.deque ≈ list (append/popleft/... methods)
+        check_arity(nargs, 0, 1, "collections.deque");
+        KamiValue* a0[1] = {nargs ? argv[0] : nullptr};
+        dispatch(lk, KB_LIST, out, a0, nargs);
+        return;
+    }
+    case KB_HASATTR: {
+        check_arity(nargs, 2, 2, "hasattr");
+        if (argv[1]->tag != KT_STR) panic("hasattr(): attribute name must be a str");
+        std::string nm(((KamiStr*)argv[1]->p)->data, (size_t)((KamiStr*)argv[1]->p)->len);
+        out->tag = KT_BOOL;
+        out->i = 0;
+        if (argv[0]->tag == KT_OBJECT) {
+            KamiInstance* in = (KamiInstance*)argv[0]->p;
+            out->i = in->fields->count(nm) || class_lookup(in->cls, nm);
+        } else if (argv[0]->tag == KT_CLASS) {
+            out->i = class_lookup((KamiClassObj*)argv[0]->p, nm) != nullptr;
+        }
+        return;
+    }
+    case KB_GETATTR: {
+        check_arity(nargs, 2, 3, "getattr");
+        if (argv[1]->tag != KT_STR) panic("getattr(): attribute name must be a str");
+        std::string nm(((KamiStr*)argv[1]->p)->data, (size_t)((KamiStr*)argv[1]->p)->len);
+        if (nargs == 3) {
+            KamiValue dflt = *argv[2];
+            lk.unlock();
+            try {
+                kami_attr_get(out, argv[0], nm.c_str());
+            } catch (KamiError&) {
+                *out = dflt;
+            }
+            lk.lock();
+            return;
+        }
+        kami_attr_get(out, argv[0], nm.c_str());
+        return;
+    }
+    case KB_OS_CPU_COUNT: {
+        check_arity(nargs, 0, 0, "os.cpu_count");
+        unsigned n = std::thread::hardware_concurrency();
+        set_int(out, n > 0 ? (int64_t)n : 1);
+        return;
+    }
+    case KB_ID: { // identity: heap objects use their address
+        check_arity(nargs, 1, 1, "id");
+        set_int(out, argv[0]->tag >= KT_STR ? (int64_t)(intptr_t)argv[0]->p : argv[0]->i);
+        return;
+    }
+    case KB_OBJECT: { // object(): a unique, featureless sentinel
+        check_arity(nargs, 0, 0, "object");
+        static KamiClassObj* obj_cls = nullptr;
+        if (!obj_cls) { // outside the GC heap: never swept, safe to share
+            obj_cls = (KamiClassObj*)calloc(1, sizeof(KamiClassObj));
+            obj_cls->h.type = KT_CLASS;
+            obj_cls->name = "object";
+            obj_cls->members = new std::unordered_map<std::string, KamiValue>();
+        }
+        KamiInstance* inst = (KamiInstance*)gc_alloc(sizeof(KamiInstance), KT_OBJECT);
+        inst->cls = obj_cls;
+        inst->fields = new std::unordered_map<std::string, KamiValue>();
+        out->tag = KT_OBJECT;
+        out->p = inst;
+        return;
+    }
     case KB_CALLABLE: {
         check_arity(nargs, 1, 1, "callable");
         int64_t t = argv[0]->tag;
         out->tag = KT_BOOL;
         out->i = t == KT_FUNC || t == KT_CLASS;
+        return;
+    }
+    case KB_NEXT: { // next(gen[, default])
+        check_arity(nargs, 1, 2, "next");
+        if (argv[0]->tag != KT_GEN)
+            panic(std::string("'") + type_name(argv[0]->tag) + "' object is not an iterator");
+        // the generator body is user code: never hold the runtime lock
+        lk.unlock();
+        if (nargs == 1) {
+            kami_gen_next(out, argv[0]);
+            lk.lock();
+            return;
+        }
+        try {
+            kami_gen_next(out, argv[0]);
+        } catch (KamiError& e) {
+            if (e.msg != "StopIteration") {
+                lk.lock();
+                throw;
+            }
+            *out = *argv[1];
+        }
+        lk.lock();
+        return;
+    }
+    case KB_ITER: { // iter(x): generators pass through; others materialize
+        check_arity(nargs, 1, 1, "iter");
+        if (argv[0]->tag == KT_GEN) *out = *argv[0];
+        else kami_iter_prep(out, argv[0]);
         return;
     }
     case KB_REPR: {
@@ -1230,6 +1517,10 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
             *out = *argv[0];
             return;
         }
+        if (argv[0]->tag == KT_SYNC) { // Condition/Semaphore as context manager
+            sync_method(lk, out, argv[0], "__enter__", nullptr, 0, nullptr);
+            return;
+        }
         *out = *argv[0];
         return;
     }
@@ -1238,6 +1529,11 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         set_none(out);
         if (argv[0]->tag == KT_LOCK) {
             lock_release((KamiLock*)argv[0]->p);
+            return;
+        }
+        if (argv[0]->tag == KT_SYNC) {
+            KamiValue dummy;
+            sync_method(lk, &dummy, argv[0], "__exit__", nullptr, 0, nullptr);
             return;
         }
         if (argv[0]->tag == KT_FILE) {

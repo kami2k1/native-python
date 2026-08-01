@@ -59,24 +59,25 @@ kamipy clean                # xóa .kamipy-cache
 | Operators | số học + so sánh chuỗi hoá (`0 <= i < n`) + logic + **bitwise `& \| ^ ~ << >>`** + `**` + augmented |
 | Control flow | `if/elif/else`, `while`, `for` (đa target unpack), `break/continue`, ternary, inline body |
 | Functions | `def` với **kwargs + default params + `*args`**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
+| Generators | **`yield` / `yield from` / `send` / `close` / `next(g, default)`** — fiber-backed (Windows fibers / POSIX ucontext), lazy `for`, works inside `try/finally`/`with`, GC reclaims abandoned generators |
 | Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client, **`wrap_tls()`** → OpenSSL/SChannel, `settimeout`), **`requests`** (pure-Python HTTP/1.1: params/data/json/headers/auth, redirects, chunked, `Response.json()/raise_for_status()`, `Session`), **`json`**, **`re`**, **`logging`** — tất cả là Python trong `runtime/pylib/` |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
-| Modules | C-ABI bindings: `math time random threading sys os os.path socket string doctest`; **Python stdlib compiled from source** (`runtime/pylib/`): `re json logging requests itertools functools`; **auto-discovered system Python stdlib** (compile source thật của CPython trên máy); no-op `typing`/`__future__` |
+| Modules | C-ABI bindings: `math time random threading sys os os.path socket string doctest collections weakref`; **auto-discovered system Python stdlib** (compile source thật của CPython trên máy — kể cả **`concurrent.futures`**: `ThreadPoolExecutor`/`as_completed`/`wait`/`Executor.map` dịch từ `_base.py`/`thread.py`/`queue.py`/`heapq.py` thật); pylib fallback (`runtime/pylib/`) chỉ cho module CPython viết bằng C: `re json logging requests itertools functools`; no-op `typing`/`__future__` |
 | System Python | **`find_system_python_stdlib()`**: dò `KAMIPY_PYTHON_STDLIB` → `PYTHONHOME` → `PYTHONPATH` → interpreter trên `PATH` → Registry Windows (`HKCU`/`HKLM\Software\Python\PythonCore`) + `%LOCALAPPDATA%\Programs\Python\Python3*\Lib` + `C:\Python3*\Lib` + `C:\Program Files\Python3*\Lib` / `/usr/lib/python3.*` + `/usr/local/lib/python3.*` + pyenv + Homebrew. Thứ tự resolve: **project → native → system Python → pylib fallback**. `kamipy paths` để xem, `-v` để trace, `--no-system-stdlib` để tắt |
 | C extensions | `_math` `_os`/`posix`/`nt` `_socket` `_struct` `_json` `_time` `_random` → **C-ABI primitive** (`runtime/src/syscalls.cpp`) hoặc **lời gọi C trực tiếp** trong LLVM IR (`call double @sqrt(double)`); raw fd I/O `open/read/write/close/lseek`; `struct.pack/unpack/calcsize` |
 | ctypes / cffi | `ctypes.CDLL("libm.so.6")` + `restype`/`argtypes`, `cffi.FFI()` + `cdef()` + `dlopen()` → **native call** + **tự sinh cờ link** (`-lm`, `-lws2_32`, …); độ rộng kiểu C đúng chuẩn (`int` 32-bit, `long` theo LP64/LLP64, `float` ≠ `double`) |
 | Local modules | **`import mymodule` bundles `mymodule.py`** (cạnh file input, đệ quy theo dependency, `pkg.mod` → `pkg/mod.py`, relative `from .mod import x`); `__main__` guard của module bundle không chạy; `try: import cv2 / except ImportError:` works |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
-| Threading | Real OS threads with GIL-style lock (elided when single-threaded); **`threading.Lock`/`RLock`** = native mutexes usable with `with`; socket accept/recv and lock waits release the GIL |
+| Threading | Real OS threads with GIL-style lock (elided when single-threaded); **`threading.Lock`/`RLock`/`Condition`/`Event`/`Semaphore`/`Thread`** = native primitives usable with `with`; socket accept/recv, lock/condition/event waits release the GIL |
 | Memory | Mark & sweep GC (exception-unwind + file/socket safe); ASan/LSan/TSan clean |
 
 **Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1059 build (49%), 784 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
 **Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary. TCP socket server+client qua thread. Xem `docs`/CHANGELOG.
 
-Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, `**kwargs`, walrus `:=`, `@staticmethod/@property`, `nonlocal`, exception subclasses (`class E(Exception)`), và third-party package cần C extension của CPython (`numpy`, `pyautogui`, `PIL`, `flask`).
+Not yet / Chưa hỗ trợ (lỗi thông báo rõ): walrus `:=`, `@staticmethod/@property`, `nonlocal`, metaclasses, và third-party package cần C extension của CPython (`numpy`, `pyautogui`, `PIL`, `flask`).
 
 ### "Translate, don't rewrite" / "Chỉ dịch — không tự viết"
 

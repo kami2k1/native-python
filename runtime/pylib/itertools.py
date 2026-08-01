@@ -1,14 +1,9 @@
 def count(start=0, step=1):
-    # bounded materialization is impossible; callers use it with islice/zip.
-    # We provide a large finite range as a practical approximation.
-    result = []
+    # a real infinite generator (CPython implements this in C)
     n = start
-    i = 0
-    while i < 1000000:
-        result.append(n)
+    while True:
+        yield n
         n = n + step
-        i = i + 1
-    return result
 
 def repeat(obj, times):
     result = []

@@ -102,5 +102,19 @@ enum KamiBuiltinId : int64_t {
     KB_SYS_OPEN, KB_SYS_READ, KB_SYS_WRITE, KB_SYS_CLOSE, KB_SYS_LSEEK,
     KB_SYS_GETHOSTNAME,
     KB_STRUCT_PACK, KB_STRUCT_UNPACK, KB_STRUCT_CALCSIZE,
+    // generators (v0.8)
+    KB_NEXT, KB_ITER,
+    // v0.8: natives for the CPython concurrent.futures / queue source chain.
+    // collections (CPython implements these in C — no .py source exists)
+    KB_NAMEDTUPLE, KB_DEQUE,
+    // threading synchronisation primitives + thread objects
+    KB_THREAD_CONDITION, KB_THREAD_EVENT, KB_THREAD_SEMAPHORE, KB_THREAD_THREAD,
+    KB_THREAD_ATEXIT, KB_THREAD_CURRENT,
+    // weakref (degraded: strong references — objects live until unreachable)
+    KB_WEAKREF_REF, KB_WEAKREF_CALL,
+    // core additions
+    KB_HASATTR, KB_GETATTR, KB_ID, KB_OBJECT, KB_MIN_EX, KB_MAX_EX,
+    // os
+    KB_OS_CPU_COUNT,
     KB__COUNT
 };

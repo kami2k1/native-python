@@ -1,6 +1,8 @@
 // Dynamic operators, indexing, iteration and calls.
 #include "rt_internal.h"
 
+#include "../include/kami_builtins.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -479,11 +481,16 @@ int64_t prep_user_argv(KamiFuncObj* fo, KamiValue** argv, int64_t nargs, KamiMap
     if (!pass_tuple && !pass_dict) {
         while (pass_n > 0 && !fixed[(size_t)pass_n - 1]) pass_n--;
     }
+    // Holes followed by packed values: hand the callee a MISSING marker — its
+    // prologue evaluates the parameter's default (keyword-only defaults after
+    // *args: Executor.map(self, fn, *iterables, timeout=None, ...)).
+    static KamiValue missing{KT_MISSING, {0}};
     for (int64_t i = 0; i < pass_n; i++)
-        if (!fixed[(size_t)i])
-            panic(what + "(): argument " + std::to_string(i + 1) +
-                  " is missing (defaults before supplied arguments cannot be filled in "
-                  "dynamic calls)");
+        if (!fixed[(size_t)i]) {
+            if (i < fo->min_arity)
+                panic(what + "(): argument " + std::to_string(i + 1) + " is missing");
+            fixed[(size_t)i] = &missing;
+        }
     if (pass_n < fo->min_arity)
         panic(what + "() takes at least " + std::to_string(fo->min_arity) +
               " argument(s) but " + std::to_string(pass_n) + " were given");
@@ -615,6 +622,7 @@ void kami_iter_prep(KamiValue* out, const KamiValue* seq) {
     KamiValue v = *seq;
     switch (v.tag) {
     case KT_LIST:
+    case KT_GEN: // stays lazy: kami_iter_cond/get pull elements on demand
         *out = v;
         return;
     case KT_STR: {
@@ -686,6 +694,8 @@ int32_t kami_range_cond(const KamiValue* i, const KamiValue* stop, const KamiVal
 }
 
 int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx) {
+    if (seq->tag == KT_GEN) // pull the next element (buffered for iter_get)
+        return gen_pull((KamiGenObj*)seq->p) ? 1 : 0;
     Lock lk(g_lock);
     int64_t len;
     switch (seq->tag) {
@@ -698,6 +708,10 @@ int32_t kami_iter_cond(const KamiValue* seq, const KamiValue* idx) {
 }
 
 void kami_iter_get(KamiValue* out, const KamiValue* seq, const KamiValue* idx) {
+    if (seq->tag == KT_GEN) {
+        gen_take_buffered(out, (KamiGenObj*)seq->p);
+        return;
+    }
     kami_index_get(out, seq, idx);
 }
 
@@ -706,6 +720,11 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
     KamiFn init = nullptr;
     KamiValue* f_caps = nullptr;
     KamiValue* init_caps = nullptr;
+    KamiFuncObj* gen_fo = nullptr; // callee is a generator function
+    KamiValue gen_fnval{KT_NONE, {0}};
+    KamiValue bound_self{KT_NONE, {0}}; // KFN_BOUND receiver (kept alive by fn)
+    KamiValue* bound_argv[19];          // self + args for bound builtins
+    bool bound_builtin = false;
     int64_t builtin_id = -1;
     int64_t n2 = 0;
     KamiValue* argv2[19];
@@ -720,6 +739,29 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             inst->fields = new std::unordered_map<std::string, KamiValue>();
             out->tag = KT_OBJECT;
             out->p = inst; // rooted caller slot
+            if (c->nt_fields) { // namedtuple factory: positional fields
+                if (nargs != (int64_t)c->nt_fields->size())
+                    panic(std::string(c->name) + "() takes exactly " +
+                          std::to_string(c->nt_fields->size()) + " arguments");
+                for (int64_t i = 0; i < nargs; i++)
+                    (*inst->fields)[(*c->nt_fields)[(size_t)i]] = *argv[i];
+                return;
+            }
+            if (c->is_exception && !class_lookup(c, "__init__")) {
+                // Exception without __init__: accept any message argument(s),
+                // pre-render "Name: message" for raise/str().
+                std::string msg = c->name;
+                if (nargs > 0) msg += ": " + value_str(argv[0]);
+                KamiValue ms{KT_STR, {0}};
+                ms.p = str_new(msg.data(), (int64_t)msg.size());
+                (*inst->fields)["__exc_msg__"] = ms;
+                KamiValue lst{KT_LIST, {0}};
+                KamiList* l = list_new(nargs > 0 ? nargs : 1);
+                lst.p = l;
+                for (int64_t i = 0; i < nargs; i++) l->items[l->len++] = *argv[i];
+                (*inst->fields)["args"] = lst;
+                return;
+            }
             if (KamiValue* m = class_lookup(c, "__init__")) {
                 KamiFuncObj* fo = (KamiFuncObj*)m->p;
                 KamiValue* argv1[19];
@@ -738,8 +780,38 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
             if (fn->tag != KT_FUNC)
                 panic(std::string("'") + type_name(fn->tag) + "' object is not callable");
             KamiFuncObj* fo = (KamiFuncObj*)fn->p;
-            if (fo->builtin_id >= 0) {
+            if (fo->builtin_id == KB_WEAKREF_CALL) { // weakref: return referent
+                *out = fo->captures[0];
+                return;
+            }
+            if (fo->flags & KFN_BOUND) { // bound method: prepend the receiver
+                bound_self = fo->self; // referent stays alive via the func obj
+                if (fo->builtin_id >= 0) { // e.g. gen.__next__ read as a value
+                    builtin_id = fo->builtin_id;
+                    bound_builtin = true;
+                    bound_argv[0] = &bound_self;
+                    for (int64_t i = 0; i < nargs && i < 18; i++)
+                        bound_argv[i + 1] = argv[i];
+                } else {
+                    KamiValue* argv1[19];
+                    argv1[0] = &bound_self;
+                    for (int64_t i = 0; i < nargs && i < 18; i++) argv1[i + 1] = argv[i];
+                    if (fo->flags & KFN_GENERATOR) {
+                        n2 = prep_user_argv(fo, argv1, nargs + 1, nullptr, argv2, packed);
+                        gen_fo = fo;
+                        gen_fnval = *fn;
+                    } else {
+                        n2 = prep_user_argv(fo, argv1, nargs + 1, nullptr, argv2, packed);
+                        f = (KamiFn)fo->fn;
+                        f_caps = fo->captures;
+                    }
+                }
+            } else if (fo->builtin_id >= 0) {
                 builtin_id = fo->builtin_id;
+            } else if (fo->flags & KFN_GENERATOR) {
+                n2 = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
+                gen_fo = fo;
+                gen_fnval = *fn;
             } else {
                 n2 = prep_user_argv(fo, argv, nargs, nullptr, argv2, packed);
                 f = (KamiFn)fo->fn;
@@ -749,7 +821,12 @@ void kami_call_value(KamiValue* out, const KamiValue* fn, KamiValue** argv, int6
     }
     // Invoke WITHOUT holding the lock: callees take the lock themselves.
     if (builtin_id >= 0) {
-        kami_builtin(builtin_id, out, argv, nargs);
+        if (bound_builtin) kami_builtin(builtin_id, out, bound_argv, nargs + 1);
+        else kami_builtin(builtin_id, out, argv, nargs);
+        return;
+    }
+    if (gen_fo) { // build the generator object; the body runs lazily
+        gen_create_from_func(out, gen_fo, &gen_fnval, argv2, n2);
         return;
     }
     if (init) {
@@ -854,6 +931,8 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
     KamiFn user_fn = nullptr;
     KamiValue* user_caps = nullptr;
     int64_t user_nargs = 0;
+    KamiFuncObj* gen_fo = nullptr; // resolved method is a generator function
+    KamiValue gen_fnval{KT_NONE, {0}};
     KamiValue* argv2[19];
     KamiValue packed[2] = {{KT_NONE, {0}}, {KT_NONE, {0}}};
     PinGuard pin(packed, 2);
@@ -861,11 +940,25 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
         std::unique_lock<std::recursive_mutex> lk(g_lock);
         KamiValue o = *obj;
         std::string m = name;
-        if (kwmap && kwmap->count && o.tag != KT_OBJECT && o.tag != KT_CLASS)
+        if (kwmap && kwmap->count && o.tag != KT_OBJECT && o.tag != KT_CLASS &&
+            o.tag != KT_SYNC)
             panic(m + "() does not accept keyword arguments");
         if (o.tag == KT_PYOBJ) { // bridged CPython object: dispatch through the C-API
             pyobj_method(out, obj, m, argv, nargs);
             return;
+        }
+        if (o.tag == KT_GEN) { // __next__ / send / close / throw
+            lk.unlock();
+            if (gen_method(out, obj, m, argv, nargs)) return;
+            panic("'generator' object has no method '" + m + "'");
+        }
+        if (o.tag == KT_SYNC) { // Condition / Event / Semaphore
+            if (sync_method(lk, out, obj, m, argv, nargs, kwmap)) return;
+            panic("'" + std::string(type_name(o.tag)) + "' object has no method '" + m + "'");
+        }
+        if (o.tag == KT_THREAD) { // Thread objects: start / join / is_alive
+            if (thread_method(lk, out, obj, m, argv, nargs)) return;
+            panic("'thread' object has no method '" + m + "'");
         }
         if (o.tag == KT_LIST) {
             KamiList* l = (KamiList*)o.p;
@@ -885,6 +978,20 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
                 *out = l->items[j];
                 for (int64_t i = j; i + 1 < l->len; i++) l->items[i] = l->items[i + 1];
                 l->len--;
+                return;
+            }
+            if (m == "popleft" && nargs == 0) { // collections.deque ≈ list
+                if (l->len == 0) panic("IndexError: pop from an empty deque");
+                *out = l->items[0];
+                for (int64_t i = 0; i + 1 < l->len; i++) l->items[i] = l->items[i + 1];
+                l->len--;
+                return;
+            }
+            if (m == "appendleft" && nargs == 1) {
+                KamiValue v = *argv[0];
+                list_push(l, &v); // grow; then shift right
+                for (int64_t i = l->len - 1; i > 0; i--) l->items[i] = l->items[i - 1];
+                l->items[0] = v;
                 return;
             }
             if (m == "insert" && nargs == 2) {
@@ -1486,6 +1593,14 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             }
             if ((m == "update" || m == "difference_update" ||
                  m == "intersection_update") && nargs == 1) {
+                if (m == "update" && argv[0]->tag == KT_LIST) {
+                    // set.update(iterable): lists (= tuples) are fine too
+                    KamiList* l = (KamiList*)argv[0]->p;
+                    KamiValue none{KT_NONE, {0}};
+                    for (int64_t i = 0; i < l->len; i++) map_set(mp, &l->items[i], &none);
+                    out->tag = KT_NONE; out->i = 0;
+                    return;
+                }
                 if (argv[0]->tag != KT_SET) panic("set." + m + "() expects a set");
                 KamiMap* other = (KamiMap*)argv[0]->p;
                 KamiValue none{KT_NONE, {0}};
@@ -1644,6 +1759,15 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             if (mv->tag != KT_FUNC)
                 panic(std::string("'") + in->cls->name + "." + m + "' is not callable");
             KamiFuncObj* fo = (KamiFuncObj*)mv->p;
+            // Builtin-backed or already-bound callables stored on the class
+            // (`_counter = itertools.count().__next__`) are not descriptors:
+            // call them as plain values, without prepending the receiver.
+            if (fo->builtin_id >= 0 || (fo->flags & KFN_BOUND)) {
+                KamiValue fnv = *mv;
+                lk.unlock();
+                kami_call_value(out, &fnv, argv, nargs);
+                return;
+            }
             KamiValue* argv1[19];
             int64_t k = 0;
             if (bound) argv1[k++] = obj;
@@ -1651,6 +1775,7 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             user_nargs = prep_user_argv(fo, argv1, k, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
+            if (fo->flags & KFN_GENERATOR) { gen_fo = fo; gen_fnval = *mv; }
         } else if (o.tag == KT_CLASS) {
             // unbound call: ClassName.method(self, args...)
             KamiClassObj* c = (KamiClassObj*)o.p;
@@ -1661,10 +1786,15 @@ static void method_impl(KamiValue* out, KamiValue* obj, const char* name, KamiVa
             user_nargs = prep_user_argv(fo, argv, nargs, kwmap, argv2, packed);
             user_fn = (KamiFn)fo->fn;
             user_caps = fo->captures;
+            if (fo->flags & KFN_GENERATOR) { gen_fo = fo; gen_fnval = *mv; }
         }
         if (!user_fn)
             panic(std::string("'") + type_name(o.tag) + "' object has no method '" + m + "'(" +
                   std::to_string(nargs) + " args)");
+    }
+    if (gen_fo) { // generator method: build the generator object lazily
+        gen_create_from_func(out, gen_fo, &gen_fnval, argv2, user_nargs);
+        return;
     }
     // Invoke user method WITHOUT holding the lock.
     user_fn(out, argv2, user_nargs, user_caps);

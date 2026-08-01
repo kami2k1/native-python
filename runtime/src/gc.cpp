@@ -58,14 +58,25 @@ struct TlsReg {
     }
 };
 thread_local TlsReg t_reg;
+// When a generator fiber is executing, frame registration is redirected to
+// the fiber's own FrameStack (generator.cpp) so suspended generator frames
+// stay registered as GC roots without interleaving with the thread's frames.
+thread_local FrameStack* t_fs_override = nullptr;
 } // namespace
 
 FrameStack* tls_frames() {
+    if (t_fs_override) return t_fs_override;
     if (!t_reg.registered) {
         g_frame_stacks.push_back(&t_reg.fs);
         t_reg.registered = true;
     }
     return &t_reg.fs;
+}
+
+FrameStack* set_tls_frames(FrameStack* fs) {
+    FrameStack* prev = t_fs_override;
+    t_fs_override = fs;
+    return prev;
 }
 
 // ---- marking ----
@@ -116,8 +127,23 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
     case KT_FUNC: {
         KamiFuncObj* fo = (KamiFuncObj*)h;
         for (int64_t i = 0; i < fo->ncaptures; i++) mark_value(&fo->captures[i], stack);
+        if (fo->flags & KFN_BOUND) mark_value(&fo->self, stack);
         break;
     }
+    case KT_THREAD: {
+        ThreadData* td = ((KamiThreadObj*)h)->td;
+        if (td) {
+            mark_value(&td->target, stack);
+            for (auto& a : td->args) mark_value(&a, stack);
+        }
+        break;
+    }
+    case KT_SYNC:
+        mark_value(&((KamiSync*)h)->assoc, stack);
+        break;
+    case KT_GEN:
+        gen_mark_children(h, stack, mark_value);
+        break;
     default: break; // STR / THREAD have no Value children
     }
 }
@@ -135,6 +161,7 @@ void gc_collect() {
         }
     for (auto& pin : g_pins)
         for (int64_t i = 0; i < pin.second; i++) mark_value(&pin.first[i], stack);
+    for (auto& v : g_atexit) mark_value(&v, stack);
     for (FrameStack* fs : g_frame_stacks)
         for (auto& fr : fs->frames)
             for (int64_t i = 0; i < fr.second; i++) mark_value(&fr.first[i], stack);
@@ -171,10 +198,19 @@ void gc_collect() {
             case KT_SOCKET: socket_release((KamiSocket*)h); break;
             case KT_LOCK: lock_destroy((KamiLock*)h); break;
             case KT_FUNC: free(((KamiFuncObj*)h)->captures); break;
-            case KT_CLASS: delete ((KamiClassObj*)h)->members; break;
+            case KT_CLASS: {
+                KamiClassObj* c = (KamiClassObj*)h;
+                delete c->members;
+                delete c->nt_fields;
+                break;
+            }
+            case KT_SYNC: sync_destroy((KamiSync*)h); break;
             case KT_OBJECT: delete ((KamiInstance*)h)->fields; break;
             case KT_PYOBJ:
                 pyobj_finalize(h);
+                break;
+            case KT_GEN:
+                gen_finalize(h);
                 break;
             case KT_THREAD: {
                 ThreadData* td = ((KamiThreadObj*)h)->td;
@@ -288,6 +324,9 @@ void kami_rt_init(int64_t argc, char** argv) {
 }
 
 void kami_rt_shutdown(void) {
+    // First run threading._register_atexit callbacks: concurrent.futures uses
+    // them to wake worker threads so the joins below can finish.
+    atexit_run();
     // Join any still-running threads so we exit cleanly.
     std::vector<ThreadData*> pending;
     {
@@ -295,6 +334,7 @@ void kami_rt_shutdown(void) {
         for (ObjHeader* h = g_all_objects; h; h = h->next) {
             if (h->type == KT_THREAD) {
                 ThreadData* td = ((KamiThreadObj*)h)->td;
+                if (td && td->daemon) continue; // daemon threads die with us
                 if (td && !td->joined && td->th.joinable()) {
                     td->joined = true;
                     pending.push_back(td);

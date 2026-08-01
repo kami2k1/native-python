@@ -12,6 +12,7 @@ struct Parser {
     int func_depth = 0;
     int loop_depth = 0;
     int class_depth = 0;
+    bool saw_yield = false; // any `yield` in the def body being parsed
 
     explicit Parser(std::vector<Token> t) : toks(std::move(t)) {}
 
@@ -540,7 +541,7 @@ struct Parser {
             if (e->params.size() > 16) err("too many lambda parameters (max 16)");
             return e;
         }
-        case Tok::KW_YIELD: err("generators (yield) are not supported");
+        case Tok::KW_YIELD: return parse_yield(/*allow_tuple=*/false);
         case Tok::LPAREN: {
             int line = advance().line;
             if (check(Tok::RPAREN)) { // empty tuple → empty list
@@ -735,7 +736,8 @@ struct Parser {
         }
         // one or more simple statements separated by ';'
         for (;;) {
-            body.push_back(parse_small_stmt());
+            StmtPtr s = parse_small_stmt(&body);
+            body.push_back(std::move(s));
             if (match(Tok::SEMI)) {
                 if (check(Tok::NEWLINE)) { advance(); return; }
                 continue;
@@ -745,7 +747,7 @@ struct Parser {
         }
     }
 
-    StmtPtr parse_small_stmt() {
+    StmtPtr parse_small_stmt(std::vector<StmtPtr>* pre = nullptr) {
         const Token& t = peek();
         switch (t.kind) {
         case Tok::KW_RETURN: {
@@ -836,7 +838,7 @@ struct Parser {
             while (match(Tok::COMMA)) s->params.push_back(expect(Tok::NAME, "name").text);
             return s;
         }
-        default: return parse_simple();
+        default: return parse_simple(pre);
         }
     }
 
@@ -1103,9 +1105,13 @@ struct Parser {
         expect(Tok::COLON, "':'");
         func_depth++;
         int save_loops = loop_depth;
+        bool save_yield = saw_yield;
         loop_depth = 0;
+        saw_yield = false;
         s->body = parse_block();
+        s->is_generator = saw_yield;
         loop_depth = save_loops;
+        saw_yield = save_yield;
         func_depth--;
         return s;
     }
@@ -1134,6 +1140,10 @@ struct Parser {
                     ExprPtr base = parse_expr();
                     if (first && base->kind == ExprKind::Name && base->sval != "object")
                         s->alias = base->sval;
+                    // dotted base: `class TPE(_base.Executor)` → "_base.Executor"
+                    if (first && base->kind == ExprKind::Attr &&
+                        base->a->kind == ExprKind::Name)
+                        s->alias = base->a->sval + "." + base->sval;
                     first = false;
                 } while (match(Tok::COMMA));
             }
@@ -1165,9 +1175,24 @@ struct Parser {
                 expect(Tok::ASSIGN, "'='");
                 a->e1 = parse_expr();
                 expect(Tok::NEWLINE, "newline");
+                // `__class_getitem__ = classmethod(types.GenericAlias)` and
+                // friends exist purely for typing (`Future[str]`); annotations
+                // are ignored here, so the machinery behind them is too.
+                if (a->name == "__class_getitem__" || a->name == "__hash__" ||
+                    a->name == "__slots__")
+                    continue;
                 s->body.push_back(std::move(a));
             } else if (check(Tok::AT)) {
                 s->body.push_back(parse_decorated());
+            } else if (check(Tok::NAME) && peek(1).kind == Tok::DOT) {
+                // `submit.__doc__ = Executor.submit.__doc__` — documentation
+                // plumbing on an already-defined method: parse and drop.
+                StmtPtr doc = parse_simple();
+                if (doc->kind != StmtKind::AttrAssign || doc->name.rfind("__", 0) != 0)
+                    throw CompileError(doc->line,
+                                       "only methods and simple attribute assignments are "
+                                       "supported in class bodies");
+                expect(Tok::NEWLINE, "newline");
             } else {
                 throw CompileError(peek().line,
                                    "only methods and simple attribute assignments are "
@@ -1179,9 +1204,55 @@ struct Parser {
         return s;
     }
 
-    // assignment / expression statement (NEWLINE/SEMI left unconsumed)
-    StmtPtr parse_simple() {
+    // `yield`, `yield expr`, `yield a, b` or `yield from expr` — an expression
+    // that suspends the enclosing function, turning it into a generator.
+    ExprPtr parse_yield(bool allow_tuple) {
+        if (func_depth == 0) err("'yield' outside function");
+        auto e = mk(ExprKind::Yield);
+        advance(); // 'yield'
+        saw_yield = true;
+        if (match(Tok::KW_FROM)) {
+            e->op = 1; // yield from
+            e->a = parse_expr();
+            return e;
+        }
+        switch (peek().kind) { // bare `yield` (value None)?
+        case Tok::NEWLINE:
+        case Tok::SEMI:
+        case Tok::RPAREN:
+        case Tok::RBRACKET:
+        case Tok::RBRACE:
+        case Tok::COMMA:
+        case Tok::COLON:
+        case Tok::DEDENT:
+        case Tok::END: return e;
+        default: break;
+        }
+        e->a = parse_expr();
+        if (allow_tuple && check(Tok::COMMA)) { // yield a, b → yield [a, b]
+            auto lst = std::make_unique<Expr>();
+            lst->kind = ExprKind::ListLit;
+            lst->line = e->line;
+            lst->args.push_back(std::move(e->a));
+            while (match(Tok::COMMA)) {
+                if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
+                lst->args.push_back(parse_expr());
+            }
+            e->a = std::move(lst);
+        }
+        return e;
+    }
+
+    // assignment / expression statement (NEWLINE/SEMI left unconsumed).
+    // `pre` (when given) receives extra statements produced by desugaring,
+    // emitted BEFORE the returned statement.
+    StmtPtr parse_simple(std::vector<StmtPtr>* pre = nullptr) {
         int line = peek().line;
+        if (check(Tok::KW_YIELD)) { // statement-position yield (most common)
+            auto s = mks(StmtKind::ExprStmt, line);
+            s->e1 = parse_yield(/*allow_tuple=*/true);
+            return s;
+        }
         ExprPtr e = parse_expr();
 
         // variable annotation:  x: int [= value]  /  self.x: T = v  /  a[i]: T = v
@@ -1206,6 +1277,23 @@ struct Parser {
             }
             expect(Tok::ASSIGN, "'='");
             s->values.push_back(parse_expr());
+            // chained middle target:  a, b, c = s = rhs  →  s = rhs; a,b,c = s
+            if (check(Tok::ASSIGN) && pre &&
+                s->values[0]->kind == ExprKind::Name) {
+                std::string mid = s->values[0]->sval;
+                advance(); // '='
+                ExprPtr rhs = parse_rhs_values_as_one(line);
+                auto assign = mks(StmtKind::Assign, line);
+                assign->name = mid;
+                assign->e1 = std::move(rhs);
+                pre->push_back(std::move(assign));
+                s->values[0] = std::make_unique<Expr>();
+                s->values[0]->kind = ExprKind::Name;
+                s->values[0]->line = line;
+                s->values[0]->sval = mid;
+                for (auto& t2 : s->targets) check_target(t2.get());
+                return s;
+            }
             while (match(Tok::COMMA)) {
                 if (check(Tok::NEWLINE) || check(Tok::SEMI)) break;
                 s->values.push_back(parse_expr());
@@ -1398,6 +1486,9 @@ std::string dump_expr(const Expr* e) {
     case ExprKind::IfExp:
         return "(ifexp " + dump_expr(e->b.get()) + " " + dump_expr(e->a.get()) + " " +
                dump_expr(e->c.get()) + ")";
+    case ExprKind::Yield:
+        return std::string(e->op ? "(yield-from " : "(yield ") +
+               (e->a ? dump_expr(e->a.get()) : "None") + ")";
     case ExprKind::Call: {
         std::string s = "(call " + dump_expr(e->a.get());
         for (auto& a : e->args) s += " " + dump_expr(a.get());
