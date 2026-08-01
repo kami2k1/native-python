@@ -130,6 +130,16 @@ add_custom_command(TARGET kamipy POST_BUILD
             $<TARGET_FILE_DIR:kamipy>/pylib
     COMMENT "Copying Python stdlib (pylib/) next to kamipy")
 
+# Benchmark suite: `python3 build/run_benchmark.py` compares kamipy vs Go vs
+# CPython on the same programs.
+add_custom_command(TARGET kamipy POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run_benchmark.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/bench.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/bench.go
+            $<TARGET_FILE_DIR:kamipy>
+    COMMENT "Copying benchmark suite next to kamipy")
+
 # ---- tests ----
 enable_testing()
 

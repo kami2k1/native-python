@@ -707,12 +707,14 @@ struct FnGen {
                 // Monomorphized fast path: unbox the arguments straight into
                 // CPU registers and call the @n_ specialization.
                 size_t fidx = (size_t)callee->res_idx;
-                if (fidx < mod.ftypes.size() && mod.ftypes[fidx].native_ok) {
+                if (fidx < mod.ftypes.size() && eff_native(mod.ftypes[fidx])) {
                     const Stmt* f = mod.functions[fidx];
                     const FuncTypeInfo& fi = mod.ftypes[fidx];
+                    const std::vector<uint8_t>& ps = eff_params(fi);
+                    uint8_t rt = eff_ret(fi);
                     bool match = e->args.size() == f->params.size();
                     for (size_t i = 0; match && i < e->args.size(); i++) {
-                        uint8_t pt = fi.params[i], at = e->args[i]->sty;
+                        uint8_t pt = ps[i], at = e->args[i]->sty;
                         if (pt == TY_FLOAT ? at != TY_FLOAT : !intlike(at)) match = false;
                     }
                     if (match) {
@@ -720,17 +722,17 @@ struct FnGen {
                         for (size_t i = 0; i < e->args.size(); i++) {
                             int sl = slots[i];
                             if (i) argstr += ", ";
-                            if (fi.params[i] == TY_FLOAT)
+                            if (ps[i] == TY_FLOAT)
                                 argstr += "double " + load_f64(sl);
                             else
                                 argstr += "i64 " + load_i64(sl);
                         }
                         temp_top = save;
-                        if (fi.ret == TY_NONE) {
+                        if (rt == TY_NONE) {
                             emit("call void @n_" + f->alias + "(" + argstr + ")");
                             store_tag(t, 0);
                             emit("store i64 0, ptr " + payload_ptr(t) + ", align 8");
-                        } else if (fi.ret == TY_FLOAT) {
+                        } else if (rt == TY_FLOAT) {
                             std::string v = r();
                             emit(v + " = call double @n_" + f->alias + "(" + argstr + ")");
                             store_tag(t, 3);
@@ -739,7 +741,7 @@ struct FnGen {
                         } else {
                             std::string v = r();
                             emit(v + " = call i64 @n_" + f->alias + "(" + argstr + ")");
-                            store_tag(t, fi.ret == TY_BOOL ? 1 : 2);
+                            store_tag(t, rt == TY_BOOL ? 1 : 2);
                             emit("store i64 " + v + ", ptr " + payload_ptr(t) + ", align 8");
                         }
                         return t;
@@ -1733,6 +1735,78 @@ struct FnGen {
         }
     }
 
+    // Runtime type guard for speculatively-monomorphized functions: when the
+    // dynamic arguments match the assumed signature, dispatch straight to the
+    // @n_ specialization; otherwise fall through into the generic boxed body.
+    void gen_guard(const Stmt* f, const FuncTypeInfo& fi) {
+        size_t P = f->params.size();
+        std::string Lboxed = newlabel();
+        std::string nok = r();
+        emit(nok + " = icmp eq i64 %nargs, " + std::to_string(P));
+        std::string Lc = newlabel();
+        emit("br i1 " + nok + ", label %" + Lc + ", label %" + Lboxed);
+        C().terminated = true;
+        start_block(Lc);
+        // load each argument pointer and check its tag
+        std::vector<std::string> argp(P);
+        for (size_t i = 0; i < P; i++) {
+            std::string pi = r();
+            emit(pi + " = getelementptr inbounds ptr, ptr %argv, i64 " + std::to_string(i));
+            argp[i] = r();
+            emit(argp[i] + " = load ptr, ptr " + pi + ", align 8");
+            std::string tag = r();
+            emit(tag + " = load i64, ptr " + argp[i] + ", align 8");
+            std::string okv = r();
+            if (fi.spec_params[i] == TY_FLOAT) {
+                emit(okv + " = icmp eq i64 " + tag + ", 3");
+            } else { // int parameter: accept INT and BOOL tags
+                std::string t1 = r(), t2 = r();
+                emit(t1 + " = icmp eq i64 " + tag + ", 2");
+                emit(t2 + " = icmp eq i64 " + tag + ", 1");
+                emit(okv + " = or i1 " + t1 + ", " + t2);
+            }
+            std::string Ln = newlabel();
+            emit("br i1 " + okv + ", label %" + Ln + ", label %" + Lboxed);
+            C().terminated = true;
+            start_block(Ln);
+        }
+        // all tags match: unbox, call the specialization, box the result
+        std::string argstr;
+        for (size_t i = 0; i < P; i++) {
+            std::string pp = r(), v = r();
+            emit(pp + " = getelementptr inbounds i8, ptr " + argp[i] + ", i64 8");
+            if (fi.spec_params[i] == TY_FLOAT) {
+                emit(v + " = load double, ptr " + pp + ", align 8");
+                argstr += (i ? ", " : "") + std::string("double ") + v;
+            } else {
+                emit(v + " = load i64, ptr " + pp + ", align 8");
+                argstr += (i ? ", " : "") + std::string("i64 ") + v;
+            }
+        }
+        std::string retpp = r();
+        emit(retpp + " = getelementptr inbounds i8, ptr %ret, i64 8");
+        if (fi.spec_ret == TY_NONE) {
+            emit("call void @n_" + f->alias + "(" + argstr + ")");
+            emit("store i64 0, ptr %ret, align 8");
+            emit("store i64 0, ptr " + retpp + ", align 8");
+        } else if (fi.spec_ret == TY_FLOAT) {
+            std::string v = r();
+            emit(v + " = call double @n_" + f->alias + "(" + argstr + ")");
+            emit("store i64 3, ptr %ret, align 8");
+            emit("store double " + v + ", ptr " + retpp + ", align 8");
+        } else {
+            std::string v = r();
+            emit(v + " = call i64 @n_" + f->alias + "(" + argstr + ")");
+            emit("store i64 " + std::string(fi.spec_ret == TY_BOOL ? "1" : "2") +
+                 ", ptr %ret, align 8");
+            emit("store i64 " + v + ", ptr " + retpp + ", align 8");
+        }
+        emit("call void @kami_frame_pop()");
+        emit("ret void");
+        C().terminated = true;
+        start_block(Lboxed);
+    }
+
     // Emits parameter copying (with default-value filling) into the current
     // body context. Must be called before generating any statements.
     void gen_prologue(const Stmt* f) {
@@ -2252,15 +2326,17 @@ struct NativeGen {
                 size_t fidx = (size_t)callee->res_idx;
                 const Stmt* def = mod.functions[fidx];
                 const FuncTypeInfo& cal = mod.ftypes[fidx];
+                const std::vector<uint8_t>& ps = eff_params(cal);
+                uint8_t rt = eff_ret(cal);
                 std::string args;
                 for (size_t i = 0; i < e->args.size(); i++) {
-                    char pk = rk(cal.params[i]);
+                    char pk = rk(ps[i]);
                     V a = conv(gen_expr(e->args[i].get()), pk);
                     if (i) args += ", ";
                     args += std::string(irty(pk)) + " " + a.v;
                 }
-                char retk = rk(cal.ret);
-                if (cal.ret == TY_NONE) {
+                char retk = rk(rt);
+                if (rt == TY_NONE) {
                     emit("call void @n_" + def->alias + "(" + args + ")");
                     return {"0", 'i'};
                 }
@@ -2499,24 +2575,40 @@ std::string codegen(const Module& m, const std::string& source_name) {
     // monomorphized native specializations first (boxed bodies call them)
     std::set<std::string> libm;
     for (size_t i = 0; i < m.functions.size(); i++) {
-        if (i < m.ftypes.size() && m.ftypes[i].native_ok) {
-            NativeGen ng(m, m.functions[i], m.ftypes[i], strtab, libm);
+        if (i >= m.ftypes.size()) break;
+        const FuncTypeInfo& fi = m.ftypes[i];
+        if (fi.native_ok) {
+            NativeGen ng(m, m.functions[i], fi, strtab, libm);
             ng.gen_stmts(m.functions[i]->body);
             fns += ng.finish();
+        } else if (fi.guarded) {
+            // speculative specialization: emit under the spec type stamps,
+            // then restore the generic stamps for the boxed body.
+            FuncTypeInfo eff = fi;
+            eff.locals = fi.spec_locals;
+            eff.params = fi.spec_params;
+            eff.ret = fi.spec_ret;
+            stamp_function(const_cast<Module&>(m), i, /*spec=*/true);
+            NativeGen ng(m, m.functions[i], eff, strtab, libm);
+            ng.gen_stmts(m.functions[i]->body);
+            fns += ng.finish();
+            stamp_function(const_cast<Module&>(m), i, /*spec=*/false);
         }
     }
 
-    auto gen_fn = [&](const Stmt* f) {
+    auto gen_fn = [&](const Stmt* f, const FuncTypeInfo* fi) {
         FnGen g(m, strtab);
         g.nlocals = f->nlocals;
         bool ht = stmts_have_try(f->body);
         g.temps_base = f->nlocals + (ht ? 1 : 0);
         g.spill_slot = ht ? f->nlocals : -1;
+        if (fi && fi->guarded) g.gen_guard(f, *fi);
         g.gen_prologue(f);
         g.gen_stmts(f->body);
         fns += g.finish("u_" + f->alias, ht);
     };
-    for (const Stmt* f : m.functions) gen_fn(f);
+    for (size_t i = 0; i < m.functions.size(); i++)
+        gen_fn(m.functions[i], i < m.ftypes.size() ? &m.ftypes[i] : nullptr);
 
     // module body
     FnGen g(m, strtab);

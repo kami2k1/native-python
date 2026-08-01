@@ -161,7 +161,23 @@ struct FuncTypeInfo {
     uint8_t ret = TY_BOT;        // join of all return expression types
     bool escapes = true;         // name used as a value → dynamic calls possible
     bool native_ok = false;      // monomorphized @n_<alias> specialization emitted
+
+    // Speculative monomorphization for functions whose name escapes (e.g.
+    // passed to a benchmark harness): the body is typed under an assumed
+    // parameter signature (int unless call sites say float); u_<alias> gets a
+    // runtime tag guard that dispatches to @n_<alias> when the actual
+    // arguments match, falling back to the generic boxed body otherwise.
+    bool guarded = false;
+    std::vector<uint8_t> spec_locals, spec_params;
+    uint8_t spec_ret = TY_BOT;
 };
+
+// Effective (native-callable) view of a function's signature.
+inline bool eff_native(const FuncTypeInfo& f) { return f.native_ok || f.guarded; }
+inline const std::vector<uint8_t>& eff_params(const FuncTypeInfo& f) {
+    return f.guarded ? f.spec_params : f.params;
+}
+inline uint8_t eff_ret(const FuncTypeInfo& f) { return f.guarded ? f.spec_ret : f.ret; }
 
 struct Module {
     std::vector<StmtPtr> body;         // module-level statements
@@ -189,6 +205,11 @@ struct Module {
 // Type inference & monomorphization analysis (typeinf.cpp). Runs after
 // analyze(); stamps Expr::sty / Stmt::sty and fills Module::ftypes.
 void infer_types(Module& m);
+
+// Re-stamps a single function body's Expr::sty under the speculative (spec =
+// true) or normal (spec = false) type tables. Codegen uses this to emit the
+// guarded @n_ specialization and then restore the stamps for the boxed body.
+void stamp_function(Module& m, size_t func_index, bool spec);
 
 // libm symbol for a builtin math id usable in native (monomorphized) bodies,
 // or null. Shared between typeinf.cpp and codegen.cpp.

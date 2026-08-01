@@ -107,6 +107,9 @@ struct TypeInf {
     Module& mod;
     std::vector<uint8_t> gtypes; // global slot types (currently always TY_ANY)
     bool changed = false;
+    bool spec_mode = false;   // walking under speculative (guarded) tables
+    bool freeze = false;      // stamping only: never mutate the tables
+    bool spec_ready = false;  // spec tables computed: Call typing may use them
 
     explicit TypeInf(Module& m) : mod(m) {}
 
@@ -118,7 +121,13 @@ struct TypeInf {
         FuncTypeInfo* fi = nullptr;
     };
 
+    std::vector<uint8_t>& locals_of(FnCtx& c) {
+        return spec_mode ? c.fi->spec_locals : c.fi->locals;
+    }
+    uint8_t& ret_of(FnCtx& c) { return spec_mode ? c.fi->spec_ret : c.fi->ret; }
+
     void join_into(uint8_t& slot, uint8_t t) {
+        if (freeze) return;
         uint8_t j = join(slot, t);
         if (j != slot) {
             slot = j;
@@ -128,21 +137,25 @@ struct TypeInf {
 
     void join_local(FnCtx& c, int64_t idx, uint8_t t) {
         if (!c.fi) return; // module level: globals are not unboxed
-        if (idx >= 0 && (size_t)idx < c.fi->locals.size()) join_into(c.fi->locals[idx], t);
+        auto& tbl = locals_of(c);
+        if (idx >= 0 && (size_t)idx < tbl.size()) join_into(tbl[idx], t);
     }
 
     uint8_t local_type(FnCtx& c, int64_t idx) {
         if (!c.fi) return TY_ANY;
-        if (idx < 0 || (size_t)idx >= c.fi->locals.size()) return TY_ANY;
-        return c.fi->locals[idx];
+        auto& tbl = locals_of(c);
+        if (idx < 0 || (size_t)idx >= tbl.size()) return TY_ANY;
+        return tbl[idx];
     }
 
     // ---- expression typing (also stamps e->sty) ----
     uint8_t type_expr(FnCtx& c, Expr* e) {
         uint8_t t = type_expr_inner(c, e);
-        // Slots hold BOT only before any assignment; treat as ANY for reads
-        // (never unbox a maybe-uninitialized value).
-        if (t == TY_BOT) t = TY_ANY;
+        // During fixpoint iteration BOT stays optimistic (it only means "no
+        // information yet" — e.g. a recursive call before the return type
+        // settles). Final freeze-stamping turns leftover BOT into ANY so
+        // codegen never unboxes a maybe-uninitialized value.
+        if (freeze && t == TY_BOT) t = TY_ANY;
         e->sty = t;
         return t;
     }
@@ -219,10 +232,12 @@ struct TypeInf {
             const Expr* callee = e->a.get();
             if (callee->res == Res::UserFunc) {
                 size_t fi = (size_t)callee->res_idx;
-                // feed argument types into the callee's parameter joins
+                // feed argument types into the callee's parameter joins (also
+                // collected for escaping functions: they seed the speculative
+                // signature)
                 FuncTypeInfo& cal = info(fi);
                 const Stmt* def = mod.functions[fi];
-                if (!cal.escapes) {
+                if (!spec_mode) {
                     for (size_t i = 0; i < e->args.size() && i < cal.params.size(); i++)
                         join_into(cal.params[i], e->args[i]->sty);
                     // omitted trailing arguments: the default expressions run
@@ -237,7 +252,13 @@ struct TypeInf {
                         }
                     }
                 }
-                return cal.ret == TY_BOT ? TY_ANY : cal.ret;
+                if (!cal.escapes) return cal.ret; // BOT = still settling (optimistic)
+                // Escaping callee: precise only when the speculative signature
+                // is known to apply to this call's argument types.
+                if (spec_ready && (cal.guarded || spec_mode) &&
+                    args_match_spec(cal, e))
+                    return cal.spec_ret;
+                return TY_ANY;
             }
             if (callee->res == Res::BuiltinFunc) return builtin_ret(callee->res_idx);
             type_expr(c, e->a.get());
@@ -314,6 +335,15 @@ struct TypeInf {
         }
     }
 
+    bool args_match_spec(const FuncTypeInfo& cal, const Expr* e) {
+        if (e->args.size() != cal.spec_params.size()) return false;
+        for (size_t i = 0; i < e->args.size(); i++) {
+            uint8_t p = cal.spec_params[i], a = e->args[i]->sty;
+            if (p == TY_FLOAT ? a != TY_FLOAT : !is_intlike(a)) return false;
+        }
+        return true;
+    }
+
     // Is `e` a range(...) call whose arguments are all statically int?
     bool int_range(Expr* e) {
         if (e->kind != ExprKind::Call || e->a->res != Res::BuiltinFunc ||
@@ -381,7 +411,7 @@ struct TypeInf {
         case StmtKind::Return:
             if (c.fi) {
                 uint8_t t = s->e1 ? type_expr(c, s->e1.get()) : TY_NONE;
-                join_into(c.fi->ret, t);
+                join_into(ret_of(c), t);
             } else if (s->e1) {
                 type_expr(c, s->e1.get());
             }
@@ -466,10 +496,9 @@ struct TypeInf {
         };
         sts(mod.body);
         for (Stmt* f : mod.functions) sts(f->body);
-        // params of escaping functions are unknown
-        for (size_t i = 0; i < mod.functions.size(); i++)
-            if (info(i).escapes)
-                for (auto& p : info(i).params) p = TY_ANY;
+        // Note: params of escaping functions keep their direct-call-site
+        // joins — they are not used to seed locals (dynamic calls may pass
+        // anything) but they do seed the speculative signature.
     }
 
     // ---- native-subset check (monomorphization eligibility) ----
@@ -503,11 +532,16 @@ struct TypeInf {
             const Expr* callee = e->a.get();
             if (callee->res == Res::UserFunc) {
                 size_t fi = (size_t)callee->res_idx;
-                if (!mod.ftypes[fi].native_ok) return false;
+                const FuncTypeInfo& cal = mod.ftypes[fi];
+                if (!eff_native(cal)) return false;
                 const Stmt* def = mod.functions[fi];
                 if (e->args.size() != def->params.size()) return false; // defaults
-                for (auto& a : e->args)
-                    if (!native_expr(a.get())) return false;
+                const std::vector<uint8_t>& ps = eff_params(cal);
+                for (size_t i = 0; i < e->args.size(); i++) {
+                    if (!native_expr(e->args[i].get())) return false;
+                    uint8_t p = ps[i], a = e->args[i]->sty;
+                    if (p == TY_FLOAT ? a != TY_FLOAT : !is_intlike(a)) return false;
+                }
                 return true;
             }
             if (callee->res == Res::BuiltinFunc) {
@@ -622,6 +656,78 @@ struct TypeInf {
         }
     }
 
+    // ---- speculative monomorphization for escaping functions ----
+    // A function whose name escapes can be called with anything, so its boxed
+    // body must stay generically typed. But we can *assume* a signature (int
+    // unless direct call sites say float), type the body under it, and — when
+    // the body stays native — emit @n_<alias> plus a runtime tag guard in
+    // u_<alias> that dispatches to it. Benchmarks that pass functions to a
+    // timing harness keep full native speed this way.
+    void compute_speculative() {
+        std::vector<char> cand(mod.functions.size(), 0);
+        for (size_t i = 0; i < mod.functions.size(); i++) {
+            Stmt* f = mod.functions[i];
+            FuncTypeInfo& fi = info(i);
+            if (fi.escapes && !fi.native_ok && f->global_idx >= 0 &&
+                f->defaults.empty() && f->vararg.empty() && f->kwarg.empty() &&
+                f->decorators.empty())
+                cand[i] = 1;
+        }
+        bool any = false;
+        for (size_t i = 0; i < cand.size(); i++)
+            if (cand[i]) any = true;
+        if (!any) return;
+        for (size_t i = 0; i < mod.functions.size(); i++) {
+            if (!cand[i]) continue;
+            Stmt* f = mod.functions[i];
+            FuncTypeInfo& fi = info(i);
+            fi.spec_params.assign(f->params.size(), TY_INT);
+            for (size_t p = 0; p < fi.params.size(); p++)
+                if (fi.params[p] == TY_FLOAT) fi.spec_params[p] = TY_FLOAT;
+            fi.spec_locals.assign((size_t)f->nlocals, TY_BOT);
+            fi.spec_ret = TY_BOT;
+            fi.guarded = true; // provisional; dropped below if non-native
+        }
+        spec_ready = true;
+        spec_mode = true;
+        for (int round = 0; round < 20; round++) {
+            changed = false;
+            for (size_t i = 0; i < mod.functions.size(); i++) {
+                if (!cand[i]) continue;
+                Stmt* f = mod.functions[i];
+                FnCtx c{f, &info(i)};
+                for (size_t p = 0; p < f->params.size() && p < info(i).spec_locals.size();
+                     p++)
+                    join_into(info(i).spec_locals[p], info(i).spec_params[p]);
+                walk_stmts(c, f->body);
+                if (!always_returns(f->body)) join_into(info(i).spec_ret, TY_NONE);
+            }
+            if (!changed) break;
+        }
+        spec_mode = false;
+        // native-subset check against the (now spec-stamped) candidate bodies;
+        // a dropped callee can disqualify its callers.
+        bool again = true;
+        while (again) {
+            again = false;
+            for (size_t i = 0; i < mod.functions.size(); i++) {
+                if (!cand[i] || !info(i).guarded) continue;
+                bool ok = native_stmts(mod.functions[i]->body);
+                if (ok)
+                    for (uint8_t l : info(i).spec_locals)
+                        if (!(is_primitive(l) || l == TY_BOT)) ok = false;
+                if (ok && !(is_primitive(info(i).spec_ret) || info(i).spec_ret == TY_BOT))
+                    ok = false;
+                if (!ok) {
+                    info(i).guarded = false;
+                    again = true;
+                }
+            }
+        }
+        for (size_t i = 0; i < mod.functions.size(); i++)
+            if (info(i).guarded && info(i).spec_ret == TY_BOT) info(i).spec_ret = TY_NONE;
+    }
+
     void run() {
         mod.ftypes.assign(mod.functions.size(), FuncTypeInfo{});
         for (size_t i = 0; i < mod.functions.size(); i++) {
@@ -659,15 +765,18 @@ struct TypeInf {
             if (mod.ftypes[i].ret == TY_BOT) mod.ftypes[i].ret = TY_NONE;
         }
         compute_native();
+        compute_speculative();
         // Re-stamp every expression once more with the final tables so codegen
-        // sees stable types (earlier rounds may have stamped BOT-era values).
-        changed = false;
+        // sees stable types (earlier rounds may have stamped BOT-era values,
+        // and the speculative pass stamped candidate bodies with spec types).
+        freeze = true;
         FnCtx modctx;
         walk_stmts(modctx, mod.body);
         for (size_t i = 0; i < mod.functions.size(); i++) {
             FnCtx c{mod.functions[i], &mod.ftypes[i]};
             walk_stmts(c, mod.functions[i]->body);
         }
+        freeze = false;
         // For-range loops: stamp the loop-variable type for codegen
         stamp_for_types();
         // an unboxed-numeric `s = s + x` never needs the string fast path
@@ -712,6 +821,15 @@ struct TypeInf {
 void infer_types(Module& m) {
     TypeInf ti(m);
     ti.run();
+}
+
+void stamp_function(Module& m, size_t func_index, bool spec) {
+    TypeInf ti(m);
+    ti.freeze = true;
+    ti.spec_ready = true;
+    ti.spec_mode = spec;
+    TypeInf::FnCtx c{m.functions[func_index], &m.ftypes[func_index]};
+    ti.walk_stmts(c, m.functions[func_index]->body);
 }
 
 } // namespace kami
