@@ -172,6 +172,7 @@ bool http_request(const std::string& method, const std::string& url,
                   std::string& err);
 void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
                    const std::string& m, KamiValue** argv, int64_t nargs);
+std::string format_value(KamiValue* v, const std::string& spec); // format() spec
 std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);

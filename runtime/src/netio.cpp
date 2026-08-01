@@ -579,6 +579,79 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
         else set_none();
         return true;
     }
+    case KB_OS_CHDIR:
+        fs::current_path(arg_str(0, "os.chdir"), ec);
+        if (ec) panic("os.chdir: " + ec.message());
+        set_none();
+        return true;
+    case KB_OS_GETPID:
+#ifdef _WIN32
+        out->tag = KT_INT;
+        out->i = (int64_t)GetCurrentProcessId();
+#else
+        out->tag = KT_INT;
+        out->i = (int64_t)getpid();
+#endif
+        return true;
+    case KB_OS_URANDOM: {
+        int64_t n = argv[0]->tag == KT_INT ? argv[0]->i : 0;
+        if (n < 0) panic("os.urandom: negative count");
+        std::string bytes;
+        bytes.resize((size_t)n);
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) {
+            size_t got = fread(&bytes[0], 1, (size_t)n, f);
+            fclose(f);
+            (void)got;
+        } else {
+            for (int64_t i = 0; i < n; i++) bytes[(size_t)i] = (char)(rand() & 0xff);
+        }
+        out->tag = KT_STR;
+        out->p = str_new(bytes.data(), (int64_t)bytes.size());
+        return true;
+    }
+    case KB_OS_WALK: {
+        // Returns a list of (dirpath, [dirnames], [filenames]) triples (as lists).
+        std::string root = arg_str(0, "os.walk");
+        KamiList* result = list_new(4);
+        out->tag = KT_LIST;
+        out->p = result;
+        std::error_code wec;
+        std::vector<std::string> dirs{root};
+        while (!dirs.empty()) {
+            std::string cur = dirs.front();
+            dirs.erase(dirs.begin());
+            KamiList* dnames = list_new(4);
+            KamiList* fnames = list_new(4);
+            for (fs::directory_iterator it(cur, wec), end; !wec && it != end; it.increment(wec)) {
+                std::string name = it->path().filename().string();
+                KamiValue nv;
+                nv.tag = KT_STR;
+                nv.p = str_new(name.data(), (int64_t)name.size());
+                if (it->is_directory(wec)) {
+                    list_push(dnames, &nv);
+                    dirs.push_back(it->path().string());
+                } else {
+                    list_push(fnames, &nv);
+                }
+            }
+            KamiList* triple = list_new(3);
+            KamiValue cv;
+            cv.tag = KT_STR;
+            cv.p = str_new(cur.data(), (int64_t)cur.size());
+            list_push(triple, &cv);
+            KamiValue dv{KT_LIST, {0}};
+            dv.p = dnames;
+            list_push(triple, &dv);
+            KamiValue fv{KT_LIST, {0}};
+            fv.p = fnames;
+            list_push(triple, &fv);
+            KamiValue tv{KT_LIST, {0}};
+            tv.p = triple;
+            list_push(result, &tv);
+        }
+        return true;
+    }
     // ---- os.path ----
     case KB_OSP_EXISTS: set_bool(fs::exists(arg_str(0, "os.path.exists"), ec)); return true;
     case KB_OSP_ISFILE:
@@ -607,6 +680,56 @@ bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kami
     case KB_OSP_ABSPATH:
         set_str(fs::absolute(arg_str(0, "os.path.abspath"), ec).string());
         return true;
+    case KB_OSP_EXPANDUSER: {
+        std::string p = arg_str(0, "os.path.expanduser");
+        if (!p.empty() && p[0] == '~') {
+            const char* home = getenv("HOME");
+#ifdef _WIN32
+            if (!home) home = getenv("USERPROFILE");
+#endif
+            if (home) p = std::string(home) + p.substr(1);
+        }
+        set_str(p);
+        return true;
+    }
+    case KB_OSP_ISABS: {
+        std::string p = arg_str(0, "os.path.isabs");
+        set_bool(fs::path(p).is_absolute());
+        return true;
+    }
+    case KB_OSP_SPLITEXT: {
+        fs::path p = arg_str(0, "os.path.splitext");
+        std::string full = p.string();
+        std::string ext = p.extension().string();
+        std::string root = ext.empty() ? full : full.substr(0, full.size() - ext.size());
+        KamiList* r = list_new(2);
+        out->tag = KT_LIST;
+        out->p = r;
+        KamiValue a, b;
+        a.tag = KT_STR;
+        a.p = str_new(root.data(), (int64_t)root.size());
+        list_push(r, &a);
+        b.tag = KT_STR;
+        b.p = str_new(ext.data(), (int64_t)ext.size());
+        list_push(r, &b);
+        return true;
+    }
+    case KB_OSP_SPLIT: {
+        fs::path p = arg_str(0, "os.path.split");
+        std::string head = p.parent_path().string();
+        std::string tail = p.filename().string();
+        KamiList* r = list_new(2);
+        out->tag = KT_LIST;
+        out->p = r;
+        KamiValue a, b;
+        a.tag = KT_STR;
+        a.p = str_new(head.data(), (int64_t)head.size());
+        list_push(r, &a);
+        b.tag = KT_STR;
+        b.p = str_new(tail.data(), (int64_t)tail.size());
+        list_push(r, &b);
+        return true;
+    }
     // ---- logging ----
     case KB_LOG_BASICCONFIG: {
         // args (from sema): [level|None, format|None]

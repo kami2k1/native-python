@@ -830,7 +830,10 @@ struct Parser {
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
-        if (check(Tok::KW_ELSE)) err("'while ... else' is not supported");
+        if (match(Tok::KW_ELSE)) { // while ... else: runs if no break
+            expect(Tok::COLON, "':'");
+            s->orelse = parse_block();
+        }
         return s;
     }
 
@@ -855,7 +858,10 @@ struct Parser {
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
-        if (check(Tok::KW_ELSE)) err("'for ... else' is not supported");
+        if (match(Tok::KW_ELSE)) { // for ... else: runs if no break
+            expect(Tok::COLON, "':'");
+            s->orelse = parse_block();
+        }
         return s;
     }
 

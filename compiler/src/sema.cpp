@@ -21,7 +21,7 @@ struct BuiltinSig {
 static const std::unordered_map<std::string, BuiltinSig>& builtins() {
     static const std::unordered_map<std::string, BuiltinSig> b = {
         {"print", {KB_PRINT, 0, 16}}, {"len", {KB_LEN, 1, 1}},
-        {"str", {KB_STR, 1, 1}},      {"int", {KB_INT, 1, 1}},
+        {"str", {KB_STR, 1, 1}},      {"int", {KB_INT, 1, 2}},
         {"float", {KB_FLOAT, 1, 1}},  {"abs", {KB_ABS, 1, 1}},
         {"min", {KB_MIN, 1, 16}},     {"max", {KB_MAX, 1, 16}},
         {"ord", {KB_ORD, 1, 1}},      {"chr", {KB_CHR, 1, 1}},
@@ -50,14 +50,30 @@ modules() {
             {"math",
              {{"sqrt", {KB_MATH_SQRT, 1, 1}}, {"sin", {KB_MATH_SIN, 1, 1}},
               {"cos", {KB_MATH_COS, 1, 1}},   {"tan", {KB_MATH_TAN, 1, 1}},
-              {"exp", {KB_MATH_EXP, 1, 1}},   {"log", {KB_MATH_LOG, 1, 1}},
+              {"exp", {KB_MATH_EXP, 1, 1}},   {"log", {KB_MATH_LOG, 1, 2}},
               {"pow", {KB_MATH_POW, 2, 2}},   {"floor", {KB_MATH_FLOOR, 1, 1}},
-              {"ceil", {KB_MATH_CEIL, 1, 1}}, {"fabs", {KB_MATH_FABS, 1, 1}}}},
-            {"time", {{"time", {KB_TIME_TIME, 0, 0}}, {"sleep", {KB_TIME_SLEEP, 1, 1}}}},
+              {"ceil", {KB_MATH_CEIL, 1, 1}}, {"fabs", {KB_MATH_FABS, 1, 1}},
+              {"factorial", {KB_MATH_FACTORIAL, 1, 1}}, {"gcd", {KB_MATH_GCD, 0, 16}},
+              {"isqrt", {KB_MATH_ISQRT, 1, 1}}, {"hypot", {KB_MATH_HYPOT, 2, 16}},
+              {"log2", {KB_MATH_LOG2, 1, 1}}, {"log10", {KB_MATH_LOG10, 1, 1}},
+              {"atan", {KB_MATH_ATAN, 1, 1}}, {"asin", {KB_MATH_ASIN, 1, 1}},
+              {"acos", {KB_MATH_ACOS, 1, 1}}, {"atan2", {KB_MATH_ATAN2, 2, 2}},
+              {"degrees", {KB_MATH_DEGREES, 1, 1}}, {"radians", {KB_MATH_RADIANS, 1, 1}},
+              {"trunc", {KB_MATH_TRUNC, 1, 1}}, {"isnan", {KB_MATH_ISNAN, 1, 1}},
+              {"isinf", {KB_MATH_ISINF, 1, 1}}}},
+            {"time", {{"time", {KB_TIME_TIME, 0, 0}}, {"sleep", {KB_TIME_SLEEP, 1, 1}},
+                      {"monotonic", {KB_TIME_MONOTONIC, 0, 0}},
+                      {"perf_counter", {KB_TIME_PERF_COUNTER, 0, 0}}}},
             {"random",
              {{"random", {KB_RANDOM_RANDOM, 0, 0}},
               {"randint", {KB_RANDOM_RANDINT, 2, 2}},
-              {"seed", {KB_RANDOM_SEED, 1, 1}}}},
+              {"seed", {KB_RANDOM_SEED, 0, 1}},
+              {"randrange", {KB_RANDOM_RANDRANGE, 1, 3}},
+              {"choice", {KB_RANDOM_CHOICE, 1, 1}},
+              {"shuffle", {KB_RANDOM_SHUFFLE, 1, 1}},
+              {"uniform", {KB_RANDOM_UNIFORM, 2, 2}},
+              {"sample", {KB_RANDOM_SAMPLE, 2, 2}},
+              {"choices", {KB_RANDOM_CHOICES, 1, 2}}}},
             {"threading",
              {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}}}},
             {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
@@ -69,12 +85,17 @@ modules() {
               {"remove", {KB_OS_REMOVE, 1, 1}}, {"unlink", {KB_OS_REMOVE, 1, 1}},
               {"mkdir", {KB_OS_MKDIR, 1, 1}},   {"makedirs", {KB_OS_MAKEDIRS, 1, 2}},
               {"rmdir", {KB_OS_RMDIR, 1, 1}},   {"rename", {KB_OS_RENAME, 2, 2}},
-              {"system", {KB_OS_SYSTEM, 1, 1}}, {"getenv", {KB_OS_GETENV, 1, 2}}}},
+              {"system", {KB_OS_SYSTEM, 1, 1}}, {"getenv", {KB_OS_GETENV, 1, 2}},
+              {"walk", {KB_OS_WALK, 1, 1}},     {"chdir", {KB_OS_CHDIR, 1, 1}},
+              {"getpid", {KB_OS_GETPID, 0, 0}}, {"urandom", {KB_OS_URANDOM, 1, 1}}}},
             {"os.path",
              {{"exists", {KB_OSP_EXISTS, 1, 1}}, {"isfile", {KB_OSP_ISFILE, 1, 1}},
               {"isdir", {KB_OSP_ISDIR, 1, 1}},   {"join", {KB_OSP_JOIN, 1, 16}},
               {"basename", {KB_OSP_BASENAME, 1, 1}}, {"dirname", {KB_OSP_DIRNAME, 1, 1}},
-              {"getsize", {KB_OSP_GETSIZE, 1, 1}}, {"abspath", {KB_OSP_ABSPATH, 1, 1}}}},
+              {"getsize", {KB_OSP_GETSIZE, 1, 1}}, {"abspath", {KB_OSP_ABSPATH, 1, 1}},
+              {"expanduser", {KB_OSP_EXPANDUSER, 1, 1}},
+              {"splitext", {KB_OSP_SPLITEXT, 1, 1}}, {"split", {KB_OSP_SPLIT, 1, 1}},
+              {"isabs", {KB_OSP_ISABS, 1, 1}}}},
             {"json",
              {{"loads", {KB_JSON_LOADS, 1, 1}}, {"dumps", {KB_JSON_DUMPS, 1, 3}}}},
             {"socket", {{"socket", {KB_SOCKET_SOCKET, 0, 2}}}},
@@ -110,6 +131,54 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
         out = {0, std::numeric_limits<double>::infinity(), "", 0};
         return true;
     }
+    if (mod == "math" && attr == "tau") { out = {0, 6.28318530717958647692, "", 0}; return true; }
+    if (mod == "math" && attr == "nan") {
+        out = {0, std::numeric_limits<double>::quiet_NaN(), "", 0};
+        return true;
+    }
+    if (mod == "sys" && attr == "maxsize") { out = {2, 0, "", 9223372036854775807LL}; return true; }
+    if (mod == "sys" && attr == "platform") {
+#ifdef _WIN32
+        out = {1, 0, "win32", 0};
+#elif defined(__APPLE__)
+        out = {1, 0, "darwin", 0};
+#else
+        out = {1, 0, "linux", 0};
+#endif
+        return true;
+    }
+    if (mod == "sys" && (attr == "maxint")) { out = {2, 0, "", 9223372036854775807LL}; return true; }
+    if (mod == "os" && attr == "name") {
+#ifdef _WIN32
+        out = {1, 0, "nt", 0};
+#else
+        out = {1, 0, "posix", 0};
+#endif
+        return true;
+    }
+    if (mod == "os" && attr == "sep") {
+#ifdef _WIN32
+        out = {1, 0, "\\", 0};
+#else
+        out = {1, 0, "/", 0};
+#endif
+        return true;
+    }
+    if (mod == "os" && attr == "linesep") {
+#ifdef _WIN32
+        out = {1, 0, "\r\n", 0};
+#else
+        out = {1, 0, "\n", 0};
+#endif
+        return true;
+    }
+    if (mod == "socket") {
+        if (attr == "AF_INET") { out = {2, 0, "", 2}; return true; }
+        if (attr == "SOCK_STREAM") { out = {2, 0, "", 1}; return true; }
+        if (attr == "SOCK_DGRAM") { out = {2, 0, "", 2}; return true; }
+        if (attr == "SOL_SOCKET") { out = {2, 0, "", 1}; return true; }
+        if (attr == "SO_REUSEADDR") { out = {2, 0, "", 2}; return true; }
+    }
     if (mod == "logging") {
         if (attr == "DEBUG") { out = {2, 0, "", 10}; return true; }
         if (attr == "INFO") { out = {2, 0, "", 20}; return true; }
@@ -131,6 +200,15 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
             return true;
         }
         if (attr == "whitespace") { out = {1, 0, " \t\n\r\x0b\x0c", 0}; return true; }
+        if (attr == "printable") {
+            out = {1, 0,
+                   "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                   "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ \t\n\r\x0b\x0c",
+                   0};
+            return true;
+        }
+        if (attr == "hexdigits") { out = {1, 0, "0123456789abcdefABCDEF", 0}; return true; }
+        if (attr == "octdigits") { out = {1, 0, "01234567", 0}; return true; }
     }
     return false;
 }
@@ -333,12 +411,16 @@ struct Sema {
             case StmtKind::For:
                 for (auto& n : s->params) global_slot(n);
                 collect_assigned(s->body, true);
+                collect_assigned(s->orelse, true);
                 break;
             case StmtKind::If:
                 collect_assigned(s->body, true);
                 collect_assigned(s->orelse, true);
                 break;
-            case StmtKind::While: collect_assigned(s->body, true); break;
+            case StmtKind::While:
+                collect_assigned(s->body, true);
+                collect_assigned(s->orelse, true);
+                break;
             case StmtKind::Try:
                 try_depth++;
                 collect_assigned(s->body, true);
@@ -375,12 +457,16 @@ struct Sema {
             case StmtKind::For:
                 for (auto& n : s->params) slot(n);
                 collect_assigned(s->body, as_globals);
+                collect_assigned(s->orelse, as_globals);
                 break;
             case StmtKind::If:
                 collect_assigned(s->body, as_globals);
                 collect_assigned(s->orelse, as_globals);
                 break;
-            case StmtKind::While: collect_assigned(s->body, as_globals); break;
+            case StmtKind::While:
+                collect_assigned(s->body, as_globals);
+                collect_assigned(s->orelse, as_globals);
+                break;
             case StmtKind::With:
                 if (!s->name.empty()) slot(s->name);
                 collect_assigned(s->body, as_globals);
@@ -1240,6 +1326,7 @@ struct Sema {
         case StmtKind::While:
             resolve_expr(s->e1.get());
             resolve_stmts(s->body);
+            resolve_stmts(s->orelse);
             return;
         case StmtKind::For: {
             resolve_expr(s->e1.get());
@@ -1253,6 +1340,7 @@ struct Sema {
             s->target_res = s->multi_tkind[0] == 1 ? Res::Local : Res::Global;
             s->target_idx = s->multi_tidx[0];
             resolve_stmts(s->body);
+            resolve_stmts(s->orelse);
             return;
         }
         case StmtKind::FuncDef:

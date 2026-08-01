@@ -563,7 +563,7 @@ struct FnGen {
     // break/continue via out params when used by For.
     template <typename BodyFn>
     void gen_iteration(const Expr* iter, BodyFn body, std::string* out_step,
-                       std::string* out_end) {
+                       std::string* out_end, std::function<void()> on_normal_exit = {}) {
         bool is_range = iter->kind == ExprKind::Call &&
                         iter->a->res == Res::BuiltinFunc && iter->a->res_idx == KB_RANGE;
         if (is_range) {
@@ -587,7 +587,7 @@ struct FnGen {
             emit("call void @kami_copy(ptr " + slot_ptr(s_i) + ", ptr " + slot_ptr(s_start) +
                  ")");
             std::string Lcond = newlabel(), Lbody = newlabel(), Lstep = newlabel(),
-                        Lend = newlabel();
+                        Lelse = newlabel(), Lend = newlabel();
             if (out_step) *out_step = Lstep;
             if (out_end) *out_end = Lend;
             start_block(Lcond);
@@ -596,7 +596,7 @@ struct FnGen {
                  slot_ptr(s_stop) + ", ptr " + slot_ptr(s_step) + ")");
             std::string b = r();
             emit(b + " = icmp ne i32 " + c + ", 0");
-            emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lend);
+            emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lelse);
             C().terminated = true;
             start_block(Lbody);
             body(s_i);
@@ -604,6 +604,10 @@ struct FnGen {
             emit("call void @kami_binop(i64 " + std::to_string((int)KOP_ADD) + ", ptr " +
                  slot_ptr(s_i) + ", ptr " + slot_ptr(s_i) + ", ptr " + slot_ptr(s_step) + ")");
             emit("br label %" + Lcond);
+            C().terminated = true;
+            start_block(Lelse); // normal exit (loop exhausted, not break) → for/else
+            if (on_normal_exit) on_normal_exit();
+            if (!C().terminated) emit("br label %" + Lend);
             C().terminated = true;
             start_block(Lend);
             return;
@@ -617,7 +621,7 @@ struct FnGen {
         int s_one = alloc_temp();
         emit("call void @kami_make_int(ptr " + slot_ptr(s_one) + ", i64 1)");
         std::string Lcond = newlabel(), Lbody = newlabel(), Lstep = newlabel(),
-                    Lend = newlabel();
+                    Lelse = newlabel(), Lend = newlabel();
         if (out_step) *out_step = Lstep;
         if (out_end) *out_end = Lend;
         start_block(Lcond);
@@ -626,7 +630,7 @@ struct FnGen {
              slot_ptr(s_idx) + ")");
         std::string b = r();
         emit(b + " = icmp ne i32 " + c + ", 0");
-        emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lend);
+        emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lelse);
         C().terminated = true;
         start_block(Lbody);
         int elem = alloc_temp();
@@ -637,6 +641,10 @@ struct FnGen {
         emit("call void @kami_binop(i64 " + std::to_string((int)KOP_ADD) + ", ptr " +
              slot_ptr(s_idx) + ", ptr " + slot_ptr(s_idx) + ", ptr " + slot_ptr(s_one) + ")");
         emit("br label %" + Lcond);
+        C().terminated = true;
+        start_block(Lelse); // normal exit → for/else clause
+        if (on_normal_exit) on_normal_exit();
+        if (!C().terminated) emit("br label %" + Lend);
         C().terminated = true;
         start_block(Lend);
     }
@@ -719,18 +727,23 @@ struct FnGen {
             break;
         }
         case StmtKind::While: {
-            std::string Lcond = newlabel(), Lbody = newlabel(), Lend = newlabel();
+            std::string Lcond = newlabel(), Lbody = newlabel(), Lelse = newlabel(),
+                        Lend = newlabel();
             start_block(Lcond);
             int c = gen_expr(s->e1.get());
             std::string b = truthy(c);
             temp_top = save;
-            emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lend);
+            emit("br i1 " + b + ", label %" + Lbody + ", label %" + Lelse);
             C().terminated = true;
             start_block(Lbody);
             C().loops.push_back({Lcond, Lend});
             gen_stmts(s->body);
             C().loops.pop_back();
             if (!C().terminated) emit("br label %" + Lcond);
+            C().terminated = true;
+            start_block(Lelse); // ran when the condition became false (no break)
+            if (!s->orelse.empty()) gen_stmts(s->orelse);
+            if (!C().terminated) emit("br label %" + Lend);
             C().terminated = true;
             start_block(Lend);
             break;
@@ -758,7 +771,9 @@ struct FnGen {
                 gen_stmts(s->body);
                 C().loops.pop_back();
             };
-            gen_iteration(s->e1.get(), body, &Lstep, &Lend);
+            gen_iteration(s->e1.get(), body, &Lstep, &Lend,
+                          s->orelse.empty() ? std::function<void()>{}
+                                            : [&]() { gen_stmts(s->orelse); });
             break;
         }
         case StmtKind::FuncDef:

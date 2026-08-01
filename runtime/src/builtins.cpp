@@ -36,7 +36,7 @@ static void check_arity(int64_t nargs, int64_t lo, int64_t hi, const char* fn) {
 static std::mt19937_64 g_rng{0xC0FFEEull};
 
 // Python-like format(value, spec): [[fill]align][sign][width][,][.prec][type]
-static std::string format_value(KamiValue* v, const std::string& spec) {
+std::string format_value(KamiValue* v, const std::string& spec) {
     char fill = ' ';
     char align = 0;
     char sign = 0;
@@ -174,6 +174,11 @@ static void call_user(std::unique_lock<std::recursive_mutex>& lk, const KamiValu
 static void set_float(KamiValue* out, double d) { out->tag = KT_FLOAT; out->f = d; }
 static void set_int(KamiValue* out, int64_t i) { out->tag = KT_INT; out->i = i; }
 static void set_none(KamiValue* out) { out->tag = KT_NONE; out->i = 0; }
+static void set_bool(KamiValue* out, bool b) { out->tag = KT_BOOL; out->i = b ? 1 : 0; }
+static void set_str(KamiValue* out, const std::string& s) {
+    out->tag = KT_STR;
+    out->p = str_new(s.data(), (int64_t)s.size());
+}
 
 // Materialize an iterable into a list value written to *out. The result is
 // pinned as a GC root until unpin_scratch() is called; callers must pair them.
@@ -275,11 +280,14 @@ static void builtin_int(KamiValue* out, KamiValue* v) {
     case KT_FLOAT: set_int(out, (int64_t)v->f); return; // trunc toward zero
     case KT_STR: {
         KamiStr* s = (KamiStr*)v->p;
+        std::string t(s->data, (size_t)s->len);
+        size_t b = t.find_first_not_of(" \t\r\n");
+        size_t e = t.find_last_not_of(" \t\r\n");
+        t = (b == std::string::npos) ? "" : t.substr(b, e - b + 1);
         char* end = nullptr;
-        long long r = strtoll(s->data, &end, 10);
-        while (end && *end == ' ') end++;
-        if (end == s->data || (end && *end != '\0'))
-            panic(std::string("invalid literal for int(): '") + s->data + "'");
+        long long r = strtoll(t.c_str(), &end, 10);
+        if (t.empty() || (end && *end != '\0'))
+            panic(std::string("invalid literal for int(): '") + std::string(s->data, (size_t)s->len) + "'");
         set_int(out, (int64_t)r);
         return;
     }
@@ -294,11 +302,14 @@ static void builtin_float(KamiValue* out, KamiValue* v) {
     case KT_FLOAT: set_float(out, v->f); return;
     case KT_STR: {
         KamiStr* s = (KamiStr*)v->p;
+        std::string t(s->data, (size_t)s->len);
+        size_t b = t.find_first_not_of(" \t\r\n");
+        size_t e = t.find_last_not_of(" \t\r\n");
+        t = (b == std::string::npos) ? "" : t.substr(b, e - b + 1);
         char* end = nullptr;
-        double d = strtod(s->data, &end);
-        while (end && *end == ' ') end++;
-        if (end == s->data || (end && *end != '\0'))
-            panic(std::string("could not convert string to float: '") + s->data + "'");
+        double d = strtod(t.c_str(), &end);
+        if (t.empty() || (end && *end != '\0'))
+            panic(std::string("could not convert string to float: '") + std::string(s->data, (size_t)s->len) + "'");
         set_float(out, d);
         return;
     }
@@ -332,7 +343,25 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         }
     }
     case KB_STR: check_arity(nargs, 1, 1, "str"); builtin_str(out, argv[0]); return;
-    case KB_INT: check_arity(nargs, 1, 1, "int"); builtin_int(out, argv[0]); return;
+    case KB_INT:
+        check_arity(nargs, 1, 2, "int");
+        if (nargs == 2) {
+            if (argv[0]->tag != KT_STR) panic("int() can't convert non-string with explicit base");
+            KamiStr* s = (KamiStr*)argv[0]->p;
+            int64_t base = arg_int(argv[1], "int");
+            std::string t(s->data, (size_t)s->len);
+            size_t b = t.find_first_not_of(" \t\r\n");
+            size_t e = t.find_last_not_of(" \t\r\n");
+            t = (b == std::string::npos) ? "" : t.substr(b, e - b + 1);
+            char* end = nullptr;
+            long long r = strtoll(t.c_str(), &end, (int)base);
+            if (end == t.c_str() || (end && *end != '\0'))
+                panic("invalid literal for int() with base " + std::to_string(base) + ": '" + t + "'");
+            set_int(out, (int64_t)r);
+        } else {
+            builtin_int(out, argv[0]);
+        }
+        return;
     case KB_FLOAT: check_arity(nargs, 1, 1, "float"); builtin_float(out, argv[0]); return;
     case KB_ABS: {
         check_arity(nargs, 1, 1, "abs");
@@ -417,11 +446,63 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
     case KB_MATH_COS: check_arity(nargs, 1, 1, "math.cos"); set_float(out, std::cos(arg_num(argv[0], "math.cos"))); return;
     case KB_MATH_TAN: check_arity(nargs, 1, 1, "math.tan"); set_float(out, std::tan(arg_num(argv[0], "math.tan"))); return;
     case KB_MATH_EXP: check_arity(nargs, 1, 1, "math.exp"); set_float(out, std::exp(arg_num(argv[0], "math.exp"))); return;
-    case KB_MATH_LOG: check_arity(nargs, 1, 1, "math.log"); set_float(out, std::log(arg_num(argv[0], "math.log"))); return;
+    case KB_MATH_LOG: {
+        check_arity(nargs, 1, 2, "math.log");
+        double x = arg_num(argv[0], "math.log");
+        if (nargs == 2) set_float(out, std::log(x) / std::log(arg_num(argv[1], "math.log")));
+        else set_float(out, std::log(x));
+        return;
+    }
     case KB_MATH_POW: check_arity(nargs, 2, 2, "math.pow"); set_float(out, std::pow(arg_num(argv[0], "math.pow"), arg_num(argv[1], "math.pow"))); return;
     case KB_MATH_FLOOR: check_arity(nargs, 1, 1, "math.floor"); set_int(out, (int64_t)std::floor(arg_num(argv[0], "math.floor"))); return;
     case KB_MATH_CEIL: check_arity(nargs, 1, 1, "math.ceil"); set_int(out, (int64_t)std::ceil(arg_num(argv[0], "math.ceil"))); return;
     case KB_MATH_FABS: check_arity(nargs, 1, 1, "math.fabs"); set_float(out, std::fabs(arg_num(argv[0], "math.fabs"))); return;
+    case KB_MATH_FACTORIAL: {
+        check_arity(nargs, 1, 1, "math.factorial");
+        int64_t n = arg_int(argv[0], "math.factorial");
+        if (n < 0) panic("math.factorial() not defined for negative values");
+        int64_t r = 1;
+        for (int64_t i = 2; i <= n; i++) r *= i;
+        set_int(out, r);
+        return;
+    }
+    case KB_MATH_GCD: {
+        int64_t g = 0;
+        for (int64_t i = 0; i < nargs; i++) {
+            int64_t v = arg_int(argv[i], "math.gcd");
+            if (v < 0) v = -v;
+            while (v) { int64_t t = g % v; g = v; v = t; }
+        }
+        set_int(out, g);
+        return;
+    }
+    case KB_MATH_ISQRT: {
+        check_arity(nargs, 1, 1, "math.isqrt");
+        int64_t n = arg_int(argv[0], "math.isqrt");
+        if (n < 0) panic("math.isqrt() argument must be nonnegative");
+        int64_t r = (int64_t)std::sqrt((double)n);
+        while (r > 0 && r * r > n) r--;
+        while ((r + 1) * (r + 1) <= n) r++;
+        set_int(out, r);
+        return;
+    }
+    case KB_MATH_HYPOT: {
+        double s = 0;
+        for (int64_t i = 0; i < nargs; i++) { double v = arg_num(argv[i], "math.hypot"); s += v * v; }
+        set_float(out, std::sqrt(s));
+        return;
+    }
+    case KB_MATH_LOG2: check_arity(nargs, 1, 1, "math.log2"); set_float(out, std::log2(arg_num(argv[0], "math.log2"))); return;
+    case KB_MATH_LOG10: check_arity(nargs, 1, 1, "math.log10"); set_float(out, std::log10(arg_num(argv[0], "math.log10"))); return;
+    case KB_MATH_ATAN: check_arity(nargs, 1, 1, "math.atan"); set_float(out, std::atan(arg_num(argv[0], "math.atan"))); return;
+    case KB_MATH_ASIN: check_arity(nargs, 1, 1, "math.asin"); set_float(out, std::asin(arg_num(argv[0], "math.asin"))); return;
+    case KB_MATH_ACOS: check_arity(nargs, 1, 1, "math.acos"); set_float(out, std::acos(arg_num(argv[0], "math.acos"))); return;
+    case KB_MATH_ATAN2: check_arity(nargs, 2, 2, "math.atan2"); set_float(out, std::atan2(arg_num(argv[0], "math.atan2"), arg_num(argv[1], "math.atan2"))); return;
+    case KB_MATH_DEGREES: check_arity(nargs, 1, 1, "math.degrees"); set_float(out, arg_num(argv[0], "math.degrees") * (180.0 / 3.14159265358979323846)); return;
+    case KB_MATH_RADIANS: check_arity(nargs, 1, 1, "math.radians"); set_float(out, arg_num(argv[0], "math.radians") * (3.14159265358979323846 / 180.0)); return;
+    case KB_MATH_TRUNC: check_arity(nargs, 1, 1, "math.trunc"); set_int(out, (int64_t)std::trunc(arg_num(argv[0], "math.trunc"))); return;
+    case KB_MATH_ISNAN: check_arity(nargs, 1, 1, "math.isnan"); set_bool(out, std::isnan(arg_num(argv[0], "math.isnan"))); return;
+    case KB_MATH_ISINF: check_arity(nargs, 1, 1, "math.isinf"); set_bool(out, std::isinf(arg_num(argv[0], "math.isinf"))); return;
     // ---- time ----
     case KB_TIME_TIME: {
         check_arity(nargs, 0, 0, "time.time");
@@ -436,6 +517,13 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         lk.unlock(); // release the GIL while sleeping
         std::this_thread::sleep_for(std::chrono::duration<double>(sec));
         lk.lock();
+        return;
+    }
+    case KB_TIME_MONOTONIC:
+    case KB_TIME_PERF_COUNTER: {
+        check_arity(nargs, 0, 0, "time.monotonic");
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        set_float(out, std::chrono::duration<double>(now).count());
         return;
     }
     // ---- random ----
@@ -453,9 +541,87 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     case KB_RANDOM_SEED: {
-        check_arity(nargs, 1, 1, "random.seed");
-        g_rng.seed((uint64_t)arg_int(argv[0], "random.seed"));
+        check_arity(nargs, 0, 1, "random.seed");
+        if (nargs == 1 && argv[0]->tag != KT_NONE) g_rng.seed((uint64_t)arg_int(argv[0], "random.seed"));
+        else g_rng.seed(std::random_device{}());
         set_none(out);
+        return;
+    }
+    case KB_RANDOM_RANDRANGE: {
+        check_arity(nargs, 1, 3, "random.randrange");
+        int64_t start = 0, stop, step = 1;
+        if (nargs == 1) stop = arg_int(argv[0], "random.randrange");
+        else {
+            start = arg_int(argv[0], "random.randrange");
+            stop = arg_int(argv[1], "random.randrange");
+            if (nargs == 3) step = arg_int(argv[2], "random.randrange");
+        }
+        if (step == 0) panic("random.randrange() step must not be zero");
+        int64_t span = step > 0 ? (stop - start + step - 1) / step : (stop - start + step + 1) / step;
+        if (span <= 0) panic("random.randrange() empty range");
+        set_int(out, start + step * (int64_t)(g_rng() % (uint64_t)span));
+        return;
+    }
+    case KB_RANDOM_UNIFORM: {
+        check_arity(nargs, 2, 2, "random.uniform");
+        double a = arg_num(argv[0], "random.uniform");
+        double b = arg_num(argv[1], "random.uniform");
+        double r = (double)(g_rng() >> 11) * (1.0 / 9007199254740992.0);
+        set_float(out, a + (b - a) * r);
+        return;
+    }
+    case KB_RANDOM_CHOICE: {
+        check_arity(nargs, 1, 1, "random.choice");
+        KamiValue seq;
+        as_list_pinned(&seq, argv[0]);
+        KamiList* l = (KamiList*)seq.p;
+        if (l->len == 0) { unpin_scratch(&seq); panic("random.choice() from empty sequence"); }
+        *out = l->items[g_rng() % (uint64_t)l->len];
+        unpin_scratch(&seq);
+        return;
+    }
+    case KB_RANDOM_SHUFFLE: {
+        check_arity(nargs, 1, 1, "random.shuffle");
+        if (argv[0]->tag != KT_LIST) panic("random.shuffle() requires a list");
+        KamiList* l = (KamiList*)argv[0]->p;
+        for (int64_t i = l->len - 1; i > 0; i--) {
+            int64_t j = (int64_t)(g_rng() % (uint64_t)(i + 1));
+            KamiValue t = l->items[i]; l->items[i] = l->items[j]; l->items[j] = t;
+        }
+        set_none(out);
+        return;
+    }
+    case KB_RANDOM_SAMPLE: {
+        check_arity(nargs, 2, 2, "random.sample");
+        int64_t k = arg_int(argv[1], "random.sample");
+        KamiValue seq;
+        as_list_pinned(&seq, argv[0]);
+        KamiList* src = (KamiList*)seq.p;
+        if (k < 0 || k > src->len) { unpin_scratch(&seq); panic("random.sample() larger than population"); }
+        // partial Fisher-Yates on a copy
+        KamiList* tmp = list_new(src->len > 0 ? src->len : 1);
+        for (int64_t i = 0; i < src->len; i++) tmp->items[tmp->len++] = src->items[i];
+        KamiList* r = list_new(k > 0 ? k : 1);
+        out->tag = KT_LIST; out->p = r;
+        for (int64_t i = 0; i < k; i++) {
+            int64_t j = i + (int64_t)(g_rng() % (uint64_t)(tmp->len - i));
+            KamiValue t = tmp->items[i]; tmp->items[i] = tmp->items[j]; tmp->items[j] = t;
+            r->items[r->len++] = tmp->items[i];
+        }
+        unpin_scratch(&seq);
+        return;
+    }
+    case KB_RANDOM_CHOICES: {
+        check_arity(nargs, 1, 2, "random.choices");
+        int64_t k = nargs == 2 ? arg_int(argv[1], "random.choices") : 1;
+        KamiValue seq;
+        as_list_pinned(&seq, argv[0]);
+        KamiList* l = (KamiList*)seq.p;
+        if (l->len == 0) { unpin_scratch(&seq); panic("random.choices() from empty sequence"); }
+        KamiList* r = list_new(k > 0 ? k : 1);
+        out->tag = KT_LIST; out->p = r;
+        for (int64_t i = 0; i < k; i++) r->items[r->len++] = l->items[g_rng() % (uint64_t)l->len];
+        unpin_scratch(&seq);
         return;
     }
     // ---- threading ----
