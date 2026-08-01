@@ -1401,6 +1401,11 @@ std::string dump_expr(const Expr* e) {
         return s + ")";
     }
     case ExprKind::Starred: return "(* " + dump_expr(e->a.get()) + ")";
+    case ExprKind::CCall: {
+        std::string r = "(ccall " + e->sval;
+        for (auto& a : e->args) r += " " + dump_expr(a.get());
+        return r + ")";
+    }
     }
     return "?";
 }

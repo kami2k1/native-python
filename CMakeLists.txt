@@ -48,11 +48,6 @@ add_library(kamipy_core STATIC
     compiler/src/driver.cpp
 )
 target_include_directories(kamipy_core PUBLIC compiler/src runtime/include)
-if(NOT WIN32 AND OpenSSL_FOUND)
-    # The driver must link compiled programs against the same TLS libs the
-    # runtime was built with (see driver.cpp link command).
-    target_compile_definitions(kamipy_core PRIVATE KAMI_RT_NEEDS_OPENSSL)
-endif()
 
 add_executable(kamipy cli/main.cpp)
 target_link_libraries(kamipy PRIVATE kamipy_core)

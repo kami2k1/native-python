@@ -74,9 +74,6 @@ modules() {
               {"uniform", {KB_RANDOM_UNIFORM, 2, 2}},
               {"sample", {KB_RANDOM_SAMPLE, 2, 2}},
               {"choices", {KB_RANDOM_CHOICES, 1, 2}}}},
-            {"threading",
-             {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}}}},
-            {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
             {"doctest", {{"testmod", {KB_NOOP, 0, 2}}}},
             // _kami — the raw OS layer the Python stdlib is written against.
             // Every entry is a thin C-ABI forward to libc (see
@@ -110,9 +107,63 @@ modules() {
               {"sock_send", {KB_SOCK_SEND, 2, 2}},
               {"sock_recv", {KB_SOCK_RECV, 2, 2}},
               {"sock_close", {KB_SOCK_CLOSE, 1, 1}},
-              {"sock_timeout", {KB_SOCK_TIMEOUT, 2, 2}}}},
+              {"sock_timeout", {KB_SOCK_TIMEOUT, 2, 2}},
+              {"thread_spawn", {KB_SYS_THREAD_SPAWN, 1, 9}},
+              {"thread_join", {KB_SYS_THREAD_JOIN, 1, 1}},
+              {"thread_alive", {KB_SYS_THREAD_ALIVE, 1, 1}},
+              {"mutex_new", {KB_SYS_MUTEX_NEW, 1, 1}},
+              {"mutex_lock", {KB_SYS_MUTEX_LOCK, 1, 1}},
+              {"mutex_trylock", {KB_SYS_MUTEX_TRYLOCK, 1, 1}},
+              {"mutex_unlock", {KB_SYS_MUTEX_UNLOCK, 1, 1}},
+              {"mutex_free", {KB_SYS_MUTEX_FREE, 1, 1}},
+              {"argv", {KB_SYS_ARGV, 0, 0}},
+              {"exit", {KB_SYS_EXIT, 0, 1}}}},
         };
     return m;
+}
+
+// ---------------------------------------------------------------- ctypes
+// `lib = ctypes.CDLL("libfoo.so")` does not create a runtime object: the handle
+// only exists in the compiler, and `lib.f(x)` becomes a direct C call. Argument
+// and return types come from the argtypes/restype assignments ctypes already
+// requires for anything but ints.
+
+static bool ctype_from_name(const std::string& n, CType& out) {
+    static const std::unordered_map<std::string, CType> m = {
+        {"c_int", CType::I32},       {"c_uint", CType::I32},
+        {"c_int32", CType::I32},     {"c_uint32", CType::I32},
+        {"c_long", CType::I64},      {"c_ulong", CType::I64},
+        {"c_longlong", CType::I64},  {"c_ulonglong", CType::I64},
+        {"c_int64", CType::I64},     {"c_uint64", CType::I64},
+        {"c_size_t", CType::I64},    {"c_ssize_t", CType::I64},
+        {"c_short", CType::I16},     {"c_ushort", CType::I16},
+        {"c_int16", CType::I16},     {"c_uint16", CType::I16},
+        {"c_char", CType::I8},       {"c_byte", CType::I8},
+        {"c_ubyte", CType::I8},      {"c_int8", CType::I8},
+        {"c_bool", CType::I8},       {"c_float", CType::F32},
+        {"c_double", CType::F64},    {"c_longdouble", CType::F64},
+        {"c_char_p", CType::CStr},   {"c_wchar_p", CType::CStr},
+        {"c_void_p", CType::Ptr},
+    };
+    auto it = m.find(n);
+    if (it == m.end()) return false;
+    out = it->second;
+    return true;
+}
+
+// A shared-library name/path → a linker flag, so the direct call resolves.
+// "libm.so.6" → -lm, "./build/libfoo.so" → -L./build -lfoo, "user32.dll" → -luser32
+static void cdll_link_flags(const std::string& path, std::vector<std::string>& out) {
+    if (path.empty()) return; // CDLL(None): symbols already in this program
+    size_t slash = path.find_last_of("/\\");
+    std::string dir = slash == std::string::npos ? "" : path.substr(0, slash);
+    std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (base.compare(0, 3, "lib") == 0) base = base.substr(3);
+    size_t dot = base.find('.');
+    if (dot != std::string::npos) base = base.substr(0, dot);
+    if (base.empty()) return;
+    if (!dir.empty()) out.push_back("-L" + dir);
+    out.push_back("-l" + base);
 }
 
 // Imports that are accepted and ignored (annotation-only / test helpers).
@@ -142,18 +193,6 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
         out = {0, std::numeric_limits<double>::quiet_NaN(), "", 0};
         return true;
     }
-    if (mod == "sys" && attr == "maxsize") { out = {2, 0, "", 9223372036854775807LL}; return true; }
-    if (mod == "sys" && attr == "platform") {
-#ifdef _WIN32
-        out = {1, 0, "win32", 0};
-#elif defined(__APPLE__)
-        out = {1, 0, "darwin", 0};
-#else
-        out = {1, 0, "linux", 0};
-#endif
-        return true;
-    }
-    if (mod == "sys" && (attr == "maxint")) { out = {2, 0, "", 9223372036854775807LL}; return true; }
     return false;
 }
 
@@ -181,6 +220,17 @@ struct Sema {
     // "from re import match as m" → {"m": "re__match"}: the alias refers to a
     // namespaced global of a translated module.
     std::unordered_map<std::string, std::string> user_renames;
+    // ctypes: alias of the ctypes module, C library handles, and per-function
+    // signatures declared through argtypes/restype.
+    std::set<std::string> ctypes_aliases;
+    std::set<std::string> cdll_handles;
+    struct CSig {
+        std::vector<CType> args;
+        CType ret = CType::I32; // ctypes' own default
+        bool args_known = false;
+    };
+    std::unordered_map<std::string, CSig> csigs;          // "handle.func" → signature
+    std::unordered_map<std::string, std::string> ctypes_names; // from-import alias → ctypes name
 
     int try_depth = 0; // imports inside try/except may fail softly
     Stmt* cur_func = nullptr;
@@ -281,15 +331,20 @@ struct Sema {
     std::string module_list() const {
         std::string where;
         for (const auto& d : mod.search_path) where += (where.empty() ? "" : ", ") + d;
-        return "math, time, random, threading, sys, doctest are built in; os, os.path, "
-               "json, re, logging, socket, requests, string ship as Python source in "
-               "stdlib/ — searched: " + (where.empty() ? "<nothing>" : where);
+        return "math, time, random, doctest are built in; os, os.path, sys, json, re, "
+               "logging, socket, requests, string, threading, itertools, functools ship as "
+               "Python source in stdlib/ — searched: " + (where.empty() ? "<nothing>" : where);
     }
 
     void register_import(Stmt* s) {
         const std::string& modname = s->name;
         if (noop_module(modname)) {
             for (auto& extra : s->body) register_import(extra.get());
+            return;
+        }
+        if (modname == "ctypes") {
+            // Compile-time only: handles and signatures live in the compiler.
+            ctypes_aliases.insert(s->alias.empty() ? modname : s->alias);
             return;
         }
         if (mod.bundled.count(modname)) {
@@ -314,6 +369,11 @@ struct Sema {
 
     void register_from_import(Stmt* s) {
         const std::string& modname = s->name;
+        if (modname == "ctypes") {
+            // `from ctypes import CDLL, c_int` — the names stay compile-time.
+            for (auto& [n, alias] : s->import_names) ctypes_names[alias] = n;
+            return;
+        }
         // `from . import mod1, mod2` — each imported name is a sibling module.
         if (s->relative && modname.empty()) {
             for (auto& [n, alias] : s->import_names) {
@@ -805,6 +865,109 @@ struct Sema {
         return true;
     }
 
+    // ---- ctypes ----
+    // Is this expression `ctypes.CDLL(...)` (or `CDLL(...)` after a from-import)?
+    bool is_cdll_call(const Expr* e) const {
+        if (!e || e->kind != ExprKind::MethodCall) {
+            if (e && e->kind == ExprKind::Call && e->a->kind == ExprKind::Name) {
+                auto it = ctypes_names.find(e->a->sval);
+                return it != ctypes_names.end() &&
+                       (it->second == "CDLL" || it->second == "cdll" ||
+                        it->second == "WinDLL" || it->second == "windll");
+            }
+            return false;
+        }
+        return e->a->kind == ExprKind::Name && ctypes_aliases.count(e->a->sval) &&
+               (e->sval == "CDLL" || e->sval == "WinDLL" || e->sval == "PyDLL");
+    }
+
+    static std::string cdll_path(const Expr* e) {
+        if (e->args.empty()) return "";
+        const Expr* a = e->args[0].get();
+        return a->kind == ExprKind::StrLit ? a->sval : "";
+    }
+
+    // `ctypes.c_int` / `c_int` → a CType.
+    bool as_ctype(const Expr* e, CType& out) const {
+        if (e->kind == ExprKind::NoneLit) {
+            out = CType::Void;
+            return true;
+        }
+        if (e->kind == ExprKind::Attr && e->a->kind == ExprKind::Name &&
+            ctypes_aliases.count(e->a->sval))
+            return ctype_from_name(e->sval, out);
+        if (e->kind == ExprKind::Name) {
+            auto it = ctypes_names.find(e->sval);
+            if (it != ctypes_names.end()) return ctype_from_name(it->second, out);
+        }
+        return false;
+    }
+
+    // "lib.func" for an attribute chain rooted at a C library handle, else "".
+    std::string cfunc_key(const Expr* e) const {
+        if (e->kind != ExprKind::Attr || e->a->kind != ExprKind::Name) return "";
+        if (!cdll_handles.count(e->a->sval)) return "";
+        return e->a->sval + "." + e->sval;
+    }
+
+    bool resolve_ctypes_decl(Stmt* s) {
+        std::string key = cfunc_key(s->e1.get());
+        if (key.empty()) return false;
+        if (s->name == "argtypes") {
+            if (s->e3->kind != ExprKind::ListLit)
+                err(s->line, "argtypes must be a list of ctypes types");
+            CSig& sig = csigs[key];
+            sig.args.clear();
+            for (auto& t : s->e3->args) {
+                CType ct;
+                if (!as_ctype(t.get(), ct))
+                    err(s->line, "unsupported ctypes argument type in argtypes");
+                sig.args.push_back(ct);
+            }
+            sig.args_known = true;
+        } else if (s->name == "restype") {
+            CType ct;
+            if (!as_ctype(s->e3.get(), ct))
+                err(s->line, "unsupported ctypes return type in restype");
+            csigs[key].ret = ct;
+        } else {
+            err(s->line, "only .argtypes and .restype can be set on a C function");
+        }
+        s->kind = StmtKind::Pass; // compile-time declaration, no code
+        s->e1.reset();
+        s->e3.reset();
+        return true;
+    }
+
+    // lib.func(a, b) → a direct C call.
+    bool resolve_ctypes_call(Expr* e) {
+        if (e->kind != ExprKind::MethodCall || e->a->kind != ExprKind::Name) return false;
+        if (!cdll_handles.count(e->a->sval)) return false;
+        std::string key = e->a->sval + "." + e->sval;
+        auto it = csigs.find(key);
+        CSig sig;
+        if (it != csigs.end()) sig = it->second;
+        if (!e->kwargs.empty()) err(e->line, "a C function call takes no keyword arguments");
+        for (auto& a : e->args) {
+            if (a->kind == ExprKind::Starred)
+                err(e->line, "'*' is not supported when calling a C function");
+            resolve_expr(a.get());
+        }
+        if (sig.args_known && sig.args.size() != e->args.size())
+            err(e->line, "C function '" + e->sval + "' declares " +
+                             std::to_string(sig.args.size()) + " argument(s) but " +
+                             std::to_string(e->args.size()) + " were given");
+        e->kind = ExprKind::CCall;
+        e->comp_tkind.clear();
+        for (size_t i = 0; i < e->args.size(); i++) {
+            CType ct = sig.args_known ? sig.args[i] : CType::I64; // ctypes' default
+            e->comp_tkind.push_back((int)ct);
+        }
+        e->res_idx = (int64_t)sig.ret;
+        e->a.reset();
+        return true;
+    }
+
     // Move a call's keyword arguments into a mapping expression carried in `c`,
     // which codegen passes through the keyword channel.
     void collect_kwargs_into_mapping(Expr* e) {
@@ -955,19 +1118,6 @@ struct Sema {
                     e->a.reset();
                     return;
                 }
-                if (modname == "sys" && e->sval == "argv") {
-                    // sys.argv → zero-arg builtin call
-                    e->kind = ExprKind::Call;
-                    auto callee = std::make_unique<Expr>();
-                    callee->kind = ExprKind::Name;
-                    callee->line = e->line;
-                    callee->sval = "sys.argv";
-                    callee->res = Res::BuiltinFunc;
-                    callee->res_idx = KB_SYS_ARGV;
-                    e->a = std::move(callee);
-                    e->sval.clear();
-                    return;
-                }
                 err(e->line, "module '" + modname + "' has no constant '" + e->sval + "'");
             }
             resolve_expr(e->a.get()); // generic attribute access (objects/classes)
@@ -1063,6 +1213,7 @@ struct Sema {
             return;
         }
         case ExprKind::MethodCall: {
+            if (resolve_ctypes_call(e)) return; // lib.c_func(...) → a direct C call
             // Translated module: "re.findall(a, b)" → "re__findall(a, b)".
             // Re-resolving as a plain Call keeps kwargs/default arguments working.
             std::string bmod = module_ref(e->a.get());
@@ -1336,6 +1487,14 @@ struct Sema {
         switch (s->kind) {
         case StmtKind::ExprStmt: resolve_expr(s->e1.get()); return;
         case StmtKind::Assign:
+            // lib = ctypes.CDLL("libfoo.so") — a compile-time handle, no code.
+            if (is_cdll_call(s->e1.get())) {
+                cdll_handles.insert(s->name);
+                cdll_link_flags(cdll_path(s->e1.get()), mod.link_libs);
+                s->kind = StmtKind::Pass;
+                s->e1.reset();
+                return;
+            }
             resolve_expr(s->e1.get());
             resolve_target(s, s->name);
             return;
@@ -1345,6 +1504,8 @@ struct Sema {
             resolve_expr(s->e3.get());
             return;
         case StmtKind::AttrAssign:
+            // lib.f.argtypes = [c_int, ...] / lib.f.restype = c_double
+            if (resolve_ctypes_decl(s)) return;
             resolve_expr(s->e1.get());
             resolve_expr(s->e3.get());
             return;

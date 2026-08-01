@@ -14,6 +14,8 @@
 #include "rt_internal.h"
 
 #include <cerrno>
+#include <mutex>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -141,6 +143,20 @@ void winsock_init() {
 #endif
 }
 
+// ---- mutexes for threading.Lock / RLock -------------------------------------
+// Handles into a table so Python only ever sees an integer. Locking releases the
+// runtime lock while it blocks, exactly like the other blocking primitives.
+std::vector<std::recursive_mutex*>& mutex_table() {
+    static std::vector<std::recursive_mutex*> t;
+    return t;
+}
+
+std::recursive_mutex* mutex_at(int64_t h) {
+    auto& t = mutex_table();
+    if (h < 0 || (size_t)h >= t.size() || !t[(size_t)h]) panic("invalid lock handle");
+    return t[(size_t)h];
+}
+
 } // namespace
 
 // Returns false when `id` is not one of ours, so the main dispatcher can report
@@ -183,6 +199,16 @@ bool dispatch_syscall(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Ka
     case KB_SYS_FD_WRITE: {
         int fd = (int)arg_int(argv, 0, "fd_write");
         std::string data = arg_str(argv, 1, "fd_write");
+        // stdout/stderr go through stdio so that print(), sys.stdout.write() and
+        // logging all share one buffer and appear in program order.
+        if (fd == 1 || fd == 2) {
+            if (fd == 2) fflush(stdout);
+            FILE* f = fd == 1 ? stdout : stderr;
+            size_t n = fwrite(data.data(), 1, data.size(), f);
+            if (fd == 2) fflush(stderr);
+            set_int(out, (int64_t)n);
+            return true;
+        }
         int64_t done = 0;
         while (done < (int64_t)data.size()) {
             auto n = KAMI_WRITE(fd, data.data() + done, (unsigned)(data.size() - done));
@@ -466,6 +492,38 @@ bool dispatch_syscall(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Ka
         rc |= setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 #endif
         set_int(out, rc == 0 ? 0 : -1);
+        return true;
+    }
+    // ------------------------------------------------------------ threads
+    case KB_SYS_MUTEX_NEW: {
+        auto& t = mutex_table();
+        t.push_back(new std::recursive_mutex());
+        set_int(out, (int64_t)t.size() - 1);
+        return true;
+    }
+    case KB_SYS_MUTEX_LOCK: {
+        std::recursive_mutex* m = mutex_at(arg_int(argv, 0, "mutex_lock"));
+        lk.unlock(); // blocking: hand the runtime lock to whoever holds this one
+        m->lock();
+        lk.lock();
+        set_int(out, 0);
+        return true;
+    }
+    case KB_SYS_MUTEX_TRYLOCK:
+        set_int(out, mutex_at(arg_int(argv, 0, "mutex_trylock"))->try_lock() ? 1 : 0);
+        return true;
+    case KB_SYS_MUTEX_UNLOCK:
+        mutex_at(arg_int(argv, 0, "mutex_unlock"))->unlock();
+        set_int(out, 0);
+        return true;
+    case KB_SYS_MUTEX_FREE: {
+        int64_t h = arg_int(argv, 0, "mutex_free");
+        auto& t = mutex_table();
+        if (h >= 0 && (size_t)h < t.size()) {
+            delete t[(size_t)h];
+            t[(size_t)h] = nullptr;
+        }
+        set_int(out, 0);
         return true;
     }
     default: return false;

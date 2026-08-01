@@ -1,5 +1,7 @@
 #include "codegen.h"
 
+#include <set>
+
 #include "../../runtime/include/kami_builtins.h"
 #include "../../runtime/include/kami_runtime.h"
 
@@ -103,6 +105,8 @@ static std::string param_table(const Stmt* f, StrTable& strtab, std::string& def
 // Parameter-name tables for closures, which are created while generating code
 // (unlike top-level functions, registered in main()).
 static std::string g_closure_param_tables;
+// `declare` lines for C functions reached through compiled ctypes calls.
+static std::set<std::string> c_decls;
 
 struct FnGen {
     const Module& mod;
@@ -409,6 +413,8 @@ struct FnGen {
             }
             return t;
         }
+        case ExprKind::CCall:
+            return gen_ccall(e);
         case ExprKind::Starred:
             throw CompileError(e->line, "* is only allowed inside a list/call");
         case ExprKind::SetLit: {
@@ -1286,6 +1292,120 @@ struct FnGen {
         }
     }
 
+    // ---- compiled ctypes calls ----
+    static const char* ctype_ir(CType t) {
+        switch (t) {
+        case CType::Void: return "void";
+        case CType::I8: return "i8";
+        case CType::I16: return "i16";
+        case CType::I32: return "i32";
+        case CType::I64: return "i64";
+        case CType::F32: return "float";
+        case CType::F64: return "double";
+        default: return "ptr"; // CStr / Ptr
+        }
+    }
+
+    // lib.c_func(a, b) compiled to `call <ret> @c_func(...)`: each argument is
+    // marshalled from a KamiValue to its C type and the result back again.
+    int gen_ccall(const Expr* e) {
+        int t = alloc_temp();
+        int save = temp_top;
+        std::vector<std::string> argv;
+        for (size_t i = 0; i < e->args.size(); i++) {
+            CType ct = (CType)e->comp_tkind[i];
+            int v = gen_expr(e->args[i].get());
+            std::string sp = slot_ptr(v);
+            std::string reg = r();
+            switch (ct) {
+            case CType::F64:
+                emit(reg + " = call double @kami_to_f64(ptr " + sp + ")");
+                argv.push_back("double " + reg);
+                break;
+            case CType::F32: {
+                std::string d = reg;
+                emit(d + " = call double @kami_to_f64(ptr " + sp + ")");
+                std::string f = r();
+                emit(f + " = fptrunc double " + d + " to float");
+                argv.push_back("float " + f);
+                break;
+            }
+            case CType::CStr:
+                emit(reg + " = call ptr @kami_to_cstr(ptr " + sp + ")");
+                argv.push_back("ptr " + reg);
+                break;
+            case CType::Ptr:
+                emit(reg + " = call ptr @kami_to_ptr(ptr " + sp + ")");
+                argv.push_back("ptr " + reg);
+                break;
+            default: {
+                emit(reg + " = call i64 @kami_to_i64(ptr " + sp + ")");
+                const char* ity = ctype_ir(ct);
+                if (std::string(ity) == "i64") {
+                    argv.push_back("i64 " + reg);
+                } else {
+                    std::string tr = r();
+                    emit(tr + " = trunc i64 " + reg + " to " + ity);
+                    argv.push_back(std::string(ity) + " " + tr);
+                }
+                break;
+            }
+            }
+        }
+        CType ret = (CType)e->res_idx;
+        std::string joined;
+        std::string types;
+        for (size_t i = 0; i < argv.size(); i++) {
+            if (i) {
+                joined += ", ";
+                types += ", ";
+            }
+            joined += argv[i];
+            types += argv[i].substr(0, argv[i].find(' '));
+        }
+        c_decls.insert("declare " + std::string(ctype_ir(ret)) + " @" + e->sval + "(" + types +
+                       ")");
+        if (ret == CType::Void) {
+            emit("call void @" + e->sval + "(" + joined + ")");
+            emit("call void @kami_make_none(ptr " + slot_ptr(t) + ")");
+            temp_top = save;
+            return t;
+        }
+        std::string res = r();
+        emit(res + " = call " + ctype_ir(ret) + " @" + e->sval + "(" + joined + ")");
+        switch (ret) {
+        case CType::F64:
+            emit("call void @kami_make_float(ptr " + slot_ptr(t) + ", double " + res + ")");
+            break;
+        case CType::F32: {
+            std::string d = r();
+            emit(d + " = fpext float " + res + " to double");
+            emit("call void @kami_make_float(ptr " + slot_ptr(t) + ", double " + d + ")");
+            break;
+        }
+        case CType::CStr:
+            emit("call void @kami_from_cstr(ptr " + slot_ptr(t) + ", ptr " + res + ")");
+            break;
+        case CType::Ptr: {
+            std::string i = r();
+            emit(i + " = ptrtoint ptr " + res + " to i64");
+            emit("call void @kami_make_int(ptr " + slot_ptr(t) + ", i64 " + i + ")");
+            break;
+        }
+        default: {
+            std::string w = res;
+            if (std::string(ctype_ir(ret)) != "i64") {
+                w = r();
+                emit(w + " = sext " + ctype_ir(ret) + " " + res + " to i64");
+            }
+            emit("call void @kami_make_int(ptr " + slot_ptr(t) + ", i64 " + w + ")");
+            break;
+        }
+        }
+        temp_top = save;
+        return t;
+    }
+
     // f(*seq, x, **map): the argument list is built at run time as a list, then
     // handed to the runtime together with the keyword mapping.
     int gen_spread_call(const Expr* e, int t) {
@@ -1503,6 +1623,11 @@ declare i64 @kami_try(ptr, ptr)
 declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
 declare void @kami_panic(ptr)
+declare i64 @kami_to_i64(ptr)
+declare double @kami_to_f64(ptr)
+declare ptr @kami_to_cstr(ptr)
+declare ptr @kami_to_ptr(ptr)
+declare void @kami_from_cstr(ptr, ptr)
 declare void @kami_rethrow()
 declare void @kami_run_module(ptr)
 
@@ -1510,7 +1635,8 @@ declare void @kami_run_module(ptr)
 
 } // namespace
 
-std::string codegen(const Module& m, const std::string& source_name) {
+std::string codegen(const Module& m, const std::string& source_name,
+                    const std::string& target) {
     StrTable strtab;
     std::string fns;
     g_outline_counter = 0;
@@ -1583,6 +1709,7 @@ std::string codegen(const Module& m, const std::string& source_name) {
 
     std::string out;
     out += "; KamiPython compiled module: " + source_name + "\n";
+    if (!target.empty()) out += "target triple = \"" + target + "\"\n";
     out += "%kv = type { i64, i64 }\n\n";
     for (size_t i = 0; i < strtab.strs.size(); i++) {
         const std::string& s = strtab.strs[i];
@@ -1591,6 +1718,7 @@ std::string codegen(const Module& m, const std::string& source_name) {
     }
     out += param_tables;
     out += g_closure_param_tables;
+    for (const auto& d : c_decls) out += d + "\n";
     out += "\n";
     out += RUNTIME_DECLS;
     out += fns;

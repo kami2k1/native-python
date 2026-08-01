@@ -23,7 +23,11 @@ enum class ExprKind {
     Starred,    // *a inside a list/call display; a = inner
     SetComp,    // element a + clauses
     MapComp,    // pairs[0] = (key,val) + clauses
+    CCall,      // compiled ctypes call: sval = C symbol, args = arguments
 };
+
+// C-ABI types a compiled ctypes call can marshal (see ExprKind::CCall).
+enum class CType { Void = 0, I8, I16, I32, I64, F32, F64, CStr, Ptr };
 
 struct Expr;
 
@@ -60,7 +64,8 @@ struct Expr {
     Res res = Res::Unresolved;
     int64_t res_idx = 0;       // local slot / global index / builtin id / func index
     std::vector<int64_t> comp_tidx; // ListComp resolved target slots
-    std::vector<int> comp_tkind;    // 1=local 2=global
+    std::vector<int> comp_tkind;    // 1=local 2=global; CCall: argument CTypes
+                                    // (res_idx then holds the return CType)
 };
 
 // ---------------- statements ----------------
@@ -140,6 +145,9 @@ struct Module {
     int64_t nglobals = 0;
     std::map<std::string, BundledModule> bundled; // module name → namespace info
     std::vector<std::string> search_path;          // where imports were looked for
+    // Libraries named by ctypes.CDLL(...), so the driver can link them: a
+    // compiled ctypes call is a direct call, which must resolve at link time.
+    std::vector<std::string> link_libs;
     std::string source_path;                       // input file path (for __file__)
 };
 

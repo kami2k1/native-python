@@ -208,6 +208,47 @@ void kami_make_closure(KamiValue* out, void* fnptr, int64_t min_arity, int64_t a
     }
 }
 
+// ---- C ABI marshalling for compiled ctypes calls ----
+int64_t kami_to_i64(const KamiValue* v) {
+    switch (v->tag) {
+    case KT_BOOL:
+    case KT_INT: return v->i;
+    case KT_FLOAT: return (int64_t)v->f;
+    case KT_NONE: return 0;
+    case KT_STR: return (int64_t)(intptr_t)((KamiStr*)v->p)->data; // char* as an integer
+    default: panic(std::string("cannot pass '") + type_name(v->tag) + "' to a C function");
+    }
+}
+
+double kami_to_f64(const KamiValue* v) {
+    if (v->tag == KT_FLOAT) return v->f;
+    if (v->tag == KT_INT || v->tag == KT_BOOL) return (double)v->i;
+    panic(std::string("cannot pass '") + type_name(v->tag) + "' to a C function as a double");
+}
+
+const char* kami_to_cstr(const KamiValue* v) {
+    if (v->tag == KT_STR) return ((KamiStr*)v->p)->data; // strings are NUL-terminated
+    if (v->tag == KT_NONE) return nullptr;
+    panic(std::string("cannot pass '") + type_name(v->tag) + "' to a C function as a char*");
+}
+
+void* kami_to_ptr(const KamiValue* v) {
+    if (v->tag == KT_NONE) return nullptr;
+    if (v->tag == KT_INT) return (void*)(intptr_t)v->i;
+    if (v->tag == KT_STR) return (void*)((KamiStr*)v->p)->data;
+    panic(std::string("cannot pass '") + type_name(v->tag) + "' to a C function as a pointer");
+}
+
+void kami_from_cstr(KamiValue* out, const char* s) {
+    Lock lk(g_lock);
+    if (!s) {
+        out->tag = KT_NONE;
+        out->i = 0;
+        return;
+    }
+    put_str(out, s, (int64_t)strlen(s));
+}
+
 void kami_make_set(KamiValue* out) {
     Lock lk(g_lock);
     KamiMap* m = map_new();

@@ -11,6 +11,11 @@ struct BuildOptions {
     bool emit_ast = false;   // print the AST dump and stop
     int opt_level = 2;
     std::string argv0;       // for locating libkamirt
+    std::string target;      // LLVM target triple (cross-compilation)
+    std::string sysroot;     // headers/libs of the target platform
+    // Extra .c/.cpp/.o/.a/.lib inputs and -l/-L flags, passed to the linker
+    // driver together with the compiled Python.
+    std::vector<std::string> extra_inputs;
 };
 
 // Returns the produced executable path. Throws std::runtime_error / CompileError.

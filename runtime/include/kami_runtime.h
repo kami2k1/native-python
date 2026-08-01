@@ -151,6 +151,13 @@ void kami_rethrow(void);
 // Top-level entry: runs the module body, catching runtime errors.
 void kami_run_module(void* module_fn);
 
+// --- C ABI marshalling (compiled ctypes calls) ---
+int64_t kami_to_i64(const KamiValue* v);
+double kami_to_f64(const KamiValue* v);
+const char* kami_to_cstr(const KamiValue* v); // NUL-terminated view of a str
+void* kami_to_ptr(const KamiValue* v);
+void kami_from_cstr(KamiValue* out, const char* s);
+
 // --- diagnostics ---
 void kami_panic(const char* msg);
 

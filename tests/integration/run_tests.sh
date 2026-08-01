@@ -16,7 +16,17 @@ for py in "$DIR"/*.py; do
     base="$(basename "$py" .py)"
     exp="$DIR/$base.expected"
     count=$((count + 1))
-    if ! "$KAMIPY" build "$py" -o "$TMP/$base" > "$TMP/$base.buildlog" 2>&1; then
+    # <base>.args (optional): extra inputs for the compiler, e.g. a C source to
+    # link in — one per line, resolved relative to this directory.
+    extra=()
+    if [ -f "$DIR/$base.args" ]; then
+        while read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in -*) extra+=("$line");; *) extra+=("$DIR/$line");; esac
+        done < "$DIR/$base.args"
+    fi
+    if ! "$KAMIPY" build "$py" "${extra[@]+"${extra[@]}"}" -o "$TMP/$base" \
+            > "$TMP/$base.buildlog" 2>&1; then
         echo "BUILD FAIL: $base"
         cat "$TMP/$base.buildlog"
         fail=1

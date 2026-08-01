@@ -122,7 +122,7 @@ std::string build(const BuildOptions& opts) {
             fputs(dump_module(mod).c_str(), stdout);
             return "";
         }
-        ir = codegen(mod, opts.input);
+        ir = codegen(mod, opts.input, opts.target);
     } catch (const CompileError& e) {
         // The error may sit in a translated stdlib module: report its own file.
         throw locate_error(mod, e);
@@ -142,23 +142,44 @@ std::string build(const BuildOptions& opts) {
 
     std::string cxx = getenv("KAMIPY_CXX") ? getenv("KAMIPY_CXX") : "clang++";
     std::string rtlib = find_runtime_lib(opts.argv0);
-    std::vector<std::string> cmd = {cxx,
-                                    "-O" + std::to_string(opts.opt_level),
-                                    ll.string(),
-                                    rtlib,
-                                    "-o",
-                                    out.string()};
+    std::vector<std::string> cmd = {cxx, "-O" + std::to_string(opts.opt_level)};
+    // Cross-compilation: clang selects the backend from the target triple, so the
+    // same .ll can be lowered for another platform given its sysroot.
+    if (!opts.target.empty()) {
+        cmd.push_back("--target=" + opts.target);
+        cmd.push_back("-fuse-ld=lld");
+    }
+    if (!opts.sysroot.empty()) cmd.push_back("--sysroot=" + opts.sysroot);
+    cmd.push_back(ll.string());
+    // Extra C/C++ sources, objects and libraries are compiled and linked by the
+    // same clang invocation, next to the Python program's IR (this is what makes
+    // ctypes.CDLL of a locally built library work in a single binary).
+    for (const auto& x : opts.extra_inputs) {
+        // A .c file must be compiled as C, or clang++ would mangle its symbols
+        // and the direct calls emitted for ctypes would not resolve.
+        bool is_c = x.size() > 2 && x.compare(x.size() - 2, 2, ".c") == 0;
+        if (is_c) {
+            cmd.push_back("-x");
+            cmd.push_back("c");
+        }
+        cmd.push_back(x);
+        if (is_c) {
+            cmd.push_back("-x");
+            cmd.push_back("none");
+        }
+    }
+    // Libraries named by ctypes.CDLL(...) — a compiled ctypes call is a direct
+    // call, so the symbol has to be there at link time.
+    for (const auto& l : mod.link_libs) cmd.push_back(l);
+    cmd.push_back(rtlib);
+    cmd.push_back("-o");
+    cmd.push_back(out.string());
 #ifndef _WIN32
     cmd.push_back("-pthread");
     cmd.push_back("-lm");
-#ifdef KAMI_RT_NEEDS_OPENSSL
-    cmd.push_back("-lssl");
-    cmd.push_back("-lcrypto");
-#endif
     cmd.push_back("-Wl,--gc-sections");
 #else
     cmd.push_back("-lws2_32");
-    cmd.push_back("-lwinhttp");
 #endif
     // clang warns about override of module-less IR opt flags; keep output clean:
     cmd.push_back("-Wno-override-module");
@@ -167,9 +188,16 @@ std::string build(const BuildOptions& opts) {
         std::error_code ec;
         fs::remove(ll, ec);
     }
-    if (rc != 0)
-        throw std::runtime_error("linking failed (clang++ exited with code " +
-                                 std::to_string(rc) + ")");
+    if (rc != 0) {
+        std::string msg = "linking failed (" + cxx + " exited with code " +
+                          std::to_string(rc) + ")";
+        if (!opts.target.empty())
+            msg += "\nnote: cross-compiling to " + opts.target +
+                   " also needs a sysroot for that platform (--sysroot) and a copy of the "
+                   "runtime built for it (point KAMIPY_RT_LIB at the cross-built "
+                   "libkamirt.a)";
+        throw std::runtime_error(msg);
+    }
     return out.string();
 }
 

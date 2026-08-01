@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -14,13 +15,34 @@ using namespace kami;
 
 static const char* CACHE_DIR = ".kamipy-cache";
 
+// C/C++ sources, objects, libraries and linker flags that ride along with the
+// compiled Python.
+static bool is_native_input(const std::string& a) {
+    if (a.rfind("-l", 0) == 0 || a.rfind("-L", 0) == 0) return true;
+    static const char* exts[] = {".c", ".cpp", ".cc", ".cxx", ".o", ".obj", ".a", ".lib", ".so"};
+    for (const char* e : exts) {
+        size_t n = strlen(e);
+        if (a.size() > n && a.compare(a.size() - n, n, e) == 0) return true;
+    }
+    return false;
+}
+
 static void usage() {
     fprintf(stderr,
             "KamiPython native compiler\n"
             "usage:\n"
             "  kamipy build <file.py> [-o <out>] [-O0|-O1|-O2] [--emit-llvm] [--emit-ast]\n"
+            "               [--target <triple>] [--sysroot <dir>]\n"
+            "               [extra.c ...] [lib.a ...] [-l<name>] [-L<dir>]\n"
             "  kamipy run   <file.py>\n"
-            "  kamipy clean\n");
+            "  kamipy clean\n"
+            "\n"
+            "Cross-compilation: --target picks the LLVM target triple (needs the\n"
+            "target's sysroot and lld), e.g.\n"
+            "  kamipy build main.py --target x86_64-unknown-linux-gnu -o app_linux\n"
+            "\n"
+            "C interop: extra C/C++ sources, objects and libraries are compiled and\n"
+            "linked into the same executable, so ctypes.CDLL can bind to them.\n");
 }
 
 int main(int argc, char** argv) {
@@ -55,6 +77,11 @@ int main(int argc, char** argv) {
             else if (a == "-O2") opts.opt_level = 2;
             else if (a == "--emit-llvm") opts.emit_llvm = true;
             else if (a == "--emit-ast") opts.emit_ast = true;
+            else if (a == "--target" && i + 1 < argc) opts.target = argv[++i];
+            else if (a.rfind("--target=", 0) == 0) opts.target = a.substr(9);
+            else if (a == "--sysroot" && i + 1 < argc) opts.sysroot = argv[++i];
+            else if (a.rfind("--sysroot=", 0) == 0) opts.sysroot = a.substr(10);
+            else if (is_native_input(a)) opts.extra_inputs.push_back(a);
             else {
                 fprintf(stderr, "unknown option: %s\n", a.c_str());
                 return 2;

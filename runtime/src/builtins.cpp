@@ -643,8 +643,18 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     // ---- threading ----
-    case KB_THREAD_SPAWN: builtin_spawn(out, argv, nargs); return;
-    case KB_THREAD_JOIN: builtin_join(lk, out, argv, nargs); return;
+    case KB_THREAD_SPAWN:
+    case KB_SYS_THREAD_SPAWN: builtin_spawn(out, argv, nargs); return;
+    case KB_THREAD_JOIN:
+    case KB_SYS_THREAD_JOIN: builtin_join(lk, out, argv, nargs); return;
+    case KB_SYS_THREAD_ALIVE: {
+        check_arity(nargs, 1, 1, "thread_alive");
+        if (argv[0]->tag != KT_THREAD) panic("thread_alive(): argument must be a thread");
+        KamiThreadObj* to = (KamiThreadObj*)argv[0]->p;
+        out->tag = KT_BOOL;
+        out->i = to->td && !to->td->joined;
+        return;
+    }
     // ---- extended builtins ----
     case KB_SUM: {
         check_arity(nargs, 1, 2, "sum");
