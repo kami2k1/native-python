@@ -53,6 +53,32 @@ endif()
 target_compile_options(kamirt PRIVATE ${KAMI_RT_OPTS})
 
 # ---- compiler ----
+# Embedded LLVM backend + LLD linker (Part III): when the LLVM and LLD
+# development libraries are available, kamipy compiles IR to machine code in
+# process and links executables itself — no clang/gcc/ld on the user machine.
+# Without them, kamipy falls back to invoking an external clang++.
+find_package(LLVM CONFIG QUIET)
+find_package(LLD CONFIG QUIET)
+if(NOT LLVM_FOUND OR NOT LLD_FOUND)
+    # Debian/Ubuntu install versioned LLVM outside the default search path.
+    foreach(v RANGE 21 14 -1)
+        if(EXISTS "/usr/lib/llvm-${v}/lib/cmake/llvm")
+            find_package(LLVM CONFIG QUIET PATHS "/usr/lib/llvm-${v}/lib/cmake/llvm" NO_DEFAULT_PATH)
+            find_package(LLD CONFIG QUIET PATHS "/usr/lib/llvm-${v}/lib/cmake/lld" NO_DEFAULT_PATH)
+            if(LLVM_FOUND AND LLD_FOUND)
+                break()
+            endif()
+        endif()
+    endforeach()
+endif()
+if(LLVM_FOUND AND LLD_FOUND)
+    message(STATUS "Embedding LLVM ${LLVM_PACKAGE_VERSION} + LLD (self-contained kamipy)")
+    set(KAMI_EMBED_LLVM ON)
+else()
+    message(STATUS "LLVM/LLD dev libraries not found — kamipy will call an external clang++")
+    set(KAMI_EMBED_LLVM OFF)
+endif()
+
 add_library(kamipy_core STATIC
     compiler/src/lexer.cpp
     compiler/src/parser.cpp
@@ -62,8 +88,23 @@ add_library(kamipy_core STATIC
     compiler/src/cext.cpp
     compiler/src/modules.cpp
     compiler/src/driver.cpp
+    $<IF:$<BOOL:${KAMI_EMBED_LLVM}>,compiler/src/native_backend.cpp,compiler/src/native_backend_stub.cpp>
 )
 target_include_directories(kamipy_core PUBLIC compiler/src runtime/include)
+if(KAMI_EMBED_LLVM)
+    target_include_directories(kamipy_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${LLD_INCLUDE_DIRS})
+    target_compile_definitions(kamipy_core PRIVATE ${LLVM_DEFINITIONS} KAMI_EMBED_LLVM)
+    set_source_files_properties(compiler/src/native_backend.cpp PROPERTIES
+        COMPILE_FLAGS "$<IF:$<CXX_COMPILER_ID:MSVC>,/GR-,-fno-rtti>")
+    llvm_map_components_to_libnames(KAMI_LLVM_LIBS
+        core irreader support passes native)
+    if(WIN32)
+        set(KAMI_LLD_LIBS lldCOFF lldCommon)
+    else()
+        set(KAMI_LLD_LIBS lldELF lldCommon)
+    endif()
+    target_link_libraries(kamipy_core PRIVATE ${KAMI_LLD_LIBS} ${KAMI_LLVM_LIBS})
+endif()
 if(NOT WIN32 AND OpenSSL_FOUND)
     # The driver must link compiled programs against the same TLS libs the
     # runtime was built with (see driver.cpp link command).
