@@ -12,8 +12,6 @@
 
 namespace kami {
 
-bool dispatch_netio(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
-                    KamiValue** argv, int64_t nargs);
 bool dispatch_syscalls(std::unique_lock<std::recursive_mutex>& lk, int64_t id, KamiValue* out,
                        KamiValue** argv, int64_t nargs);
 void socket_method(std::unique_lock<std::recursive_mutex>& lk, KamiValue* out, KamiValue* obj,
@@ -1115,7 +1113,6 @@ static void dispatch(std::unique_lock<std::recursive_mutex>& lk, int64_t id, Kam
         return;
     }
     default:
-        if (dispatch_netio(lk, id, out, argv, nargs)) return;
         if (dispatch_syscalls(lk, id, out, argv, nargs)) return;
         panic("unknown builtin id " + std::to_string(id));
     }

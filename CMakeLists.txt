@@ -28,9 +28,6 @@ add_library(kamirt STATIC
     runtime/src/collections.cpp
     runtime/src/ops.cpp
     runtime/src/objects.cpp
-    runtime/src/netio.cpp
-    runtime/src/http_client.cpp
-    runtime/src/kami_regex.cpp
     runtime/src/builtins.cpp
     runtime/src/syscalls.cpp
 )
