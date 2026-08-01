@@ -26,9 +26,23 @@ namespace kami {
 
 namespace {
 
+std::string path_to_utf8(const fs::path& p) {
+#ifdef _WIN32
+    std::wstring ws = p.wstring();
+    if (ws.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], len, NULL, NULL);
+    return out;
+#else
+    return p.string();
+#endif
+}
+
 std::string read_source(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot open " + p.string());
+    if (!in) throw std::runtime_error("cannot open " + path_to_utf8(p));
     std::ostringstream ss;
     ss << in.rdbuf();
     return ss.str();
@@ -82,7 +96,7 @@ void push_candidate(std::vector<Candidate>& out, const fs::path& dir, int priori
     if (ec) canon = dir;
     for (const auto& c : out)
         if (c.dir == canon) return;
-    out.push_back({canon, version_rank(canon.filename().string()), priority});
+    out.push_back({canon, version_rank(path_to_utf8(canon.filename())), priority});
 }
 
 // Directory listing that never throws. Scanning C:\\ or /usr/lib can hit an
@@ -128,7 +142,7 @@ void push_prefix(std::vector<Candidate>& out, const fs::path& prefix, int priori
     push_candidate(out, prefix / "Lib", priority, true); // Windows layout
     for (const char* libdir : {"lib", "lib64"})
         for (const fs::path& e : list_dir(prefix / libdir))
-            if (e.filename().string().rfind("python3", 0) == 0)
+            if (path_to_utf8(e.filename()).rfind("python3", 0) == 0)
                 push_candidate(out, e, priority, true);
 }
 
@@ -137,7 +151,7 @@ void push_prefix(std::vector<Candidate>& out, const fs::path& prefix, int priori
 void push_versioned_children(std::vector<Candidate>& out, const fs::path& parent,
                              const std::string& prefix, const fs::path& suffix, int priority) {
     for (const fs::path& e : list_dir(parent)) {
-        std::string lower = e.filename().string();
+        std::string lower = path_to_utf8(e.filename());
         std::transform(lower.begin(), lower.end(), lower.begin(),
                        [](unsigned char c) { return (char)tolower(c); });
         if (lower.rfind(prefix, 0) != 0) continue;

@@ -123,17 +123,31 @@ static ImportPolicy import_policy(const fs::path& input, const std::string& argv
     return pol;
 }
 
+static std::string path_to_string(const fs::path& p) {
+#ifdef _WIN32
+    std::wstring ws = p.wstring();
+    if (ws.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], len, NULL, NULL);
+    return out;
+#else
+    return p.string();
+#endif
+}
+
 // Where would `import X` look for a module right now? Printed by
 // `kamipy paths` so a broken setup can be diagnosed without guesswork.
 std::string describe_import_paths(const std::string& argv0) {
     std::string out = "project directory: <alongside the input file>\n\nbundled pylib:\n";
     std::error_code ec;
     for (const fs::path& d : bundled_pylib_dirs(self_dir(argv0)))
-        out += "  " + d.string() + (fs::is_directory(d, ec) ? "" : "   (missing)") + "\n";
+        out += "  " + path_to_string(d) + (fs::is_directory(d, ec) ? "" : "   (missing)") + "\n";
     out += "\nsystem Python (auto-discovered):\n";
     const auto& sys = find_system_python_stdlib();
     if (sys.empty()) out += "  <none found — falling back to the bundled pylib>\n";
-    for (const fs::path& d : sys) out += "  " + d.string() + "\n";
+    for (const fs::path& d : sys) out += "  " + path_to_string(d) + "\n";
     return out;
 }
 
