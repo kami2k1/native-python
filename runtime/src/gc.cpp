@@ -113,8 +113,10 @@ static void mark_children(ObjHeader* h, std::vector<ObjHeader*>& stack) {
 
 void gc_collect() {
     g_gc_runs++;
-    // mark
-    std::vector<ObjHeader*> stack;
+    // mark. The worklist is reused between collections: it grows to the depth of
+    // the object graph once instead of reallocating on every cycle.
+    static std::vector<ObjHeader*> stack;
+    stack.clear();
     for (auto& v : g_globals) mark_value(&v, stack);
     for (auto& pin : g_pins)
         for (int64_t i = 0; i < pin.second; i++) mark_value(&pin.first[i], stack);

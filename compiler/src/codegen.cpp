@@ -1078,12 +1078,13 @@ struct FnGen {
             Ctx done = std::move(ctxs.back());
             ctxs.pop_back();
             extra_fns += "define internal i64 @" + done.fname +
-                         "(ptr %frame) {\nentry:\n  %argbuf = alloca ptr, i64 @@ARGBUF@@, "
-                         "align 8\n" +
+                         "(ptr %frame, ptr %captures) {\nentry:\n"
+                         "  %argbuf = alloca ptr, i64 @@ARGBUF@@, align 8\n" +
                          done.body + "}\n\n";
         }
         std::string code = r();
-        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame)");
+        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame, ptr " +
+                 (is_module ? "null" : "%captures") + ")");
         // __exit__ always
         std::vector<int> a2{ctx_slot};
         fill_argbuf(a2);
@@ -1196,13 +1197,14 @@ struct FnGen {
             Ctx done = std::move(ctxs.back());
             ctxs.pop_back();
             extra_fns += "define internal i64 @" + done.fname +
-                         "(ptr %frame) {\n" +
+                         "(ptr %frame, ptr %captures) {\n" +
                          "entry:\n  %argbuf = alloca ptr, i64 @@ARGBUF@@, align 8\n" +
                          done.body + "}\n\n";
         }
         // 2) protected call
         std::string code = r();
-        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame)");
+        emit(code + " = call i64 @kami_try(ptr @" + fname + ", ptr %frame, ptr " +
+                 (is_module ? "null" : "%captures") + ")");
         // 3) exception dispatch
         if (!s->handlers.empty()) {
             std::string isexc = r();
@@ -1619,7 +1621,7 @@ declare i32 @kami_iter_cond(ptr, ptr)
 declare void @kami_iter_get(ptr, ptr, ptr)
 declare void @kami_unpack(ptr, ptr, i64, i64)
 declare void @kami_unpack_star(ptr, ptr, i64, i64, i64)
-declare i64 @kami_try(ptr, ptr)
+declare i64 @kami_try(ptr, ptr, ptr)
 declare void @kami_last_error(ptr)
 declare void @kami_raise(ptr)
 declare void @kami_panic(ptr)

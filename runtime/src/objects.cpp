@@ -218,15 +218,15 @@ void kami_slice(KamiValue* out, const KamiValue* obj, const KamiValue* start,
 
 // ---- exceptions ----
 
-int64_t kami_try(void* body_fn, KamiValue* frame) {
-    using BodyFn = int64_t (*)(KamiValue*);
+int64_t kami_try(void* body_fn, KamiValue* frame, KamiValue* captures) {
+    using BodyFn = int64_t (*)(KamiValue*, KamiValue*);
     size_t depth;
     {
         Lock lk(g_lock);
         depth = tls_frames()->frames.size();
     }
     try {
-        return ((BodyFn)body_fn)(frame);
+        return ((BodyFn)body_fn)(frame, captures);
     } catch (KamiError& e) {
         Lock lk(g_lock);
         // Unwinding skipped kami_frame_pop calls of frames inside the body:

@@ -61,3 +61,23 @@ print(list(map(sq, [1, 2, 3])))
 # filter + lambda capturing
 threshold = 3
 print(list(filter(lambda x: x > threshold, [1, 2, 3, 4, 5])))
+
+# try/except inside a closure that reads a captured variable (regression: the
+# outlined try body did not receive the capture pointer and failed to compile)
+def make_safe(fallback):
+    def wrapper(fn, *args):
+        try:
+            return fn(*args)
+        except Exception:
+            return fallback
+    return wrapper
+
+
+def risky(x):
+    if x == 0:
+        raise ValueError("zero")
+    return 100 // x
+
+
+safe = make_safe("failed")
+print(safe(risky, 4), safe(risky, 0))

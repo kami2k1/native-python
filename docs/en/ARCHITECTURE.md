@@ -530,3 +530,152 @@ Consequences worth knowing:
 - **HTTPS is not supported** by `requests`. The old client inherited TLS from
   `curl`; a Python client needs a TLS library binding, which does not exist yet,
   so `https://` raises a clear error instead of silently downgrading.
+
+---
+
+## 17. v0.7.0: the variadic calling convention, FFI, threads, cross-targets
+
+### 17.1 Python's calling convention, compiled
+
+`*args`, `**kwargs` and keyword-only parameters are lowered rather than rejected.
+The one design decision worth stating: **the keyword dict travels in its own
+channel**, not as a trailing argument.
+
+```
+typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv, int64_t nargs,
+                       KamiValue* captures, KamiValue* kwargs);
+```
+
+The reason is that with `*args` in play a trailing dict is indistinguishable from
+one more positional argument: for `def f(*a, **k)`, a call `f(x, y)` cannot be
+told apart from `f(x)` plus a keyword dict. A side channel also keeps arity
+checks about positional arguments only.
+
+| Feature | Where it happens |
+|---|---|
+| `def f(a, *rest)` | prologue calls `kami_pack_args(slot, argv, nargs, nfixed)` |
+| `def f(**opts)` | prologue copies `%kwargs`, or makes an empty dict when it is null |
+| `def f(*, mode="x")` | prologue calls `kami_kwarg_take(slot, %kwargs, "mode")`, else the default |
+| `f(1, k=2)` (known callee) | sema fills parameters positionally; leftovers become a dict literal |
+| `f(*seq)` / `f(**map)` | `kami_call_spread` / `kami_method_spread` build argv at run time |
+| `a, *mid, b = seq` | `kami_unpack_star` slices the middle out |
+
+A runtime mapping still has to reach *named* parameters — `f(**{"b": 10})` — so
+every compiled function carries a table of its positional parameter names, and
+`kami_call_value_kw` binds by name before handing the leftovers to `**kwargs`.
+This is what makes the decorator idiom work end to end:
+
+```python
+def deco(fn):
+    def inner(*a, **k):
+        return fn(*a, **k) * 2      # forwards any argument shape
+    return inner
+
+@deco
+def scaled(a, b=3): return a * b
+
+scaled(5, b=10)                     # 100
+```
+
+<callout>
+Before this change the same program compiled and silently returned 30: keyword
+arguments to a decorated function were dropped on the floor.
+</callout>
+
+### 17.2 ctypes as a compile-time construct
+
+`ctypes.CDLL` does not create a runtime object. The handle exists only in the
+compiler, `argtypes`/`restype` are declarations, and the call becomes a direct
+call:
+
+```python
+lib = ctypes.CDLL("libm.so.6")
+lib.sqrt.argtypes = [ctypes.c_double]
+lib.sqrt.restype = ctypes.c_double
+lib.sqrt(144.0)
+```
+
+```llvm
+%1 = call double @kami_to_f64(ptr %slot)   ; marshal
+%2 = call double @sqrt(double %1)          ; the actual C call
+call void @kami_make_float(ptr %ret, double %2)
+```
+
+`declare double @sqrt(double)` is emitted alongside, and the library named in
+`CDLL(...)` is translated into linker flags (`libm.so.6` → `-lm`,
+`./build/libfoo.so` → `-L./build -lfoo`). That is the whole trick, and also the
+limitation: this is *compilation*, not `dlopen`. A library must exist at link
+time, and a path computed at run time cannot work. Extra `.c`, `.cpp`, `.o`,
+`.a`, `.lib` inputs (and `-l`/`-L` flags) can be passed to `kamipy build`
+directly, so a C file next to the program ends up in the same executable.
+
+### 17.3 Threads
+
+`stdlib/threading.py` is Python: `Thread(target=, args=, kwargs=)` with
+`start/join/is_alive`, and `Lock`/`RLock` with `acquire/release/__enter__`.
+The native part is four primitives — spawn, join, alive, and a mutex table —
+each a thin wrapper over `std::thread` / `std::recursive_mutex`.
+
+`Thread.start()` spawns a *closure*, which is how arbitrary argument shapes reach
+a primitive that takes a single value:
+
+```python
+def _runner(target, args, kwargs):
+    def go():
+        target(*args, **kwargs)
+    return go
+```
+
+### 17.4 Cross-compilation
+
+`--target <triple>` records the triple in the module and asks clang for that
+backend (with `lld`); `--sysroot` points at the target's headers and libraries.
+The honest caveat, which the error message now states: **the runtime must also be
+built for the target**. `libkamirt.a` is C++, so cross-compiling a program means
+cross-building the runtime and pointing `KAMIPY_RT_LIB` at it. Without that,
+`--target` only reaches as far as the link step.
+
+### 17.5 Assessed and deliberately deferred
+
+Two items from the roadmap were measured rather than half-implemented.
+
+**Explicit `invoke`/`landingpad` (phase 6.1).** Exceptions already unwind through
+the platform unwinder today: `kami_raise` throws a C++ `KamiError`, `kami_try`
+catches it, and the compiler outlines each `try` body into its own function.
+Switching codegen to `invoke` + `landingpad` would remove that outlining and one
+indirect call per `try`, but it would *not* add a capability, and it would move
+the GC's frame-registry repair (`kami_try` truncates the root registry that the
+skipped `kami_frame_pop` calls left behind) into generated code, where every
+landing pad would have to redo it correctly. The measurable cost today is one
+call per `try` entry, so the change is a refactor with real risk and no user
+visible win. What *was* fixed instead is a genuine bug the outlining had: an
+outlined body never received the enclosing closure's `captures` pointer, so a
+`try` inside a closure that read a captured variable failed to compile at all.
+
+**Escape analysis / stack allocation (phase 6.2).** The GC scans registered frame
+slots, and `gc_collect` sweeps a single global object list. A stack-allocated
+object would therefore have to be excluded from that list while still being
+traced as a root — workable, but it interacts with every path that can store a
+pointer into a longer-lived object (`list.append`, `attr_set`, `map_set`,
+returning it), so it needs a real escape analysis, not a heuristic. Measurement
+first: with a 20 000-object live set and a high allocation rate, mark & sweep
+costs ~24 ms against CPython's ~13 ms for the same program — a 2× gap, dominated
+by *marking the live set* on every cycle. Generational collection (only trace
+newly allocated objects most of the time) attacks that number directly and is
+independent of the compiler; escape analysis attacks a smaller part of it and
+needs compiler support. The recommended order is therefore: generational GC
+first, escape analysis after, and the mark worklist is already reused between
+collections as a first step.
+
+**GIL-free concurrency (phase 7.2).** Today every runtime call takes one
+recursive mutex, skipped entirely while the program is single-threaded, and
+released around blocking operations. Removing it means: per-thread allocation
+arenas, GC safepoints with stop-the-world coordination (a thread cannot be
+collected while it holds raw pointers between two runtime calls), atomic or
+sharded mutation of shared lists/dicts, and a memory model for user-visible data
+races. Each of those is individually larger than anything in this document, and a
+partial version does not fail loudly — it corrupts memory occasionally under
+load. The compiled model does make it *reachable* (there is no interpreter loop
+to serialize), and the honest sequencing is: safepoints → per-thread allocation →
+lock-free root registration → drop the global lock, with ThreadSanitizer in CI at
+each step.

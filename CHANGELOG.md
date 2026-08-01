@@ -4,6 +4,96 @@ Tất cả thay đổi đáng chú ý của project được ghi tại đây. / 
 
 ---
 
+## [v0.7.0] — 2026-08-01 — Calling convention variadic, ctypes FFI, threading, cross-compile
+
+Tiếp tục nguyên tắc "chỉ dịch": những gì Python có, compiler **dịch** ra LLVM IR.
+
+### Added — `*args` / `**kwargs` / tham số keyword-only (giai đoạn 4.2)
+- `def f(a, *rest, **opts)`, `def f(*, mode="x")`, `f(*seq)`, `f(**mapping)`,
+  `obj.m(*seq, **map)`, và target `a, *mid, b = seq`.
+- **Dict keyword đi bằng kênh riêng**: `KamiFn` thêm tham số `kwargs`. Với `*args`
+  thì một dict ở cuối không phân biệt được với một tham số vị trí nữa, nên kênh
+  riêng là cách duy nhất đúng; đồng thời arity check chỉ còn nói về tham số vị trí.
+- Mỗi hàm mang **bảng tên tham số vị trí**, nên `f(**{"b": 10})` bind được theo tên
+  lúc chạy (`kami_call_value_kw` / `kami_method_kw`) rồi mới đưa phần dư cho
+  `**kwargs`. Nhờ đó idiom decorator `def inner(*a, **k): fn(*a, **k)` hoạt động
+  trọn vẹn.
+- **Sửa bug âm thầm**: keyword truyền cho hàm có decorator trước đây **bị bỏ mất**
+  (`@deco def f(a, b=3)` rồi `f(5, b=10)` trả 30 thay vì 100).
+- `kami_pack_args`, `kami_kwarg_take`, `kami_call_spread`, `kami_method_spread`,
+  `kami_unpack_star`; `KAMI_MAX_ARGS` thay cho `argv[17]` cứng.
+- `stdlib/logging.py` bỏ workaround `_UNSET` 4 tham số, dùng `*args` thật.
+
+### Added — kế thừa `__init__`
+Lớp con không định nghĩa `__init__` giờ dùng cái gần nhất nó kế thừa (trước đây báo
+"takes no arguments").
+
+### Added — ctypes biên dịch thành lời gọi C trực tiếp (giai đoạn 5.1)
+- `ctypes.CDLL(...)` **không tạo object lúc chạy**: handle chỉ tồn tại trong sema,
+  `argtypes`/`restype` là khai báo, `lib.f(x)` sinh thẳng
+  `call <ret> @f(...)` trong LLVM IR, kèm marshalling
+  `kami_to_i64/f64/cstr/ptr` + `kami_from_cstr`.
+- Kiểu C: `c_int/c_uint/c_long/c_longlong/c_size_t/c_short/c_char/c_byte/c_bool/
+  c_float/c_double/c_char_p/c_void_p` và `restype = None`.
+- Thư viện nêu trong `CDLL()` thành cờ linker (`libm.so.6` → `-lm`,
+  `./build/libfoo.so` → `-L./build -lfoo`) vì lời gọi trực tiếp phải resolve lúc
+  link. Đây là **biên dịch, không phải `dlopen`** — giới hạn được ghi rõ.
+
+### Added — driver nhận nguồn C/C++ (giai đoạn 5.2)
+`kamipy build main.py extra.c lib.a -lfoo -L./build` — cùng một lời gọi clang biên
+dịch và link chúng với IR của Python (file `.c` được biên dịch **as C** để symbol
+không bị mangle). `run_tests.sh` hỗ trợ file `<base>.args` để test đường này.
+
+### Added — cross-compilation (giai đoạn 8)
+`--target <triple>` (ghi `target triple` vào module, dùng `lld`) và `--sysroot`.
+Khi link thất bại, thông báo nói rõ còn cần **runtime build cho target đó**
+(`KAMIPY_RT_LIB`).
+
+### Added — `stdlib/threading.py` (giai đoạn 7.1)
+`Thread(target=, args=, kwargs=, name=, daemon=)` với `start/join/is_alive/run`;
+`Lock`/`RLock` với `acquire(blocking=)/release/locked/__enter__/__exit__`;
+`current_thread`; `spawn/join` cũ giữ làm extension. Native chỉ còn 4 primitive
+(`thread_spawn/thread_join/thread_alive` + bảng mutex) — `Lock.acquire` nhả GIL
+khi block. Byte-identical CPython.
+
+### Added — `stdlib/sys.py`
+`argv`, `platform`, `maxsize`, `byteorder`, `version`, `exit()`, và `stdout`/
+`stderr` dạng stream. `_kami.fd_write` cho fd 1/2 đi qua stdio nên `print()`,
+`sys.stdout.write()` và `logging` **cùng một buffer, đúng thứ tự**.
+
+### Fixed
+- **`try/except` bên trong closure có đọc biến captured không biên dịch được**
+  (thân try đã outline không nhận `%captures`). `kami_try` giờ nhận thêm con trỏ
+  captures. Test hồi quy trong `feat_closures.py`.
+- Method value gọi động sẽ dispatch sai sang builtin 0 (`print`) vì
+  `kami_class_add_method` để `builtin_id = 0`.
+- `kami_iter_prep` tự pin slot đích khi vật chất hoá (nó cấp phát một object mỗi
+  phần tử) — sửa gốc cho cả một lớp lỗi rooting ở phía người gọi.
+- Worklist khi mark của GC được tái dùng giữa các chu kỳ.
+- Bỏ cờ link `-lssl/-lcrypto/-lwinhttp` còn sót từ HTTP client C++ đã xoá.
+
+### Assessed — hoãn có chủ ý (đo, không làm nửa vời)
+- **`invoke`/`landingpad` tường minh (6.1)**: exception hiện *đã* unwind qua
+  platform unwinder (`kami_raise` throw C++, `kami_try` catch). Chuyển sang
+  landingpad bỏ được một lời gọi mỗi `try` nhưng **không thêm năng lực**, lại đẩy
+  việc sửa registry root của GC vào mã sinh ra. Đã sửa bug thật của cơ chế hiện tại
+  thay vì viết lại nó.
+- **Escape analysis (6.2)**: đo trước — live set 20.000 object, mark & sweep ~24 ms
+  vs CPython ~13 ms; phần chi phối là **mark lại live set mỗi chu kỳ** → **GC theo
+  thế hệ** đánh trực diện hơn và không cần compiler. Thứ tự đề nghị: thế hệ trước,
+  escape analysis sau.
+- **GIL-free (7.2)**: cần safepoint + arena theo thread + mutation nguyên tử; bản
+  nửa vời không lỗi to tiếng mà *thỉnh thoảng* hỏng bộ nhớ. Trình tự trung thực ghi
+  trong `docs/*/ARCHITECTURE.md` §17.5.
+
+### Tests
+4 chương trình mới, output **so khớp CPython từng byte** (trừ `feat_ctypes` vì
+CPython cần `b"..."` cho `char*`): `feat_varargs.py`, `feat_threading_py.py`,
+`feat_sys_py.py`, `feat_ctypes.py` (+ `feat_ctypes.c` được link vào cùng binary).
+Tổng: 54 integration + 54 dưới GC stress + 2 unit; ASan/UBSan clean.
+
+---
+
 ## [v0.6.0] — 2026-08-01 — "Chỉ dịch, không tự viết": stdlib bằng Python + C-ABI syscalls
 
 Refactor kiến trúc lớn. Nguyên tắc: **compiler dịch mã Python ra native, không viết lại

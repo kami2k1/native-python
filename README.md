@@ -50,6 +50,7 @@ ctest --test-dir build --output-on-failure
 
 ```
 kamipy build <file.py> [-o out] [-O0|-O1|-O2] [--emit-llvm] [--emit-ast]
+             [--target <triple>] [--sysroot <dir>] [extra.c] [-l<name>]
 kamipy run   <file.py>      # build vào .kamipy-cache rồi chạy
 kamipy clean                # xóa .kamipy-cache
 ```
@@ -60,27 +61,29 @@ kamipy clean                # xóa .kamipy-cache
 |---|---|
 | Types | `int` (64-bit), `float`, `str`, `bool`, `None`, `list`, `dict`, tuples (≈list), function values, **classes/objects** |
 | Exceptions | **`try/except/else/finally`, `raise`, `assert`** — mọi runtime error bắt được |
-| Classes | `class C(Base):`, `__init__`, methods, `self.x`, class attrs, single inheritance, `isinstance` |
+| Classes | `class C(Base):`, `__init__` (**inherited when a subclass has none**), methods, `self.x`, class attrs, single inheritance, `isinstance`, `*args/**kwargs` in methods |
 | Strings | **f-strings** (`{x:.2f}`, `{x = }`), triple-quoted docstrings, raw strings, slicing `s[::-1]`, 20+ methods |
 | Operators | số học + so sánh chuỗi hoá (`0 <= i < n`) + logic + **bitwise `& \| ^ ~ << >>`** + `**` + augmented |
 | Control flow | `if/elif/else`, `while`, `for` (đa target unpack), `break/continue`, ternary, inline body |
-| Functions | `def` với **kwargs + default params**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global` |
-| Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
+| Functions | `def` với **kwargs + default params**, **`*args` / `**kwargs` / tham số keyword-only**, recursion, **lambda, nested functions/closures, decorators**, functions as values, `global`; call-site spreading `f(*seq, **map)` |
+| Sugar | **list/dict/set + nested comprehensions**, genexp, lambda, decorators, tuple/starred unpacking (`(a,b)=`, `[*a,b]`, **`a, *mid, b = seq`**), `x = y = 0`, slices, PEP 695 `[T]` syntax, annotations (ignored) |
 | Builtins | `print(sep=,end=) len str int float bool abs min max sum sorted reversed enumerate zip round ord chr type range all any bin hex oct list dict tuple isinstance format divmod input pow exit` |
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client, Python class over an fd), **`requests`** (HTTP/1.1 spoken in Python over sockets — no curl; http only), **`json`** (loads/dumps/indent/sort_keys) |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
-| Modules (native) | `math time random threading sys doctest` + `_kami` (C-ABI syscall layer); no-op `typing`/`__future__`/`abc`/`dataclasses` |
-| Modules (Python source, `stdlib/`) | `re` (backtracking engine: match/search/fullmatch/findall/finditer/sub/split/escape/compile, groups, backrefs, `I/M/S` flags), `json`, `logging`, `os`, `os.path`, `socket`, `requests`, `string`, `itertools`, `functools` — all translated to native code on import |
+| Modules (native) | `math time random doctest` (the modules CPython also implements in C) + `_kami` (C-ABI syscall layer); no-op `typing`/`__future__`/`abc`/`dataclasses` |
+| Modules (Python source, `stdlib/`) | `re` (backtracking engine: match/search/fullmatch/findall/finditer/sub/split/escape/compile, groups, backrefs, `I/M/S` flags), `json`, `logging`, `os`, `os.path`, `sys`, `socket`, `requests`, `string`, `threading`, `itertools`, `functools` — all translated to native code on import |
 | Imports | **`import mymodule` translates `mymodule.py`** (input dir first, then `stdlib/`, recursive dependency-first, `pkg.mod` → `pkg/mod.py`); each module gets a **real namespace** (`re.match` → global `re__match`) so user names never collide; `from m import x as y`, relative `from .mod import x`; `__main__` guard of an imported module is dropped; `try: import cv2 / except ImportError:` works; errors report the module's own file/line |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
-| Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
+| Threading | **`threading.Thread(target=, args=)` + `Lock`/`RLock`** (Python classes over `std::thread`/mutex primitives); real OS threads with a GIL-style lock (elided when single-threaded); sleep/join/accept/recv/`Lock.acquire` release it |
+| C interop | **`ctypes.CDLL` compiled to direct `call @c_func`** (argtypes/restype drive the marshalling); extra `.c/.cpp/.o/.a/.lib` inputs and `-l/-L` flags are linked into the same executable |
+| Cross-compile | **`--target <triple>`** + `--sysroot` (needs a runtime built for the target: `KAMIPY_RT_LIB`) |
 | Memory | Mark & sweep GC (exception-unwind + file safe); ASan/LSan/TSan clean; `KAMIPY_GC_STRESS=1` collects before every allocation (the whole suite runs this way in CI) |
 
 **Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1059 build (49%), 784 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
 **Native networking demo:** một HTTP server viết bằng KamiPython phục vụ chính client `requests` của KamiPython, parse JSON — tất cả là native binary, và cả hai đầu đều là mã Python đã dịch (`tests/integration/feat_http_py.py`).
 
-Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, `*args/**kwargs`, walrus `:=`, `@staticmethod/@property`, relative imports, `nonlocal`, HTTPS/TLS trong `requests`, `numpy` và third-party modules khác.
+Not yet / Chưa hỗ trợ (lỗi thông báo rõ): generators/`yield`, walrus `:=`, `@staticmethod/@property`, `nonlocal`, HTTPS/TLS trong `requests`, `dlopen` động cho `ctypes` (thư viện phải có lúc link), GIL-free multithreading, `numpy` và third-party modules khác.
 
 ## How it works / Cách hoạt động
 
@@ -131,6 +134,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
 | Python stdlib (`stdlib/*.py`) | ✅ `re json logging os os.path socket requests string` — output checked byte-for-byte against CPython |
-| Tests | ✅ 2 unit suites + 50 integration programs + a full GC-stress pass (threading, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, HTTP client+server, module namespaces, regex engine, comprehensions, dict-order, unpacking) |
+| Tests | ✅ 2 unit suites + 54 integration programs + a full GC-stress pass (threading, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, HTTP client+server, module namespaces, regex engine, comprehensions, dict-order, unpacking) |
 | CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
 | Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |

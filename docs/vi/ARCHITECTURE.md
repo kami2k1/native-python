@@ -524,3 +524,147 @@ Những hệ quả cần biết:
 - **`requests` chưa hỗ trợ HTTPS.** Client cũ thừa hưởng TLS từ `curl`; client Python cần
   binding tới một thư viện TLS, hiện chưa có, nên `https://` báo lỗi rõ ràng thay vì
   âm thầm hạ cấp.
+
+---
+
+## 17. v0.7.0: calling convention variadic, FFI, thread, cross-target
+
+### 17.1 Calling convention của Python, đã biên dịch
+
+`*args`, `**kwargs` và tham số keyword-only được **dịch**, không còn bị parser từ
+chối. Quyết định thiết kế đáng nói: **dict keyword đi bằng một kênh riêng**, không
+phải làm tham số cuối.
+
+```
+typedef void (*KamiFn)(KamiValue* ret, KamiValue** argv, int64_t nargs,
+                       KamiValue* captures, KamiValue* kwargs);
+```
+
+Lý do: khi có `*args`, một dict ở cuối không thể phân biệt với một tham số vị trí
+nữa — với `def f(*a, **k)` thì `f(x, y)` và `f(x)` + dict là cùng một hình dạng.
+Kênh riêng cũng giữ cho việc kiểm tra arity chỉ liên quan tới tham số vị trí.
+
+| Tính năng | Nơi thực hiện |
+|---|---|
+| `def f(a, *rest)` | prologue gọi `kami_pack_args(slot, argv, nargs, nfixed)` |
+| `def f(**opts)` | prologue copy `%kwargs`, hoặc tạo dict rỗng khi null |
+| `def f(*, mode="x")` | prologue gọi `kami_kwarg_take(slot, %kwargs, "mode")`, không có thì dùng default |
+| `f(1, k=2)` (biết callee) | sema điền tham số theo vị trí; phần dư thành dict literal |
+| `f(*seq)` / `f(**map)` | `kami_call_spread` / `kami_method_spread` dựng argv lúc chạy |
+| `a, *mid, b = seq` | `kami_unpack_star` cắt phần giữa ra |
+
+Một mapping lúc chạy vẫn phải tới được tham số **có tên** — `f(**{"b": 10})` — nên
+mỗi hàm đã biên dịch mang theo bảng tên tham số vị trí của nó, và
+`kami_call_value_kw` bind theo tên trước khi đưa phần còn lại cho `**kwargs`.
+Nhờ vậy idiom decorator hoạt động trọn vẹn:
+
+```python
+def deco(fn):
+    def inner(*a, **k):
+        return fn(*a, **k) * 2      # chuyển tiếp mọi hình dạng tham số
+    return inner
+
+@deco
+def scaled(a, b=3): return a * b
+
+scaled(5, b=10)                     # 100
+```
+
+<callout>
+Trước thay đổi này, đúng chương trình trên vẫn biên dịch và **âm thầm** trả 30:
+keyword truyền cho một hàm có decorator bị bỏ mất.
+</callout>
+
+### 17.2 ctypes là cấu trúc của compile-time
+
+`ctypes.CDLL` không tạo object lúc chạy. Handle chỉ tồn tại trong compiler,
+`argtypes`/`restype` là khai báo, và lời gọi trở thành lời gọi C trực tiếp:
+
+```python
+lib = ctypes.CDLL("libm.so.6")
+lib.sqrt.argtypes = [ctypes.c_double]
+lib.sqrt.restype = ctypes.c_double
+lib.sqrt(144.0)
+```
+
+```llvm
+%1 = call double @kami_to_f64(ptr %slot)   ; marshal
+%2 = call double @sqrt(double %1)          ; lời gọi C thật
+call void @kami_make_float(ptr %ret, double %2)
+```
+
+`declare double @sqrt(double)` được phát kèm, và thư viện nêu trong `CDLL(...)`
+được dịch thành cờ linker (`libm.so.6` → `-lm`, `./build/libfoo.so` →
+`-L./build -lfoo`). Đó là toàn bộ mẹo, và cũng là giới hạn: đây là **biên dịch**,
+không phải `dlopen`. Thư viện phải tồn tại lúc link, và một đường dẫn tính lúc
+chạy thì không dùng được. Có thể truyền thêm `.c`, `.cpp`, `.o`, `.a`, `.lib`
+(và cờ `-l`/`-L`) trực tiếp cho `kamipy build`, nên một file C cạnh chương trình
+nằm luôn trong cùng một executable.
+
+### 17.3 Thread
+
+`stdlib/threading.py` là Python: `Thread(target=, args=, kwargs=)` với
+`start/join/is_alive`, `Lock`/`RLock` với `acquire/release/__enter__`. Phần native
+chỉ còn bốn primitive — spawn, join, alive và một bảng mutex — mỗi cái là wrapper
+mỏng của `std::thread` / `std::recursive_mutex`.
+
+`Thread.start()` spawn một **closure**, đó là cách mọi hình dạng tham số tới được
+một primitive chỉ nhận một giá trị:
+
+```python
+def _runner(target, args, kwargs):
+    def go():
+        target(*args, **kwargs)
+    return go
+```
+
+### 17.4 Cross-compilation
+
+`--target <triple>` ghi triple vào module và yêu cầu clang dùng backend đó (kèm
+`lld`); `--sysroot` trỏ tới header/thư viện của platform đích. Điều cần nói thẳng,
+và thông báo lỗi giờ cũng nói: **runtime cũng phải được build cho target đó**.
+`libkamirt.a` là C++, nên cross-compile một chương trình nghĩa là phải cross-build
+runtime rồi trỏ `KAMIPY_RT_LIB` vào nó. Không có bước đó, `--target` chỉ đi được
+tới bước link.
+
+### 17.5 Đã đánh giá và chủ động hoãn
+
+Hai mục trong roadmap được **đo** thay vì làm nửa vời.
+
+**`invoke`/`landingpad` tường minh (giai đoạn 6.1).** Exception hiện *đã* unwind
+qua platform unwinder: `kami_raise` throw một `KamiError` C++, `kami_try` bắt nó,
+và compiler outline mỗi thân `try` thành một hàm riêng. Chuyển codegen sang
+`invoke` + `landingpad` sẽ bỏ được phần outline và một lời gọi gián tiếp mỗi
+`try`, nhưng **không thêm năng lực mới**, và sẽ đẩy việc sửa lại registry root của
+GC (`kami_try` cắt bớt registry mà các `kami_frame_pop` bị bỏ qua để lại) vào mã
+sinh ra, nơi mọi landing pad đều phải làm đúng việc đó. Chi phí đo được hiện nay
+là một lời gọi mỗi lần vào `try`, nên đây là một refactor có rủi ro thật mà người
+dùng không thấy lợi ích. Thay vào đó đã **sửa một bug thật** của cơ chế outline:
+thân đã outline không bao giờ nhận con trỏ `captures` của closure bao ngoài, nên
+`try` bên trong một closure có đọc biến captured thì **không biên dịch được**.
+
+**Escape analysis / cấp phát trên stack (giai đoạn 6.2).** GC quét các frame slot
+đã đăng ký, và `gc_collect` sweep một danh sách object toàn cục duy nhất. Một
+object cấp phát trên stack vì thế phải bị loại khỏi danh sách đó nhưng vẫn được
+trace như một root — khả thi, nhưng nó tương tác với mọi đường có thể lưu con trỏ
+vào một object sống lâu hơn (`list.append`, `attr_set`, `map_set`, hay trả về nó),
+nên cần một escape analysis thực sự, không phải heuristic. Đo trước: với live set
+20.000 object và tốc độ cấp phát cao, mark & sweep tốn ~24 ms so với ~13 ms của
+CPython cho cùng chương trình — khoảng cách 2×, và phần chi phối là **mark lại
+toàn bộ live set** ở mỗi chu kỳ. GC theo thế hệ (phần lớn thời gian chỉ trace
+object mới) đánh trực diện vào con số đó và không cần compiler; escape analysis
+đánh vào một phần nhỏ hơn và lại cần compiler. Thứ tự đề nghị: GC thế hệ trước,
+escape analysis sau; worklist khi mark đã được tái dùng giữa các chu kỳ như bước
+đầu tiên.
+
+**Concurrency không GIL (giai đoạn 7.2).** Hiện mọi runtime call giữ một recursive
+mutex, được bỏ qua hoàn toàn khi chương trình còn đơn luồng, và được nhả quanh các
+thao tác blocking. Bỏ nó đi đòi hỏi: arena cấp phát riêng cho từng thread,
+safepoint của GC kèm phối hợp stop-the-world (không thể collect một thread đang
+giữ con trỏ thô giữa hai runtime call), mutation nguyên tử hoặc phân mảnh cho
+list/dict dùng chung, và một memory model cho data race ở mức người dùng. Mỗi mục
+đó tự thân đã lớn hơn mọi thứ trong tài liệu này, và một bản làm nửa vời **không
+lỗi to tiếng** — nó thỉnh thoảng làm hỏng bộ nhớ khi tải cao. Mô hình biên dịch
+khiến việc này **khả thi** (không có interpreter loop để tuần tự hoá), và trình tự
+trung thực là: safepoint → cấp phát theo thread → đăng ký root lock-free → bỏ
+global lock, với ThreadSanitizer trong CI ở từng bước.

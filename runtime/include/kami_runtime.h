@@ -141,10 +141,11 @@ void kami_attr_get(KamiValue* out, const KamiValue* obj, const char* name);
 void kami_attr_set(KamiValue* obj, const char* name, const KamiValue* val);
 
 // --- exceptions ---
-// Runs an outlined try-body (signature: int64_t body(KamiValue* frame)).
+// Runs an outlined try-body (signature:
+// int64_t body(KamiValue* frame, KamiValue* captures)).
 // Returns the body's code (0 normal, 1 return, 2 break, 3 continue) or -1 if
 // a runtime error was caught; the message is then available via kami_last_error.
-int64_t kami_try(void* body_fn, KamiValue* frame);
+int64_t kami_try(void* body_fn, KamiValue* frame, KamiValue* captures);
 void kami_last_error(KamiValue* out);
 void kami_raise(const KamiValue* msg);
 void kami_rethrow(void);
