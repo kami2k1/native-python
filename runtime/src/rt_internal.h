@@ -167,6 +167,7 @@ bool value_eq(const KamiValue* a, const KamiValue* b);
 KamiValue* class_lookup(KamiClassObj* c, const std::string& name); // lock held
 
 std::string format_float(double d);
+std::string format_value(KamiValue* v, const std::string& spec); // format() spec
 std::string value_str(const KamiValue* v);   // human string (print)
 std::string value_repr(const KamiValue* v);  // repr (inside containers)
 const char* type_name(int64_t tag);

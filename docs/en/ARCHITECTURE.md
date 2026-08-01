@@ -517,7 +517,10 @@ Consequences worth knowing:
   `str_new()`, so a collection triggered by that very allocation would follow the
   slot's stale payload as a pointer. All such sites now allocate first and
   publish afterwards (`put_str`), and `KAMIPY_GC_STRESS=1` (collect before every
-  allocation) is a CI test.
+  allocation) re-runs the whole integration suite in CI. The same switch found two
+  more rooting bugs: `set("string")` handed an unrooted slot to `kami_iter_prep`
+  (which allocates one object per character), and `as_list_pinned()` registered
+  its pin *after* materializing the list.
 - **Regex is slower.** `re.findall(r"\d+", ...)` over 400 KB of text takes ~0.9 s
   versus ~0.06 s for the deleted C++ engine — the honest price of running the
   same algorithm the same way CPython does. Native compilation still puts it in

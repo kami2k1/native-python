@@ -512,7 +512,10 @@ Những hệ quả cần biết:
   rooting trong runtime: `out->tag = KT_STR` được ghi *trước* `str_new()`, nên một lần
   collect do chính lần cấp phát đó kích hoạt sẽ đi theo payload cũ của slot như một con
   trỏ. Mọi vị trí như vậy giờ cấp phát trước rồi mới publish (`put_str`), và
-  `KAMIPY_GC_STRESS=1` (collect trước mỗi lần cấp phát) trở thành một test trong CI.
+  `KAMIPY_GC_STRESS=1` (collect trước mỗi lần cấp phát) chạy lại toàn bộ suite integration
+  trong CI. Cũng nhờ công tắc đó mà tìm ra hai bug rooting nữa: `set("chuỗi")` truyền một
+  slot chưa root hoá cho `kami_iter_prep` (hàm này cấp phát một object mỗi ký tự), và
+  `as_list_pinned()` đăng ký pin *sau* khi vật chất hoá list.
 - **Regex chậm hơn.** `re.findall(r"\d+", ...)` trên 400 KB text mất ~0,9 s so với
   ~0,06 s của engine C++ đã xoá — giá phải trả trung thực khi chạy cùng một thuật toán
   theo cùng cách CPython làm. Bản native vẫn ngang tầm engine C của CPython với input

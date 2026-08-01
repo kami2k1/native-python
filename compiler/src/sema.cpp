@@ -27,10 +27,10 @@ static const std::unordered_map<std::string, BuiltinSig>& builtins() {
         {"ord", {KB_ORD, 1, 1}},      {"chr", {KB_CHR, 1, 1}},
         {"type", {KB_TYPE, 1, 1}},    {"range", {KB_RANGE, 1, 3}},
         {"sum", {KB_SUM, 1, 2}},      {"sorted", {KB_SORTED, 1, 1}},
-        {"reversed", {KB_REVERSED, 1, 1}}, {"enumerate", {KB_ENUMERATE, 1, 1}},
+        {"reversed", {KB_REVERSED, 1, 1}}, {"enumerate", {KB_ENUMERATE, 1, 2}},
         {"zip", {KB_ZIP, 2, 2}},      {"bool", {KB_BOOL, 1, 1}},
         {"round", {KB_ROUND, 1, 2}},  {"input", {KB_INPUT, 0, 1}},
-        {"pow", {KB_POW, 2, 2}},      {"all", {KB_ALL, 1, 1}},
+        {"pow", {KB_POW, 2, 3}},      {"all", {KB_ALL, 1, 1}},
         {"any", {KB_ANY, 1, 1}},      {"bin", {KB_BIN, 1, 1}},
         {"hex", {KB_HEX, 1, 1}},      {"oct", {KB_OCT, 1, 1}},
         {"list", {KB_LIST, 0, 1}},    {"dict", {KB_DICT, 0, 0}},
@@ -50,14 +50,30 @@ modules() {
             {"math",
              {{"sqrt", {KB_MATH_SQRT, 1, 1}}, {"sin", {KB_MATH_SIN, 1, 1}},
               {"cos", {KB_MATH_COS, 1, 1}},   {"tan", {KB_MATH_TAN, 1, 1}},
-              {"exp", {KB_MATH_EXP, 1, 1}},   {"log", {KB_MATH_LOG, 1, 1}},
+              {"exp", {KB_MATH_EXP, 1, 1}},   {"log", {KB_MATH_LOG, 1, 2}},
               {"pow", {KB_MATH_POW, 2, 2}},   {"floor", {KB_MATH_FLOOR, 1, 1}},
-              {"ceil", {KB_MATH_CEIL, 1, 1}}, {"fabs", {KB_MATH_FABS, 1, 1}}}},
-            {"time", {{"time", {KB_TIME_TIME, 0, 0}}, {"sleep", {KB_TIME_SLEEP, 1, 1}}}},
+              {"ceil", {KB_MATH_CEIL, 1, 1}}, {"fabs", {KB_MATH_FABS, 1, 1}},
+              {"factorial", {KB_MATH_FACTORIAL, 1, 1}}, {"gcd", {KB_MATH_GCD, 0, 16}},
+              {"isqrt", {KB_MATH_ISQRT, 1, 1}}, {"hypot", {KB_MATH_HYPOT, 2, 16}},
+              {"log2", {KB_MATH_LOG2, 1, 1}}, {"log10", {KB_MATH_LOG10, 1, 1}},
+              {"atan", {KB_MATH_ATAN, 1, 1}}, {"asin", {KB_MATH_ASIN, 1, 1}},
+              {"acos", {KB_MATH_ACOS, 1, 1}}, {"atan2", {KB_MATH_ATAN2, 2, 2}},
+              {"degrees", {KB_MATH_DEGREES, 1, 1}}, {"radians", {KB_MATH_RADIANS, 1, 1}},
+              {"trunc", {KB_MATH_TRUNC, 1, 1}}, {"isnan", {KB_MATH_ISNAN, 1, 1}},
+              {"isinf", {KB_MATH_ISINF, 1, 1}}}},
+            {"time", {{"time", {KB_TIME_TIME, 0, 0}}, {"sleep", {KB_TIME_SLEEP, 1, 1}},
+                      {"monotonic", {KB_TIME_MONOTONIC, 0, 0}},
+                      {"perf_counter", {KB_TIME_PERF_COUNTER, 0, 0}}}},
             {"random",
              {{"random", {KB_RANDOM_RANDOM, 0, 0}},
               {"randint", {KB_RANDOM_RANDINT, 2, 2}},
-              {"seed", {KB_RANDOM_SEED, 1, 1}}}},
+              {"seed", {KB_RANDOM_SEED, 0, 1}},
+              {"randrange", {KB_RANDOM_RANDRANGE, 1, 3}},
+              {"choice", {KB_RANDOM_CHOICE, 1, 1}},
+              {"shuffle", {KB_RANDOM_SHUFFLE, 1, 1}},
+              {"uniform", {KB_RANDOM_UNIFORM, 2, 2}},
+              {"sample", {KB_RANDOM_SAMPLE, 2, 2}},
+              {"choices", {KB_RANDOM_CHOICES, 1, 2}}}},
             {"threading",
              {{"spawn", {KB_THREAD_SPAWN, 1, 9}}, {"join", {KB_THREAD_JOIN, 1, 1}}}},
             {"sys", {{"exit", {KB_SYS_EXIT, 0, 1}}}},
@@ -121,6 +137,23 @@ static bool module_const(const std::string& mod, const std::string& attr, ModCon
         out = {0, std::numeric_limits<double>::infinity(), "", 0};
         return true;
     }
+    if (mod == "math" && attr == "tau") { out = {0, 6.28318530717958647692, "", 0}; return true; }
+    if (mod == "math" && attr == "nan") {
+        out = {0, std::numeric_limits<double>::quiet_NaN(), "", 0};
+        return true;
+    }
+    if (mod == "sys" && attr == "maxsize") { out = {2, 0, "", 9223372036854775807LL}; return true; }
+    if (mod == "sys" && attr == "platform") {
+#ifdef _WIN32
+        out = {1, 0, "win32", 0};
+#elif defined(__APPLE__)
+        out = {1, 0, "darwin", 0};
+#else
+        out = {1, 0, "linux", 0};
+#endif
+        return true;
+    }
+    if (mod == "sys" && (attr == "maxint")) { out = {2, 0, "", 9223372036854775807LL}; return true; }
     return false;
 }
 
@@ -267,6 +300,25 @@ struct Sema {
 
     void register_from_import(Stmt* s) {
         const std::string& modname = s->name;
+        // `from . import mod1, mod2` — each imported name is a sibling module.
+        if (s->relative && modname.empty()) {
+            for (auto& [n, alias] : s->import_names) {
+                if (mod.bundled.count(n)) user_imports[alias] = n;
+                else if (try_depth == 0 && !noop_module(n))
+                    err(s->line, "cannot find local module '" + n +
+                                     ".py' for 'from . import " + n + "'");
+            }
+            return;
+        }
+        if (s->star) {
+            // `from X import *`: bring every module-level name of the translated
+            // module into scope under its own spelling.
+            auto sit = mod.bundled.find(modname);
+            if (sit != mod.bundled.end())
+                for (const auto& n : sit->second.exports)
+                    user_renames[n] = sit->second.prefix + n;
+            return;
+        }
         if (noop_module(modname)) return; // names are annotation-only
         auto bit = mod.bundled.find(modname);
         if (bit != mod.bundled.end()) {
@@ -345,12 +397,16 @@ struct Sema {
             case StmtKind::For:
                 for (auto& n : s->params) global_slot(n);
                 collect_assigned(s->body, true);
+                collect_assigned(s->orelse, true);
                 break;
             case StmtKind::If:
                 collect_assigned(s->body, true);
                 collect_assigned(s->orelse, true);
                 break;
-            case StmtKind::While: collect_assigned(s->body, true); break;
+            case StmtKind::While:
+                collect_assigned(s->body, true);
+                collect_assigned(s->orelse, true);
+                break;
             case StmtKind::Try:
                 try_depth++;
                 collect_assigned(s->body, true);
@@ -387,12 +443,16 @@ struct Sema {
             case StmtKind::For:
                 for (auto& n : s->params) slot(n);
                 collect_assigned(s->body, as_globals);
+                collect_assigned(s->orelse, as_globals);
                 break;
             case StmtKind::If:
                 collect_assigned(s->body, as_globals);
                 collect_assigned(s->orelse, as_globals);
                 break;
-            case StmtKind::While: collect_assigned(s->body, as_globals); break;
+            case StmtKind::While:
+                collect_assigned(s->body, as_globals);
+                collect_assigned(s->orelse, as_globals);
+                break;
             case StmtKind::With:
                 if (!s->name.empty()) slot(s->name);
                 collect_assigned(s->body, as_globals);
@@ -497,6 +557,11 @@ struct Sema {
             e->sval = "__main__";
             return;
         }
+        if (n == "__file__") {
+            e->kind = ExprKind::StrLit;
+            e->sval = mod.source_path.empty() ? "<string>" : mod.source_path;
+            return;
+        }
         if (imports.count(n) || user_imports.count(n))
             err(e->line, "module '" + n + "' can only be used as '" + n + ".<name>'");
         auto fi2 = from_imports.find(n);
@@ -550,18 +615,46 @@ struct Sema {
                     pretty(def->name) + "() got an unexpected keyword argument '" + kw + "'");
         }
         e->kwargs.clear();
-        for (size_t i = 0; i < nparams; i++) {
+        // Trailing holes that have defaults are NOT passed: the callee's
+        // prologue evaluates the default expression in its own (definition)
+        // scope — this is what makes non-literal defaults like
+        // `thread_type=ThreadType.USER` work correctly.
+        size_t pass_n = nparams;
+        while (pass_n > 0 && !final_args[pass_n - 1] && pass_n - 1 + ndefaults >= nparams)
+            pass_n--;
+        for (size_t i = 0; i < pass_n; i++) {
             if (final_args[i]) continue;
             size_t di = i + ndefaults;
             if (di >= nparams) { // default exists (defaults align to the tail)
                 const Expr* d = def->defaults[di - nparams].get();
+                if (!is_literal_default(d))
+                    err(e->line, def->name + "(): parameter '" +
+                                     def->params[first_param + i] +
+                                     "' has a non-literal default and cannot be "
+                                     "skipped when later arguments are given — pass "
+                                     "it explicitly");
                 final_args[i] = clone_literal(d);
             } else {
                 err(e->line, pretty(def->name) + "() missing required argument '" +
                                  def->params[first_param + i] + "'");
             }
         }
+        final_args.resize(pass_n);
         e->args = std::move(final_args);
+    }
+
+    static bool is_literal_default(const Expr* e) {
+        switch (e->kind) {
+        case ExprKind::IntLit:
+        case ExprKind::FloatLit:
+        case ExprKind::StrLit:
+        case ExprKind::BoolLit:
+        case ExprKind::NoneLit: return true;
+        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal_default(e->a.get());
+        case ExprKind::ListLit: return e->args.empty();
+        case ExprKind::MapLit: return e->pairs.empty();
+        default: return false;
+        }
     }
 
     static void apply_const(Expr* e, const ModConst& cv) {
@@ -618,6 +711,17 @@ struct Sema {
             err(e->line, "module '" + modname + "' has no attribute '" + attr + "' (" +
                              info.path + ")");
         e->sval = info.prefix + attr;
+    }
+
+    // The only native module that takes keyword arguments is the no-op
+    // doctest.testmod(verbose=..., ...): accept and discard them.
+    bool rewrite_module_kwargs(Expr* e, const std::string& mod, const std::string& fn) {
+        if (mod == "doctest" && fn == "testmod") {
+            e->kwargs.clear();
+            e->args.clear();
+            return true;
+        }
+        return false;
     }
 
     void resolve_sorted_kwargs(Expr* e) {
@@ -865,7 +969,7 @@ struct Sema {
                 if ((int)e->args.size() < sig.min_args || (int)e->args.size() > sig.max_args)
                     err(e->line, modname + "." + e->sval + "() got " +
                                      std::to_string(e->args.size()) + " argument(s)");
-                if (!e->kwargs.empty())
+                if (!e->kwargs.empty() && !rewrite_module_kwargs(e, modname, e->sval))
                     err(e->line, modname + "." + e->sval +
                                      "() does not accept keyword arguments");
                 e->kind = ExprKind::Call;
@@ -1124,6 +1228,7 @@ struct Sema {
         case StmtKind::While:
             resolve_expr(s->e1.get());
             resolve_stmts(s->body);
+            resolve_stmts(s->orelse);
             return;
         case StmtKind::For: {
             resolve_expr(s->e1.get());
@@ -1137,6 +1242,7 @@ struct Sema {
             s->target_res = s->multi_tkind[0] == 1 ? Res::Local : Res::Global;
             s->target_idx = s->multi_tidx[0];
             resolve_stmts(s->body);
+            resolve_stmts(s->orelse);
             return;
         }
         case StmtKind::FuncDef:

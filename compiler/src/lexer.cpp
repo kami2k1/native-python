@@ -86,6 +86,7 @@ const char* tok_name(Tok t) {
     case Tok::COLON: return ":";
     case Tok::COMMA: return ",";
     case Tok::DOT: return ".";
+    case Tok::ELLIPSIS: return "...";
     case Tok::ARROW: return "->";
     case Tok::AT: return "@";
     case Tok::SEMI: return ";";
@@ -423,16 +424,17 @@ struct Lexer {
         std::string text = src.substr(start, pos - start);
         // string prefix?
         if ((peek() == '"' || peek() == '\'') && text.size() <= 2) {
-            bool raw = false, fstr = false, bytes = false, okpref = true;
+            bool raw = false, fstr = false, okpref = true;
             for (char c : text) {
                 char l = (char)tolower((unsigned char)c);
                 if (l == 'r') raw = true;
                 else if (l == 'f') fstr = true;
-                else if (l == 'b') bytes = true;
+                else if (l == 'b') { /* bytes → str */ }
                 else okpref = false;
             }
             if (okpref) {
-                if (bytes) err("bytes literals (b\"...\") are not supported");
+                // b"..." is modeled as a plain str: the runtime has no separate
+                // bytes type (str already stores arbitrary bytes).
                 char quote = advance();
                 bool triple = peek() == quote && peek(1) == quote;
                 if (triple) pos += 2;
@@ -568,7 +570,16 @@ struct Lexer {
             case '}': paren_depth--; push(Tok::RBRACE); break;
             case ':': push(Tok::COLON); break;
             case ',': push(Tok::COMMA); break;
-            case '.': push(Tok::DOT); break;
+            case '.':
+                // `...` is the Ellipsis literal (used in type stubs and as a
+                // no-op body); emit a single ELLIPSIS token.
+                if (peek() == '.' && peek(1) == '.') {
+                    pos += 2;
+                    push(Tok::ELLIPSIS);
+                } else {
+                    push(Tok::DOT);
+                }
+                break;
             case '@': push(Tok::AT); break;
             case ';': push(Tok::SEMI); break;
             default: err(std::string("unexpected character '") + c + "'");

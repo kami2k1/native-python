@@ -7,6 +7,8 @@
 #include <cstdio>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #endif
@@ -219,6 +221,10 @@ void kami_rt_init(int64_t argc, char** argv) {
     // Keep '\n' as-is so program output is identical across platforms.
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
+    // Strings are UTF-8 internally; switch the console codepage so Vietnamese
+    // (and any other non-ASCII) text prints correctly instead of mojibake.
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 #endif
 }
 

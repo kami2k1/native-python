@@ -16,7 +16,7 @@ if(MSVC)
     # assumes extern "C" never throws and may delete the catch handler,
     # breaking try/except at runtime (and emitting warning C4297).
     add_compile_options(/utf-8 /EHs)
-    set(KAMI_RT_OPTS /O2)
+    set(KAMI_RT_OPTS $<$<NOT:$<CONFIG:Debug>>:/O2>)
 else()
     set(KAMI_RT_OPTS -O2)
 endif()
@@ -48,6 +48,11 @@ add_library(kamipy_core STATIC
     compiler/src/driver.cpp
 )
 target_include_directories(kamipy_core PUBLIC compiler/src runtime/include)
+if(NOT WIN32 AND OpenSSL_FOUND)
+    # The driver must link compiled programs against the same TLS libs the
+    # runtime was built with (see driver.cpp link command).
+    target_compile_definitions(kamipy_core PRIVATE KAMI_RT_NEEDS_OPENSSL)
+endif()
 
 add_executable(kamipy cli/main.cpp)
 target_link_libraries(kamipy PRIVATE kamipy_core)
@@ -56,9 +61,15 @@ target_link_libraries(kamipy PRIVATE kamipy_core)
 add_dependencies(kamipy kamirt)
 
 # ---- Python standard library ----
-# stdlib/*.py is compiled from source by kamipy on every "import", so it must
-# travel with the binary. In a build tree kamipy finds ../stdlib on its own; the
-# install layout puts it under lib/kamipy/stdlib (see stdlib_search_dirs()).
+# stdlib/*.py is translated from source by kamipy on every "import", so it has to
+# travel with the binary: copy it next to kamipy after every build (this also
+# covers multi-config generators, where the binary lands in build/<Config>/), and
+# install it under lib/kamipy/stdlib. See stdlib_search_dirs().
+add_custom_command(TARGET kamipy POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/stdlib $<TARGET_FILE_DIR:kamipy>/stdlib
+    COMMENT "Copying the Python standard library (stdlib/) next to kamipy")
+
 install(TARGETS kamipy RUNTIME DESTINATION bin)
 install(TARGETS kamirt ARCHIVE DESTINATION bin)
 install(DIRECTORY stdlib/ DESTINATION lib/kamipy/stdlib FILES_MATCHING PATTERN "*.py")
@@ -79,9 +90,11 @@ add_test(NAME integration
                  $<TARGET_FILE:kamipy>)
 set_tests_properties(integration PROPERTIES TIMEOUT 600)
 
-# Same programs, but the GC collects before every allocation: an unrooted value
-# fails immediately and reproducibly instead of corrupting the heap later.
-add_test(NAME gc_stress
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_gc_stress.sh
+# The same programs, but with the GC collecting before every allocation: a value
+# that is not reachable from a registered root fails immediately and
+# reproducibly instead of corrupting the heap much later.
+add_test(NAME integration.gc_stress
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_tests.sh
                  $<TARGET_FILE:kamipy>)
-set_tests_properties(gc_stress PROPERTIES TIMEOUT 1800)
+set_tests_properties(integration.gc_stress PROPERTIES
+                     TIMEOUT 900 ENVIRONMENT "KAMIPY_GC_STRESS=1")

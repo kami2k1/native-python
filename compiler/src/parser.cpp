@@ -478,6 +478,12 @@ struct Parser {
             advance();
             return e;
         }
+        case Tok::ELLIPSIS: {
+            // Ellipsis literal: modeled as None (used in stubs / annotations).
+            auto e = mk(ExprKind::NoneLit);
+            advance();
+            return e;
+        }
         case Tok::NAME: {
             auto e = mk(ExprKind::Name);
             e->sval = t.text;
@@ -793,11 +799,35 @@ struct Parser {
     StmtPtr parse_from_import() {
         int line = advance().line;
         auto s = mks(StmtKind::FromImport, line);
-        if (check(Tok::DOT))
-            throw CompileError(line, "relative imports (from . import x) are not supported");
-        s->name = parse_dotted_name();
+        // Relative import: one or more leading dots (from . / from .mod / from ..pkg).
+        int dots = 0;
+        while (check(Tok::DOT) || check(Tok::ELLIPSIS)) {
+            dots += check(Tok::ELLIPSIS) ? 3 : 1;
+            advance();
+        }
+        if (dots > 0) s->relative = true;
+        if (check(Tok::NAME)) s->name = parse_dotted_name();
+        // else: `from . import x` — imported names are sibling modules.
         expect(Tok::KW_IMPORT, "'import'");
-        if (check(Tok::STAR)) err("'from X import *' is not supported");
+        if (check(Tok::STAR)) {
+            // `from X import *`: we can't enumerate names for a native/unknown
+            // module, but for a bundled local module every top-level name is
+            // already a global, so a star import is a harmless no-op there.
+            advance();
+            s->star = true;
+            return s;
+        }
+        if (match(Tok::LPAREN)) { // parenthesized import list (may span lines)
+            do {
+                if (check(Tok::RPAREN)) break;
+                std::string n = expect(Tok::NAME, "name").text;
+                std::string a = n;
+                if (match(Tok::KW_AS)) a = expect(Tok::NAME, "alias").text;
+                s->import_names.emplace_back(n, a);
+            } while (match(Tok::COMMA));
+            expect(Tok::RPAREN, "')'");
+            return s;
+        }
         do {
             std::string n = expect(Tok::NAME, "name").text;
             std::string a = n;
@@ -830,7 +860,10 @@ struct Parser {
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
-        if (check(Tok::KW_ELSE)) err("'while ... else' is not supported");
+        if (match(Tok::KW_ELSE)) { // while ... else: runs if no break
+            expect(Tok::COLON, "':'");
+            s->orelse = parse_block();
+        }
         return s;
     }
 
@@ -855,7 +888,10 @@ struct Parser {
         loop_depth++;
         s->body = parse_block();
         loop_depth--;
-        if (check(Tok::KW_ELSE)) err("'for ... else' is not supported");
+        if (match(Tok::KW_ELSE)) { // for ... else: runs if no break
+            expect(Tok::COLON, "':'");
+            s->orelse = parse_block();
+        }
         return s;
     }
 
@@ -958,6 +994,9 @@ struct Parser {
                 if (match(Tok::COLON)) parse_expr(); // type annotation: ignored
                 if (match(Tok::ASSIGN)) {
                     seen_default = true;
+                    // Any expression is allowed (e.g. ThreadType.USER, CONST+1):
+                    // codegen evaluates it in the function prologue when the
+                    // caller omits the argument.
                     s->defaults.push_back(parse_expr());
                 } else if (seen_default) {
                     throw CompileError(peek().line,
@@ -978,26 +1017,6 @@ struct Parser {
         return s;
     }
 
-    static bool is_literal(const Expr* e) {
-        switch (e->kind) {
-        case ExprKind::IntLit:
-        case ExprKind::FloatLit:
-        case ExprKind::StrLit:
-        case ExprKind::BoolLit:
-        case ExprKind::NoneLit: return true;
-        case ExprKind::Unary: return e->op == KUOP_NEG && is_literal(e->a.get());
-        case ExprKind::ListLit: return e->args.empty();
-        case ExprKind::MapLit: return e->pairs.empty();
-        case ExprKind::Call: // float("inf"), int(0), ...
-            if (e->a->kind != ExprKind::Name || !e->kwargs.empty()) return false;
-            if (e->a->sval != "float" && e->a->sval != "int" && e->a->sval != "str")
-                return false;
-            for (auto& a : e->args)
-                if (!is_literal(a.get())) return false;
-            return true;
-        default: return false;
-        }
-    }
 
     StmtPtr parse_class() {
         int line = advance().line;

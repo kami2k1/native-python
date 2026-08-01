@@ -70,11 +70,11 @@ kamipy clean                # xóa .kamipy-cache
 | I/O | **`open()`** file read/write/iterate, **`with`** context managers, **`socket`** (TCP server+client, Python class over an fd), **`requests`** (HTTP/1.1 spoken in Python over sockets — no curl; http only), **`json`** (loads/dumps/indent/sort_keys) |
 | Collections | **insertion-ordered dict** (CPython-parity), **`set`** (`{1,2}`, `&\|^-`), **`del`**, comprehensions, first-class builtins |
 | Modules (native) | `math time random threading sys doctest` + `_kami` (C-ABI syscall layer); no-op `typing`/`__future__`/`abc`/`dataclasses` |
-| Modules (Python source, `stdlib/`) | `re` (backtracking engine: match/search/fullmatch/findall/finditer/sub/split/escape/compile, groups, backrefs, `I/M/S` flags), `json`, `logging`, `os`, `os.path`, `socket`, `requests`, `string` — all translated to native code on import |
-| Imports | **`import mymodule` translates `mymodule.py`** (input dir first, then `stdlib/`, recursive dependency-first, `pkg.mod` → `pkg/mod.py`); each module gets a **real namespace** (`re.match` → global `re__match`) so user names never collide; `from m import x as y`; `__main__` guard of an imported module is dropped; `try: import cv2 / except ImportError:` works; errors report the module's own file/line |
+| Modules (Python source, `stdlib/`) | `re` (backtracking engine: match/search/fullmatch/findall/finditer/sub/split/escape/compile, groups, backrefs, `I/M/S` flags), `json`, `logging`, `os`, `os.path`, `socket`, `requests`, `string`, `itertools`, `functools` — all translated to native code on import |
+| Imports | **`import mymodule` translates `mymodule.py`** (input dir first, then `stdlib/`, recursive dependency-first, `pkg.mod` → `pkg/mod.py`); each module gets a **real namespace** (`re.match` → global `re__match`) so user names never collide; `from m import x as y`, relative `from .mod import x`; `__main__` guard of an imported module is dropped; `try: import cv2 / except ImportError:` works; errors report the module's own file/line |
 | Functional | **`map` `filter`** + first-class functions/lambdas/closures passed to `sorted(key=)` etc. |
 | Threading | Real OS threads with GIL-style lock (elided when single-threaded); socket accept/recv release the lock |
-| Memory | Mark & sweep GC (exception-unwind + file safe); ASan/LSan/TSan clean; `KAMIPY_GC_STRESS=1` collects before every allocation (CI test) |
+| Memory | Mark & sweep GC (exception-unwind + file safe); ASan/LSan/TSan clean; `KAMIPY_GC_STRESS=1` collects before every allocation (the whole suite runs this way in CI) |
 
 **Real-world compatibility:** đo trên **2.182 file Python thật** từ GitHub (TheAlgorithms, geekcomputers): **1059 build (49%), 784 chạy** — so với 269/261 ở v0.1.1 (xem `tools/corpus_survey.sh` + CHANGELOG).
 
@@ -131,6 +131,6 @@ Báo cáo build/test/benchmark từng phase: [CHANGELOG.md](CHANGELOG.md)
 | Runtime (Value, GC, list/dict/str, threading GIL) | ✅ implemented + sanitizer-clean |
 | CLI (`build/run/clean`) | ✅ |
 | Python stdlib (`stdlib/*.py`) | ✅ `re json logging os os.path socket requests string` — output checked byte-for-byte against CPython |
-| Tests | ✅ 2 unit suites + 42 integration programs + a GC-stress pass (threading, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, HTTP client+server, module namespaces, regex engine, comprehensions, dict-order, unpacking) |
+| Tests | ✅ 2 unit suites + 50 integration programs + a full GC-stress pass (threading, neural-net XOR, real-world projects, exceptions/classes, files/sets, stdlib, sockets, HTTP client+server, module namespaces, regex engine, comprehensions, dict-order, unpacking) |
 | CI | ✅ GitHub Actions: ubuntu-24.04 + windows-latest (MSVC + LLVM) |
 | Platforms | ✅ Linux x64 (tested locally + CI) · Windows x64 (MSVC-ready, tested via CI) |

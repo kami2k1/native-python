@@ -302,7 +302,12 @@ void collect_import_names(const Stmt* s, std::vector<std::string>& out) {
         out.push_back(s->name);
         for (const auto& extra : s->body) collect_import_names(extra.get(), out);
         return;
-    case StmtKind::FromImport: out.push_back(s->name); return;
+    case StmtKind::FromImport:
+        if (!s->name.empty()) out.push_back(s->name);
+        // `from . import a, b` — the imported names are sibling modules.
+        if (s->relative && s->name.empty())
+            for (const auto& [n, alias] : s->import_names) out.push_back(n);
+        return;
     default: break;
     }
     for (const auto& c : s->body) collect_import_names(c.get(), out);

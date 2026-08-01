@@ -67,6 +67,15 @@ enum KamiBuiltinId : int64_t {
     KB_WITH_EXIT,
     // functional
     KB_MAP, KB_FILTER,
+    // math (v0.5.1 additions)
+    KB_MATH_FACTORIAL, KB_MATH_GCD, KB_MATH_ISQRT, KB_MATH_HYPOT, KB_MATH_LOG2,
+    KB_MATH_LOG10, KB_MATH_ATAN, KB_MATH_ASIN, KB_MATH_ACOS, KB_MATH_ATAN2,
+    KB_MATH_DEGREES, KB_MATH_RADIANS, KB_MATH_TRUNC, KB_MATH_ISNAN, KB_MATH_ISINF,
+    // random (additions)
+    KB_RANDOM_RANDRANGE, KB_RANDOM_CHOICE, KB_RANDOM_SHUFFLE, KB_RANDOM_UNIFORM,
+    KB_RANDOM_SAMPLE, KB_RANDOM_CHOICES,
+    // time (additions)
+    KB_TIME_MONOTONIC, KB_TIME_PERF_COUNTER,
     // ---- module _kami: thin C-ABI bindings to libc / the OS ----------------
     // The Python standard library (stdlib/*.py) is compiled from source and
     // reaches the operating system exclusively through these primitives.
